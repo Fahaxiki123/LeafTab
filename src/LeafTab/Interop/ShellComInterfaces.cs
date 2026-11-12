@@ -1,0 +1,358 @@
+using System;
+using System.Runtime.InteropServices;
+
+namespace LeafTab.Interop
+{
+    [Flags]
+    internal enum EXPLORER_BROWSER_OPTIONS : uint
+    {
+        EBO_NONE = 0x00,
+        EBO_NAVIGATEONCE = 0x01,
+        EBO_SHOWFRAMES = 0x02,
+        EBO_ALWAYSNAVIGATE = 0x04,
+        EBO_NOTRAVELLOG = 0x08,
+        EBO_NOWRAPPERWINDOW = 0x10,
+        EBO_HTMLSHAREPOINTVIEW = 0x20,
+        EBO_NOBORDER = 0x40,
+        EBO_NOPERSISTVIEWSTATE = 0x80
+    }
+
+    internal enum FOLDERVIEWMODE : uint
+    {
+        FVM_AUTO = unchecked((uint)-1),
+        FVM_FIRST = 1,
+        FVM_ICON = 1,
+        FVM_SMALLICON = 2,
+        FVM_LIST = 3,
+        FVM_DETAILS = 4,
+        FVM_THUMBNAIL = 5,
+        FVM_TILE = 6,
+        FVM_THUMBSTRIP = 7,
+        FVM_CONTENT = 8
+    }
+
+    [Flags]
+    internal enum FOLDERFLAGS : uint
+    {
+        FWF_NONE = 0x00000000,
+        FWF_AUTOARRANGE = 0x00000001,
+        FWF_SHOWSELALWAYS = 0x00002000,
+        FWF_NOWEBVIEW = 0x00010000,
+        FWF_ALIGNLEFT = 0x00800000
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FOLDERSETTINGS
+    {
+        public FOLDERVIEWMODE ViewMode;
+        public FOLDERFLAGS fFlags;
+    }
+
+    internal enum SIGDN : int
+    {
+        SIGDN_NORMALDISPLAY = 0,
+        SIGDN_PARENTRELATIVEPARSING = unchecked((int)0x80018001),
+        SIGDN_DESKTOPABSOLUTEPARSING = unchecked((int)0x80028000),
+        SIGDN_PARENTRELATIVEEDITING = unchecked((int)0x80031001),
+        SIGDN_DESKTOPABSOLUTEEDITING = unchecked((int)0x8004c000),
+        SIGDN_FILESYSPATH = unchecked((int)0x80058000),
+        SIGDN_URL = unchecked((int)0x80068000),
+        SIGDN_PARENTRELATIVEFORADDRESSBAR = unchecked((int)0x8007c001),
+        SIGDN_PARENTRELATIVE = unchecked((int)0x80080001),
+        SIGDN_PARENTRELATIVEFORUI = unchecked((int)0x80094001)
+    }
+
+    internal static class ShellConstants
+    {
+        public const int S_OK = 0;
+        public const int S_FALSE = 1;
+
+        public const uint SBSP_DEFBROWSER = 0x0000;
+        public const uint SBSP_SAMEBROWSER = 0x0001;
+        public const uint SBSP_ABSOLUTE = 0x0000;
+        public const uint SBSP_RELATIVE = 0x1000;
+        public const uint SBSP_PARENT = 0x2000;
+        public const uint SBSP_NAVIGATEBACK = 0x4000;
+        public const uint SBSP_NAVIGATEFORWARD = 0x8000;
+
+        public const uint SVGIO_BACKGROUND = 0x0;
+        public const uint SVGIO_SELECTION = 0x1;
+        public const uint SVGIO_ALLVIEW = 0x2;
+
+        public const uint SFGAO_STREAM = 0x00400000;
+        public const uint SFGAO_FOLDER = 0x20000000;
+        public const uint SFGAO_FILESYSTEM = 0x40000000;
+
+        public static readonly Guid CLSID_ExplorerBrowser = new Guid("71f96385-ddd6-48d3-a0c1-ae06e8b055fb");
+        public static readonly Guid IID_IShellView = new Guid("000214E3-0000-0000-C000-000000000046");
+        public static readonly Guid IID_IFolderView = new Guid("cde725b0-ccc9-4519-917e-325d72fab4ce");
+        public static readonly Guid IID_IPersistFolder2 = new Guid("1AC3D9F0-175C-11d1-95BE-00609797EA4F");
+        public static readonly Guid IID_IShellFolder = new Guid("000214E6-0000-0000-C000-000000000046");
+        public static readonly Guid IID_IShellItem = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+        public static readonly Guid IID_IEnumIDList = new Guid("000214F2-0000-0000-C000-000000000046");
+    }
+
+    // Verified slot-for-slot against Windows SDK ShObjIdl_core.h lines 16447-16553
+    [ComImport]
+    [Guid("dfd3b6b5-c10c-4be9-85f6-a66969f402f6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IExplorerBrowser
+    {
+        [PreserveSig]
+        int Initialize(IntPtr hwndParent, [In] ref RECT prc, [In] ref FOLDERSETTINGS pfs);
+
+        [PreserveSig]
+        int Destroy();
+
+        // Note: rcBrowser is passed BY VALUE in ShObjIdl_core.h line 16486
+        [PreserveSig]
+        int SetRect([In, Out] ref IntPtr phdwp, RECT rcBrowser);
+
+        [PreserveSig]
+        int SetPropertyBag([MarshalAs(UnmanagedType.LPWStr)] string pszPropertyBag);
+
+        [PreserveSig]
+        int SetEmptyText([MarshalAs(UnmanagedType.LPWStr)] string pszEmptyText);
+
+        [PreserveSig]
+        int SetFolderSettings([In] ref FOLDERSETTINGS pfs);
+
+        [PreserveSig]
+        int Advise([MarshalAs(UnmanagedType.Interface)] IExplorerBrowserEvents psbe, out uint pdwCookie);
+
+        [PreserveSig]
+        int Unadvise(uint dwCookie);
+
+        [PreserveSig]
+        int SetOptions(EXPLORER_BROWSER_OPTIONS dwFlag);
+
+        [PreserveSig]
+        int GetOptions(out EXPLORER_BROWSER_OPTIONS pdwFlag);
+
+        [PreserveSig]
+        int BrowseToIDList(IntPtr pidl, uint uFlags);
+
+        [PreserveSig]
+        int BrowseToObject([MarshalAs(UnmanagedType.IUnknown)] object punk, uint uFlags);
+
+        [PreserveSig]
+        int FillFromObject([MarshalAs(UnmanagedType.IUnknown)] object? punk, uint dwFlags);
+
+        [PreserveSig]
+        int RemoveAll();
+
+        [PreserveSig]
+        int GetCurrentView(ref Guid riid, out IntPtr ppv);
+    }
+
+    // Verified against ShObjIdl_core.h lines 16254-16294
+    [ComImport]
+    [Guid("361bbdc7-e6ee-4e13-be58-58e2240c810f")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IExplorerBrowserEvents
+    {
+        [PreserveSig]
+        int OnNavigationPending(IntPtr pidlFolder);
+
+        [PreserveSig]
+        int OnViewCreated([MarshalAs(UnmanagedType.Interface)] IShellView? psv);
+
+        [PreserveSig]
+        int OnNavigationComplete(IntPtr pidlFolder);
+
+        [PreserveSig]
+        int OnNavigationFailed(IntPtr pidlFolder);
+    }
+
+    // Verified against ShObjIdl_core.h lines 5470-5564 (inherits IOleWindow)
+    [ComImport]
+    [Guid("000214E3-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellView
+    {
+        [PreserveSig]
+        int GetWindow(out IntPtr phwnd);
+
+        [PreserveSig]
+        int ContextSensitiveHelp([MarshalAs(UnmanagedType.Bool)] bool fEnterMode);
+
+        [PreserveSig]
+        int TranslateAccelerator(ref NATIVE_MSG pmsg);
+
+        [PreserveSig]
+        int EnableModeless([MarshalAs(UnmanagedType.Bool)] bool fEnable);
+
+        [PreserveSig]
+        int UIActivate(uint uState);
+
+        [PreserveSig]
+        int Refresh();
+
+        [PreserveSig]
+        int CreateViewWindow(
+            [MarshalAs(UnmanagedType.Interface)] IShellView? psvPrevious,
+            ref FOLDERSETTINGS pfs,
+            IntPtr psb,
+            ref RECT prcView,
+            out IntPtr phWnd);
+
+        [PreserveSig]
+        int DestroyViewWindow();
+
+        [PreserveSig]
+        int GetCurrentInfo(out FOLDERSETTINGS pfs);
+
+        [PreserveSig]
+        int AddPropertySheetPages(uint dwReserved, IntPtr pfn, IntPtr lparam);
+
+        [PreserveSig]
+        int SaveViewState();
+
+        [PreserveSig]
+        int SelectItem(IntPtr pidlItem, uint uFlags);
+
+        [PreserveSig]
+        int GetItemObject(uint uItem, ref Guid riid, out IntPtr ppv);
+    }
+
+    // Verified against ShObjIdl_core.h lines 5976-6075
+    [ComImport]
+    [Guid("cde725b0-ccc9-4519-917e-325d72fab4ce")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IFolderView
+    {
+        [PreserveSig]
+        int GetCurrentViewMode(out uint pViewMode);
+
+        [PreserveSig]
+        int SetCurrentViewMode(uint ViewMode);
+
+        [PreserveSig]
+        int GetFolder(ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int Item(int iItemIndex, out IntPtr ppidl);
+
+        [PreserveSig]
+        int ItemCount(uint uFlags, out int pcItems);
+
+        [PreserveSig]
+        int Items(uint uFlags, ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int GetSelectionMarkedItem(out int piItem);
+
+        [PreserveSig]
+        int GetFocusedItem(out int piItem);
+
+        [PreserveSig]
+        int GetItemPosition(IntPtr pidl, out POINT ppt);
+
+        [PreserveSig]
+        int GetSpacing(ref POINT ppt);
+
+        [PreserveSig]
+        int GetDefaultSpacing(out POINT ppt);
+
+        [PreserveSig]
+        int GetAutoArrange();
+
+        [PreserveSig]
+        int SelectItem(int iItem, uint dwFlags);
+
+        [PreserveSig]
+        int SelectAndPositionItems(uint cidl, IntPtr apidl, IntPtr apt, uint dwFlags);
+    }
+
+    // Verified against ShObjIdl_core.h lines 3426-3461
+    [ComImport]
+    [Guid("1AC3D9F0-175C-11d1-95BE-00609797EA4F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IPersistFolder2
+    {
+        [PreserveSig]
+        int GetClassID(out Guid pClassID);
+
+        [PreserveSig]
+        int Initialize(IntPtr pidl);
+
+        [PreserveSig]
+        int GetCurFolder(out IntPtr ppidl);
+    }
+
+    // Verified against ShObjIdl_core.h lines 4643-4750
+    [ComImport]
+    [Guid("000214E6-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellFolder
+    {
+        [PreserveSig]
+        int ParseDisplayName(
+            IntPtr hwnd,
+            IntPtr pbc,
+            [MarshalAs(UnmanagedType.LPWStr)] string pszDisplayName,
+            ref uint pchEaten,
+            out IntPtr ppidl,
+            ref uint pdwAttributes);
+
+        [PreserveSig]
+        int EnumObjects(IntPtr hwnd, uint grfFlags, out IntPtr ppenumIDList);
+
+        [PreserveSig]
+        int BindToObject(IntPtr pidl, IntPtr pbc, ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int BindToStorage(IntPtr pidl, IntPtr pbc, ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int CompareIDs(IntPtr lParam, IntPtr pidl1, IntPtr pidl2);
+
+        [PreserveSig]
+        int CreateViewObject(IntPtr hwndOwner, ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int GetAttributesOf(uint cidl, [In] ref IntPtr apidl, ref uint rgfInOut);
+
+        [PreserveSig]
+        int GetUIObjectOf(
+            IntPtr hwndOwner,
+            uint cidl,
+            [In] ref IntPtr apidl,
+            ref Guid riid,
+            IntPtr rgfReserved,
+            out IntPtr ppv);
+
+        [PreserveSig]
+        int GetDisplayNameOf(IntPtr pidl, uint uFlags, IntPtr pName);
+
+        [PreserveSig]
+        int SetNameOf(
+            IntPtr hwnd,
+            IntPtr pidl,
+            [MarshalAs(UnmanagedType.LPWStr)] string pszName,
+            uint uFlags,
+            out IntPtr ppidlOut);
+    }
+
+    // Verified against ShObjIdl_core.h lines 8898-8951
+    [ComImport]
+    [Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellItem
+    {
+        [PreserveSig]
+        int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+
+        [PreserveSig]
+        int GetParent([MarshalAs(UnmanagedType.Interface)] out IShellItem? ppsi);
+
+        [PreserveSig]
+        int GetDisplayName(SIGDN sigdnName, out IntPtr ppszName);
+
+        [PreserveSig]
+        int GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+
+        [PreserveSig]
+        int Compare([MarshalAs(UnmanagedType.Interface)] IShellItem? psi, uint hint, out int piOrder);
+    }
+}
