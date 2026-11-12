@@ -24,10 +24,11 @@ namespace LeafTab.Views
         private readonly DispatcherTimer _dragHoverSwitchTimer;
         private ExplorerTabItem? _pendingDragHoverTab;
 
-        // Periodic lightweight status refresh timer (updates item/selection counts & memory indicator)
+        // Periodic lightweight status refresh timer
         private readonly DispatcherTimer _statusRefreshTimer;
 
         private CancellationTokenSource? _addressParseCts;
+        private bool _isSystemBlurActive;
         private bool _isClosingWindow;
 
         public ObservableCollection<ExplorerTabItem> Tabs => _tabs;
@@ -53,27 +54,81 @@ namespace LeafTab.Views
             SourceInitialized += MainWindow_SourceInitialized;
             Loaded += MainWindow_Loaded;
             StateChanged += MainWindow_StateChanged;
+            Activated += (_, _) => UpdateHeaderGlassLuminosity(isWindowActive: true);
+            Deactivated += (_, _) => UpdateHeaderGlassLuminosity(isWindowActive: false);
             Closed += MainWindow_Closed;
         }
+
+        private const double HeaderGlassHeightDip = 86.0;
+        private const double FooterGlassHeightDip = 24.0;
 
         private void MainWindow_SourceInitialized(object? sender, EventArgs e)
         {
             IntPtr hwnd = new WindowInteropHelper(this).Handle;
-
-            // Apply native rounded window corners when running on Windows 11 (Build 22000+);
-            // harmlessly ignored on Windows 10 where DWM standard border/shadow applies.
-            if (Environment.OSVersion.Version.Build >= 22000 && hwnd != IntPtr.Zero)
-            {
-                int pref = NativeMethods.DWMWCP_ROUND;
-                NativeMethods.DwmSetWindowAttribute(
-                    hwnd,
-                    NativeMethods.DWMWA_WINDOW_CORNER_PREFERENCE,
-                    ref pref,
-                    sizeof(int));
-            }
+            (int topPx, int bottomPx) = ComputeGlassFramePixels();
+            _isSystemBlurActive = WindowBackdropHelper.TryApplyLiquidGlassBackdrop(this, hwnd, topPx, bottomPx);
+            UpdateHeaderGlassLuminosity(isWindowActive: true);
 
             ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
             UpdateMaximizedLayoutMargin();
+        }
+
+        protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+        {
+            base.OnDpiChanged(oldDpi, newDpi);
+            SyncGlassFrameRegions();
+        }
+
+        private (int TopPx, int BottomPx) ComputeGlassFramePixels()
+        {
+            DpiScale dpi = VisualTreeHelper.GetDpi(this);
+            double padTop = RootFrameBorder.Padding.Top;
+            double padBottom = RootFrameBorder.Padding.Bottom;
+            int topPx = (int)Math.Ceiling((HeaderGlassHeightDip + padTop) * dpi.DpiScaleY);
+            int bottomPx = (int)Math.Ceiling((FooterGlassHeightDip + padBottom) * dpi.DpiScaleY);
+            return (topPx, bottomPx);
+        }
+
+        private void SyncGlassFrameRegions()
+        {
+            double padTop = RootFrameBorder.Padding.Top;
+            double padBottom = RootFrameBorder.Padding.Bottom;
+            MainWindowChrome.GlassFrameThickness = new Thickness(0, HeaderGlassHeightDip + padTop, 0, FooterGlassHeightDip + padBottom);
+
+            if (_isSystemBlurActive)
+            {
+                IntPtr hwnd = new WindowInteropHelper(this).Handle;
+                (int topPx, int bottomPx) = ComputeGlassFramePixels();
+                WindowBackdropHelper.UpdateGlassFrameMargins(hwnd, topPx, bottomPx);
+            }
+        }
+
+        /// <summary>
+        /// Tunes header glass alpha based on whether live OS DWM Acrylic blur is active and whether the window is focused
+        /// (active window reveals airy DWM frosted glass; unfocused window settles into a calm matte frost like macOS).
+        /// </summary>
+        private void UpdateHeaderGlassLuminosity(bool isWindowActive)
+        {
+            if (!_isSystemBlurActive)
+            {
+                HeaderTopStop.Color = Color.FromRgb(0xF4, 0xF7, 0xFC);
+                HeaderBottomStop.Color = Color.FromRgb(0xEB, 0xF0, 0xF7);
+                BottomGlassFooter.Background = new SolidColorBrush(Color.FromRgb(0xF4, 0xF7, 0xFB));
+                return;
+            }
+
+            if (isWindowActive)
+            {
+                HeaderTopStop.Color = Color.FromArgb(0xCC, 0xF7, 0xFA, 0xFF);
+                HeaderBottomStop.Color = Color.FromArgb(0xDC, 0xF0, 0xF5, 0xFC);
+                BottomGlassFooter.Background = new SolidColorBrush(Color.FromArgb(0xDC, 0xF5, 0xF8, 0xFD));
+            }
+            else
+            {
+                HeaderTopStop.Color = Color.FromArgb(0xEC, 0xF4, 0xF7, 0xFC);
+                HeaderBottomStop.Color = Color.FromArgb(0xF4, 0xEE, 0xF3, 0xFA);
+                BottomGlassFooter.Background = new SolidColorBrush(Color.FromArgb(0xF2, 0xF4, 0xF7, 0xFB));
+            }
         }
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -104,22 +159,24 @@ namespace LeafTab.Views
             if (WindowState == WindowState.Maximized)
             {
                 Thickness resize = SystemParameters.WindowResizeBorderThickness;
-                RootFrameBorder.BorderThickness = new Thickness(0);
                 RootFrameBorder.Padding = new Thickness(
                     resize.Left + 4,
                     resize.Top + 4,
                     resize.Right + 4,
                     resize.Bottom + 4);
                 MaxRestoreButton.ToolTip = "向下还原";
-                MaxRestoreGlyph.Data = Geometry.Parse("M2.5,0.5 H9.5 V7.5 M0.5,2.5 H7.5 V9.5 H0.5 Z");
+                MaxRestoreGlyph.Data = Geometry.Parse(
+                    "M2.6,0.6 H7.4 A1.0,1.0 0 0 1 8.4,1.6 V6.4 M1.6,2.4 H6.4 A1.0,1.0 0 0 1 7.4,3.4 V7.4 A1.0,1.0 0 0 1 6.4,8.4 H1.6 A1.0,1.0 0 0 1 0.6,7.4 V3.4 A1.0,1.0 0 0 1 1.6,2.4 Z");
             }
             else
             {
-                RootFrameBorder.BorderThickness = new Thickness(1);
                 RootFrameBorder.Padding = new Thickness(0);
                 MaxRestoreButton.ToolTip = "最大化";
-                MaxRestoreGlyph.Data = Geometry.Parse("M0.5,0.5 H9.5 V9.5 H0.5 Z");
+                MaxRestoreGlyph.Data = Geometry.Parse(
+                    "M1.8,0.6 H7.2 A1.2,1.2 0 0 1 8.4,1.8 V7.2 A1.2,1.2 0 0 1 7.2,8.4 H1.8 A1.2,1.2 0 0 1 0.6,7.2 V1.8 A1.2,1.2 0 0 1 1.8,0.6 Z");
             }
+
+            SyncGlassFrameRegions();
         }
 
         public ExplorerTabItem AddNewTab(IntPtr targetPidl, bool activate = true)
@@ -133,7 +190,6 @@ namespace LeafTab.Views
                 var tab = new ExplorerTabItem(effectivePidl);
                 ExplorerBrowserHost host = tab.BrowserHost;
 
-                // Keep hidden until explicitly activated so background middle-click tabs never flash
                 host.Visibility = activate ? Visibility.Visible : Visibility.Hidden;
 
                 host.NavigationCompleted += (_, args) =>
@@ -145,7 +201,9 @@ namespace LeafTab.Views
                         {
                             AddressTextBox.Text = tab.AddressText;
                         }
+                        AddressFolderIcon.Source = tab.Icon;
                         Title = $"{tab.Title} - LeafTab";
+                        UpdateViewModeIndicator();
                         RefreshStatusBarCounts();
                     }
                 };
@@ -157,14 +215,13 @@ namespace LeafTab.Views
 
                 host.FolderMiddleClicked += (_, args) =>
                 {
-                    // Clover habit: Middle-clicking a folder opens it in a new tab
                     AddNewTab(args.TargetFolderPidl, activate: false);
-                    SetTransientStatus($"已在新标签页打开文件夹 (UIA {args.UiaElapsedMs:F1}ms)");
+                    SetTransientStatus($"已在后台新标签打开文件夹");
                 };
 
-                host.BlankAreaDoubleClicked += (_, elapsedMs) =>
+                host.BlankAreaDoubleClicked += (_, _) =>
                 {
-                    SetTransientStatus($"返回上一级 (UIA {elapsedMs:F1}ms)");
+                    SetTransientStatus("已返回上一级");
                 };
 
                 _tabs.Add(tab);
@@ -215,7 +272,9 @@ namespace LeafTab.Views
             }
 
             AddressTextBox.Text = tab.AddressText;
+            AddressFolderIcon.Source = tab.Icon;
             Title = $"{tab.Title} - LeafTab";
+            UpdateViewModeIndicator();
             RefreshStatusBarCounts();
 
             if (focusNativeView)
@@ -269,7 +328,6 @@ namespace LeafTab.Views
             int vk = (int)msg.wParam.ToInt64();
             ModifierKeys mods = Keyboard.Modifiers;
 
-            // 1. Global tab / address bar shortcuts handled directly by LeafTab
             if (mods == ModifierKeys.Control)
             {
                 if (vk == 'T')
@@ -292,14 +350,14 @@ namespace LeafTab.Views
                     handled = true;
                     return;
                 }
-                if (vk == 0x09) // VK_TAB
+                if (vk == 0x09)
                 {
                     SwitchRelativeTab(+1);
                     handled = true;
                     return;
                 }
             }
-            else if (mods == (ModifierKeys.Control | ModifierKeys.Shift) && vk == 0x09) // Ctrl+Shift+Tab
+            else if (mods == (ModifierKeys.Control | ModifierKeys.Shift) && vk == 0x09)
             {
                 SwitchRelativeTab(-1);
                 handled = true;
@@ -313,34 +371,38 @@ namespace LeafTab.Views
                     handled = true;
                     return;
                 }
-                if (vk == 0x25 && _selectedTab != null) // VK_LEFT
+                if (vk == 0x25 && _selectedTab != null)
                 {
                     _selectedTab.BrowserHost.NavigateBack();
                     handled = true;
                     return;
                 }
-                if (vk == 0x27 && _selectedTab != null) // VK_RIGHT
+                if (vk == 0x27 && _selectedTab != null)
                 {
                     _selectedTab.BrowserHost.NavigateForward();
                     handled = true;
                     return;
                 }
-                if (vk == 0x26 && _selectedTab != null) // VK_UP
+                if (vk == 0x26 && _selectedTab != null)
                 {
                     _selectedTab.BrowserHost.NavigateUp();
                     handled = true;
                     return;
                 }
+                if (vk == 0x20)
+                {
+                    SystemCommands.ShowSystemMenu(this, new Point(Left + 14, Top + 42));
+                    handled = true;
+                    return;
+                }
             }
-            else if (mods == ModifierKeys.None && vk == 0x74 && _selectedTab != null) // VK_F5
+            else if (mods == ModifierKeys.None && vk == 0x74 && _selectedTab != null)
             {
                 _selectedTab.BrowserHost.RefreshView();
                 handled = true;
                 return;
             }
 
-            // 2. Forward file-view accelerators (F2, Delete, Ctrl+C/V/X/Z/A, Enter, Backspace, Alt+Enter)
-            //    to the active IShellView when focus resides inside the native ExplorerBrowser control.
             if (_selectedTab != null && _selectedTab.BrowserHost.TryTranslateShellAccelerator(ref msg))
             {
                 handled = true;
@@ -363,7 +425,7 @@ namespace LeafTab.Views
             AddressTextBox.SelectAll();
         }
 
-        // ==================== TAB GESTURES (Click, Double-Click Close, Middle-Click Close, Wheel) ====================
+        // ==================== TAB CAPSULE GESTURES ====================
 
         private void TabPill_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
@@ -371,7 +433,6 @@ namespace LeafTab.Views
             {
                 if (e.ClickCount == 2)
                 {
-                    // Clover habit: Double-clicking a tab closes it
                     e.Handled = true;
                     CloseTab(tab);
                     return;
@@ -398,7 +459,6 @@ namespace LeafTab.Views
             if (_tabs.Count <= 1)
                 return;
 
-            // Clover habit: Mouse wheel over tab bar switches tabs
             SwitchRelativeTab(e.Delta > 0 ? -1 : +1);
             e.Handled = true;
         }
@@ -427,20 +487,11 @@ namespace LeafTab.Views
 
         // ==================== CROSS-TAB FILE DRAG HOVER-TO-SWITCH ====================
 
-        private void TabPill_DragEnter(object sender, DragEventArgs e)
-        {
-            HandleTabDragHover(sender, e);
-        }
-
-        private void TabPill_DragOver(object sender, DragEventArgs e)
-        {
-            HandleTabDragHover(sender, e);
-        }
+        private void TabPill_DragEnter(object sender, DragEventArgs e) => HandleTabDragHover(sender, e);
+        private void TabPill_DragOver(object sender, DragEventArgs e) => HandleTabDragHover(sender, e);
 
         private void HandleTabDragHover(object sender, DragEventArgs e)
         {
-            // Stage 1: Do not accept direct drop onto tab title; instead hover ~380ms switches tab
-            // while keeping the native OLE IDataObject drag loop intact so user drops into native view.
             e.Effects = DragDropEffects.None;
             e.Handled = true;
 
@@ -488,7 +539,6 @@ namespace LeafTab.Views
 
             if (target != null && !ReferenceEquals(target, _selectedTab))
             {
-                // Activate without calling SetFocus so active Win32 OLE DoDragDrop capture is undisturbed
                 ActivateTab(target, focusNativeView: false);
                 SetTransientStatus($"已切换至「{target.Title}」，请移入下方列表松手完成拖放");
             }
@@ -504,17 +554,76 @@ namespace LeafTab.Views
             }
         }
 
-        // ==================== NAVIGATION & ADDRESS BAR ====================
+        // ==================== SAFARI TOOLBAR, ADDRESS POD & VIEW CAPSULE ====================
 
         private void BackButton_Click(object sender, RoutedEventArgs e) => _selectedTab?.BrowserHost.NavigateBack();
         private void ForwardButton_Click(object sender, RoutedEventArgs e) => _selectedTab?.BrowserHost.NavigateForward();
         private void UpButton_Click(object sender, RoutedEventArgs e) => _selectedTab?.BrowserHost.NavigateUp();
         private void RefreshButton_Click(object sender, RoutedEventArgs e) => _selectedTab?.BrowserHost.RefreshView();
 
+        private void DetailsViewButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedTab != null && _selectedTab.BrowserHost.TrySetViewMode(FOLDERVIEWMODE.FVM_DETAILS))
+            {
+                UpdateViewModeIndicator();
+                _selectedTab.BrowserHost.FocusNativeView();
+            }
+        }
+
+        private void IconViewButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_selectedTab != null && _selectedTab.BrowserHost.TrySetViewMode(FOLDERVIEWMODE.FVM_ICON))
+            {
+                UpdateViewModeIndicator();
+                _selectedTab.BrowserHost.FocusNativeView();
+            }
+        }
+
+        private void UpdateViewModeIndicator()
+        {
+            if (_selectedTab == null)
+                return;
+
+            FOLDERVIEWMODE mode = _selectedTab.BrowserHost.GetCurrentViewMode();
+            bool isIcons = mode == FOLDERVIEWMODE.FVM_ICON || mode == FOLDERVIEWMODE.FVM_THUMBNAIL || mode == FOLDERVIEWMODE.FVM_TILE;
+
+            Brush activeStroke = new SolidColorBrush(Color.FromRgb(0x00, 0x66, 0xCC));
+            Brush inactiveStroke = new SolidColorBrush(Color.FromRgb(0x52, 0x60, 0x71));
+            Brush activeBg = new SolidColorBrush(Color.FromArgb(0x1F, 0x00, 0x7A, 0xFF));
+
+            DetailsViewGlyph.Stroke = isIcons ? inactiveStroke : activeStroke;
+            IconViewGlyph.Stroke = isIcons ? activeStroke : inactiveStroke;
+            DetailsViewButton.Background = isIcons ? Brushes.Transparent : activeBg;
+            IconViewButton.Background = isIcons ? activeBg : Brushes.Transparent;
+        }
+
         private void AddressTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
-            AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0x25, 0x63, 0xEB));
+            AddressBoxBorder.Background = new SolidColorBrush(Color.FromArgb(0xF5, 0xFF, 0xFF, 0xFF));
+            AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
+            AddressPodShadow.Color = Color.FromRgb(0x00, 0x7A, 0xFF);
+            AddressPodShadow.BlurRadius = 11;
+            AddressPodShadow.ShadowDepth = 0;
+            AddressPodShadow.Opacity = 0.20;
             AddressTextBox.SelectAll();
+        }
+
+        private void AddressTextBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+        {
+            RestoreAddressPodRestStyle();
+        }
+
+        private void RestoreAddressPodRestStyle()
+        {
+            if (TryFindResource("AddressPodRestFillBrush") is Brush restFill)
+                AddressBoxBorder.Background = restFill;
+            if (TryFindResource("GlassCapsuleRimBrush") is Brush rimBrush)
+                AddressBoxBorder.BorderBrush = rimBrush;
+
+            AddressPodShadow.Color = Color.FromRgb(0x0F, 0x17, 0x2A);
+            AddressPodShadow.BlurRadius = 7;
+            AddressPodShadow.ShadowDepth = 1;
+            AddressPodShadow.Opacity = 0.045;
         }
 
         private void AddressTextBox_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -535,7 +644,7 @@ namespace LeafTab.Views
                     AddressTextBox.Text = _selectedTab.AddressText;
                     _selectedTab.BrowserHost.FocusNativeView();
                 }
-                AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0xCB, 0xD5, 0xE1));
+                RestoreAddressPodRestStyle();
                 e.Handled = true;
                 return;
             }
@@ -580,7 +689,7 @@ namespace LeafTab.Views
                     bool ok = targetTab.BrowserHost.NavigateToPidl(pidl);
                     if (ok)
                     {
-                        AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromRgb(0xCB, 0xD5, 0xE1));
+                        RestoreAddressPodRestStyle();
                         targetTab.BrowserHost.FocusNativeView();
                     }
                     else
@@ -600,7 +709,7 @@ namespace LeafTab.Views
             }
         }
 
-        // ==================== WINDOW CAPTION & STATUS BAR ====================
+        // ==================== CAPTION & FINDER-STYLE CENTERED STATUS ====================
 
         private void MinimizeButton_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
 
@@ -611,9 +720,9 @@ namespace LeafTab.Views
 
         private DateTime _transientStatusUntilUtc = DateTime.MinValue;
 
-        public void SetTransientStatus(string message, int durationMs = 3000)
+        public void SetTransientStatus(string message, int durationMs = 2800)
         {
-            StatusLeftText.Text = message;
+            StatusCenterText.Text = message;
             _transientStatusUntilUtc = DateTime.UtcNow.AddMilliseconds(durationMs);
         }
 
@@ -624,14 +733,14 @@ namespace LeafTab.Views
             if (DateTime.UtcNow >= _transientStatusUntilUtc && _selectedTab != null)
             {
                 (int total, int selected) = _selectedTab.BrowserHost.GetItemCounts();
-                StatusLeftText.Text = selected > 0
-                    ? $"{total} 个项目  |  已选择 {selected} 个项目"
+                StatusCenterText.Text = selected > 0
+                    ? $"{total} 个项目  ·  已选 {selected} 项"
                     : $"{total} 个项目";
             }
 
             using Process proc = Process.GetCurrentProcess();
             double wsMb = proc.WorkingSet64 / (1024.0 * 1024.0);
-            StatusRightText.Text = $"{(Environment.Is64BitProcess ? "x64" : "x86")} · {_tabs.Count} 个标签 · {wsMb:F1} MB";
+            StatusRightText.Text = $"{_tabs.Count} 标签 · {wsMb:F0} MB";
         }
 
         private void MainWindow_Closed(object? sender, EventArgs e)

@@ -355,4 +355,37 @@ namespace LeafTab.Interop
         [PreserveSig]
         int Compare([MarshalAs(UnmanagedType.Interface)] IShellItem? psi, uint hint, out int piOrder);
     }
+
+    // Verified against OCIdl.h lines 6106-6117
+    [ComImport]
+    [Guid("FC4801A3-2BA9-11CF-A229-00AA003D7352")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IObjectWithSite
+    {
+        [PreserveSig]
+        int SetSite([MarshalAs(UnmanagedType.IUnknown)] object? pUnkSite);
+
+        [PreserveSig]
+        int GetSite(ref Guid riid, out IntPtr ppvSite);
+    }
+
+    // Verified against ServProv.h lines 140-152
+    [ComImport]
+    [Guid("6d5140c1-7436-11ce-8034-00aa006009fa")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IServiceProvider
+    {
+        [PreserveSig]
+        int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject);
+    }
+
+    // Verified against ShObjIdl_core.h lines 25675-25701
+    [ComImport]
+    [Guid("e07010ec-bc17-44c0-97b0-46c7c95b9edc")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IExplorerPaneVisibility
+    {
+        [PreserveSig]
+        int GetPaneState(ref Guid ep, out uint peps);
+    }
 }

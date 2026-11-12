@@ -89,6 +89,12 @@ namespace LeafTab.Controls
             Type? comType = Type.GetTypeFromCLSID(ShellConstants.CLSID_ExplorerBrowser, throwOnError: true);
             _browser = (IExplorerBrowser)Activator.CreateInstance(comType!)!;
 
+            // Keep left Navigation Pane (EP_NavPane) while hiding legacy Win7 Command Bar (EP_Commands) & duplicate inner status bar
+            if (_browser is IObjectWithSite withSite)
+            {
+                withSite.SetSite(ExplorerPaneVisibilitySite.Shared);
+            }
+
             // Enable native left Navigation Pane (EBO_SHOWFRAMES) per Stage 1 design
             _browser.SetOptions(EXPLORER_BROWSER_OPTIONS.EBO_SHOWFRAMES | EXPLORER_BROWSER_OPTIONS.EBO_NOBORDER);
 
@@ -131,6 +137,15 @@ namespace LeafTab.Controls
             }
         }
 
+        private int _innerStatusBarClipPx = -1;
+
+        protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+        {
+            base.OnDpiChanged(oldDpi, newDpi);
+            _innerStatusBarClipPx = -1;
+            SyncBrowserRect();
+        }
+
         protected override void OnWindowPositionChanged(Rect rcBoundingBox)
         {
             base.OnWindowPositionChanged(rcBoundingBox);
@@ -142,7 +157,32 @@ namespace LeafTab.Controls
             if (_isDestroyed || _browser == null || _hostHwnd == IntPtr.Zero)
                 return;
 
-            if (NativeMethods.GetClientRect(_hostHwnd, out RECT rc) && rc.Width > 0 && rc.Height > 0)
+            if (!NativeMethods.GetClientRect(_hostHwnd, out RECT rc) || rc.Width <= 0 || rc.Height <= 0)
+                return;
+
+            if (_innerStatusBarClipPx < 0)
+            {
+                IntPtr hdwpProbe = IntPtr.Zero;
+                _browser.SetRect(ref hdwpProbe, rc);
+
+                IntPtr svHwnd = GetShellViewWindowHandle();
+                if (svHwnd != IntPtr.Zero &&
+                    NativeMethods.GetWindowRect(_hostHwnd, out RECT hostScreen) &&
+                    NativeMethods.GetWindowRect(svHwnd, out RECT svScreen) &&
+                    svScreen.Height > 40)
+                {
+                    int bottomGap = hostScreen.Bottom - svScreen.Bottom;
+                    _innerStatusBarClipPx = (bottomGap > 0 && bottomGap <= 56) ? bottomGap : 0;
+                }
+            }
+
+            if (_innerStatusBarClipPx > 0)
+            {
+                RECT expanded = new RECT(0, 0, rc.Right, rc.Bottom + _innerStatusBarClipPx);
+                IntPtr hdwp = IntPtr.Zero;
+                _browser.SetRect(ref hdwp, expanded);
+            }
+            else if (_innerStatusBarClipPx == 0)
             {
                 IntPtr hdwp = IntPtr.Zero;
                 _browser.SetRect(ref hdwp, rc);
@@ -310,6 +350,29 @@ namespace LeafTab.Controls
             }
         }
 
+        internal FOLDERVIEWMODE GetCurrentViewMode()
+        {
+            if (_isDestroyed || _browser == null)
+                return FOLDERVIEWMODE.FVM_DETAILS;
+
+            Guid iidFolderView = ShellConstants.IID_IFolderView;
+            if (_browser.GetCurrentView(ref iidFolderView, out IntPtr pfv) != ShellConstants.S_OK || pfv == IntPtr.Zero)
+                return FOLDERVIEWMODE.FVM_DETAILS;
+
+            var fv = (IFolderView)Marshal.GetObjectForIUnknown(pfv);
+            try
+            {
+                if (fv.GetCurrentViewMode(out uint mode) == ShellConstants.S_OK)
+                    return (FOLDERVIEWMODE)mode;
+                return FOLDERVIEWMODE.FVM_DETAILS;
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(fv);
+                Marshal.Release(pfv);
+            }
+        }
+
         public void FocusNativeView()
         {
             if (_isDestroyed || _hostHwnd == IntPtr.Zero) return;
@@ -392,6 +455,7 @@ namespace LeafTab.Controls
         {
             if (_isDestroyed) return;
             _viewGeneration++;
+            SyncBrowserRect();
             AttachDirectUiSubclassIfNeeded();
         }
 
@@ -399,6 +463,7 @@ namespace LeafTab.Controls
         {
             if (_isDestroyed) return;
             _viewGeneration++;
+            SyncBrowserRect();
             AttachDirectUiSubclassIfNeeded();
 
             IntPtr cloned = PidlManager.Clone(pidlFolder);
@@ -411,6 +476,7 @@ namespace LeafTab.Controls
                 {
                     if (!_isDestroyed)
                     {
+                        SyncBrowserRect();
                         AttachDirectUiSubclassIfNeeded();
                         NavigationCompleted?.Invoke(this, new NavigationCompletedEventArgs(cloned));
                     }
@@ -771,6 +837,10 @@ namespace LeafTab.Controls
                         _browser.Unadvise(_adviseCookie);
                         _adviseCookie = 0;
                     }
+                    if (_browser is IObjectWithSite withSite)
+                    {
+                        withSite.SetSite(null);
+                    }
                     _browser.Destroy();
                 }
                 catch
@@ -787,6 +857,57 @@ namespace LeafTab.Controls
             {
                 NativeMethods.DestroyWindow(hwnd.Handle);
                 _hostHwnd = IntPtr.Zero;
+            }
+        }
+
+        private sealed class ExplorerPaneVisibilitySite : LeafTab.Interop.IServiceProvider, IExplorerPaneVisibility
+        {
+            public static readonly ExplorerPaneVisibilitySite Shared = new ExplorerPaneVisibilitySite();
+
+            private const uint EPS_DONTCARE = 0x0;
+            private const uint EPS_DEFAULT_ON = 0x1;
+            private const uint EPS_DEFAULT_OFF = 0x2;
+            private const uint EPS_INITIALSTATE = 0x10000;
+            private const uint EPS_FORCE = 0x20000;
+            private const int E_NOINTERFACE = unchecked((int)0x80004002);
+
+            private static readonly Guid SID_ExplorerPaneVisibility = new Guid("e07010ec-bc17-44c0-97b0-46c7c95b9edc");
+            private static readonly Guid EP_NavPane = new Guid("cb316b22-25f7-42b8-8a09-540d23a43c2f");
+            private static readonly Guid EP_Commands = new Guid("d9745868-ca5f-4a76-91cd-f5a129fbb076");
+            private static readonly Guid EP_Commands_Organize = new Guid("72e81700-e3ec-4660-bf24-3c3b7b648806");
+            private static readonly Guid EP_Commands_View = new Guid("21f7c32d-eeaa-439b-bb51-37b96fd6a943");
+            private static readonly Guid EP_StatusBar = new Guid("65fe56ce-5cfe-4bc4-ad8a-7ae3fe7e8f7c");
+            private static readonly Guid EP_Ribbon = new Guid("d27524a8-c9f2-4834-a106-df8889fd4f37");
+
+            public int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject)
+            {
+                if (guidService == SID_ExplorerPaneVisibility)
+                {
+                    IntPtr unk = Marshal.GetIUnknownForObject(this);
+                    try
+                    {
+                        return Marshal.QueryInterface(unk, ref riid, out ppvObject);
+                    }
+                    finally
+                    {
+                        Marshal.Release(unk);
+                    }
+                }
+
+                ppvObject = IntPtr.Zero;
+                return E_NOINTERFACE;
+            }
+
+            public int GetPaneState(ref Guid ep, out uint peps)
+            {
+                if (ep == EP_NavPane)
+                {
+                    peps = EPS_DEFAULT_ON | EPS_INITIALSTATE;
+                    return ShellConstants.S_OK;
+                }
+
+                peps = EPS_DEFAULT_OFF | EPS_FORCE;
+                return ShellConstants.S_OK;
             }
         }
 

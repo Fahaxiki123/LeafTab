@@ -2,12 +2,16 @@
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 构建现代一体化多标签顶栏与地址导航栏。编译产物为**不到 100 KB 的纯净单文件 `LeafTab.exe`**（系统自带运行时，零第三方 DLL 依赖）。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 构建苹果极简 + 液态玻璃（Liquid Glass）风格的双层悬浮胶囊多标签顶栏与地址导航舱。编译产物为**约 100 KB 的纯净单文件 `LeafTab.exe`**（系统自带运行时，零第三方 DLL 依赖）。
 
 ---
 
-## 核心特性（v0.1.0 原型版）
+## 核心特性（v0.2.0）
 
+- **极简液态玻璃（Liquid Glass）视觉设计**：
+  - **系统级分区真毛玻璃材质**：基于 DWM 桌面亚克力（`DWMSBT_TRANSIENTWINDOW`）仅对顶栏与底栏开启实时背景模糊（关闭标题栏强调色干扰 `DWMWA_COLOR_NONE`），中间原生文件区保持 `100%` 纯白不透明底色，确保原生 GDI ClearType 文件名锐利不发虚（Win10 环境自动降级为温润奶白磨砂渐变）；
+  - **Safari 双层悬浮胶囊顶栏**：圆角悬浮胶囊标签页、对称分段导航胶囊 `[ ‹ | › ]` + `[ ↑ ]`、内嵌文件夹图标与刷新键的一体化地址舱、`[ 详细信息 | 大图标 ]` 视图切换胶囊，以及右上角极简悬浮微图标窗口控制键；
+  - **纯净无冗余面板**：通过 `IExplorerPaneVisibility` 保留左侧原生导航树，自动剔除旧式 `组织 ▼` 灰色命令条与内层重复状态栏，底部仅保留 Finder 风格居中半透状态栏。
 - **原生文件浏览体验**：锁定 `x64` 进程托管 `IExplorerBrowser (EBO_SHOWFRAMES)`，保留系统原生左导航树、右键菜单（7-Zip / Git / SVN 等）、图标缩略图、此电脑磁盘容量条、回收站与 WSL 命名空间。
 - **零注入独立进程**：不向 `explorer.exe` 注入任何 BHO / Inline Hook DLL，不影响系统桌面稳定性，不修改任何系统注册表项。
 - **顺手的多标签与手势操作**：
