@@ -420,6 +420,7 @@
                                                 MouseLeftButtonDown="TabPill_MouseLeftButtonDown"
                                                 MouseMove="TabPill_MouseMove"
                                                 MouseLeftButtonUp="TabPill_MouseLeftButtonUp"
+                                                MouseRightButtonUp="TabPill_MouseRightButtonUp"
                                                 MouseUp="TabPill_MouseUp"
                                                 DragEnter="TabPill_DragEnter"
                                                 DragOver="TabPill_DragOver"
@@ -690,11 +691,12 @@
                                 </Button>
                             </Grid>
 
-                            <!-- Mode B: Full Path Text Edit -->
+                            <!-- Mode B: Full Path Text Edit + Autocomplete / History Popup -->
                             <Grid x:Name="AddressEditGrid" Visibility="Collapsed">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
 
@@ -716,7 +718,9 @@
                                          CaretBrush="#007AFF"
                                          GotKeyboardFocus="AddressTextBox_GotKeyboardFocus"
                                          LostKeyboardFocus="AddressTextBox_LostKeyboardFocus"
-                                         KeyDown="AddressTextBox_KeyDown" />
+                                         PreviewKeyDown="AddressTextBox_PreviewKeyDown"
+                                         KeyDown="AddressTextBox_KeyDown"
+                                         TextChanged="AddressTextBox_TextChanged" />
 
                                 <Border x:Name="AddressBusyIndicator"
                                         Grid.Column="2"
@@ -730,7 +734,99 @@
                                                FontSize="11"
                                                Foreground="#0062CC" />
                                 </Border>
+
+                                <Button x:Name="AddressHistoryToggleButton"
+                                        Grid.Column="3"
+                                        Width="24" Height="24" Padding="0"
+                                        Margin="2,0,1,0"
+                                        Focusable="False"
+                                        Style="{StaticResource GlassBreadcrumbSegmentButtonStyle}"
+                                        ToolTip="展开最近访问与路径补全 (↓)"
+                                        Click="AddressHistoryToggleButton_Click">
+                                    <Path Width="8.5" Height="5" Stretch="Uniform"
+                                          Stroke="#64748B" StrokeThickness="1.35"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                                          Data="M1,1 L4.5,4.5 L8,1" />
+                                </Button>
                             </Grid>
+
+                            <Popup x:Name="AddressSuggestPopup"
+                                   PlacementTarget="{Binding ElementName=AddressBoxBorder}"
+                                   Placement="Bottom"
+                                   VerticalOffset="4"
+                                   AllowsTransparency="True"
+                                   PopupAnimation="Fade"
+                                   StaysOpen="True"
+                                   Focusable="False">
+                                <Border Width="{Binding ActualWidth, ElementName=AddressBoxBorder}"
+                                        MaxHeight="306"
+                                        Margin="0,0,0,6"
+                                        Background="#FCFFFFFF"
+                                        BorderBrush="#220F172A"
+                                        BorderThickness="1"
+                                        CornerRadius="10"
+                                        Padding="4">
+                                    <ListBox x:Name="AddressSuggestListBox"
+                                             Focusable="False"
+                                             Background="Transparent"
+                                             BorderThickness="0"
+                                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                             ScrollViewer.VerticalScrollBarVisibility="Auto">
+                                        <ListBox.ItemContainerStyle>
+                                            <Style TargetType="ListBoxItem">
+                                                <Setter Property="Focusable" Value="False" />
+                                                <Setter Property="Padding" Value="9,5.5" />
+                                                <Setter Property="Margin" Value="0,1" />
+                                                <Setter Property="Background" Value="Transparent" />
+                                                <Setter Property="BorderThickness" Value="0" />
+                                                <EventSetter Event="PreviewMouseLeftButtonUp" Handler="AddressSuggestItem_MouseLeftButtonUp" />
+                                                <Setter Property="Template">
+                                                    <Setter.Value>
+                                                        <ControlTemplate TargetType="ListBoxItem">
+                                                            <Border x:Name="ItemBd"
+                                                                    Background="{TemplateBinding Background}"
+                                                                    CornerRadius="7"
+                                                                    Padding="{TemplateBinding Padding}">
+                                                                <ContentPresenter />
+                                                            </Border>
+                                                            <ControlTemplate.Triggers>
+                                                                <Trigger Property="IsMouseOver" Value="True">
+                                                                    <Setter TargetName="ItemBd" Property="Background" Value="#14007AFF" />
+                                                                </Trigger>
+                                                                <Trigger Property="IsSelected" Value="True">
+                                                                    <Setter TargetName="ItemBd" Property="Background" Value="#24007AFF" />
+                                                                </Trigger>
+                                                            </ControlTemplate.Triggers>
+                                                        </ControlTemplate>
+                                                    </Setter.Value>
+                                                </Setter>
+                                            </Style>
+                                        </ListBox.ItemContainerStyle>
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate>
+                                                <Grid>
+                                                    <Grid.RowDefinitions>
+                                                        <RowDefinition Height="Auto" />
+                                                        <RowDefinition Height="Auto" />
+                                                    </Grid.RowDefinitions>
+                                                    <TextBlock Grid.Row="0"
+                                                               Text="{Binding DisplayTitle}"
+                                                               FontSize="12.3"
+                                                               FontWeight="Medium"
+                                                               Foreground="#0F172A"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Grid.Row="1"
+                                                               Text="{Binding Subtitle}"
+                                                               FontSize="11"
+                                                               Foreground="#64748B"
+                                                               Margin="0,1,0,0"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Border>
+                            </Popup>
                         </Grid>
                     </Border>
 

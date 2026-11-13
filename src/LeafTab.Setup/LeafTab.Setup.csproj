@@ -1,0 +1,88 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\LeafTab\Assets\LeafTab.ico</ApplicationIcon>
+    <AssemblyName>LeafTab-v0.6.0-Setup-x64</AssemblyName>
+    <RootNamespace>LeafTab.Setup</RootNamespace>
+    <Version>0.6.0</Version>
+    <AssemblyTitle>LeafTab（一叶）v0.6.0 安装向导</AssemblyTitle>
+    <Product>LeafTab（一叶）</Product>
+    <Company>LeafTab</Company>
+    <Copyright>Copyright © LeafTab</Copyright>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LeafTab\LeafTab.csproj"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true" />
+  </ItemGroup>
+
+  <UsingTask TaskName="PackLeafTabPayloadTask"
+             TaskFactory="CodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SourceCandidate1 ParameterType="System.String" Required="true" />
+      <SourceCandidate2 ParameterType="System.String" Required="true" />
+      <OutputGzPath ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.IO.Compression" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        string srcPath = File.Exists(SourceCandidate1) ? SourceCandidate1 : SourceCandidate2;
+        if (!File.Exists(srcPath))
+        {
+            Log.LogError("LeafTab.exe payload not found at '{0}' or '{1}'. Build LeafTab first.", SourceCandidate1, SourceCandidate2);
+            return false;
+        }
+
+        string outDir = Path.GetDirectoryName(OutputGzPath);
+        if (!string.IsNullOrEmpty(outDir))
+        {
+            Directory.CreateDirectory(outDir);
+        }
+
+        byte[] rawBytes = File.ReadAllBytes(srcPath);
+        using (var fs = new FileStream(OutputGzPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (var gz = new GZipStream(fs, CompressionLevel.Optimal, leaveOpen: false))
+        {
+            gz.Write(rawBytes, 0, rawBytes.Length);
+        }
+
+        Log.LogMessage(MessageImportance.High, "Packed LeafTab.exe ({0} bytes -> {1} bytes GZip)", rawBytes.Length, new FileInfo(OutputGzPath).Length);
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="PackLeafTabPayload" BeforeTargets="BeforeResGen;PrepareResources;MarkupCompilePass1">
+    <PropertyGroup>
+      <_LeafTabExeCandidate1>$(MSBuildProjectDirectory)\..\LeafTab\bin\x64\$(Configuration)\net48\LeafTab.exe</_LeafTabExeCandidate1>
+      <_LeafTabExeCandidate2>$(MSBuildProjectDirectory)\..\LeafTab\bin\$(Configuration)\net48\LeafTab.exe</_LeafTabExeCandidate2>
+      <_PackedPayloadPath>$(IntermediateOutputPath)LeafTab.Payload.gz</_PackedPayloadPath>
+    </PropertyGroup>
+
+    <PackLeafTabPayloadTask SourceCandidate1="$(_LeafTabExeCandidate1)"
+                            SourceCandidate2="$(_LeafTabExeCandidate2)"
+                            OutputGzPath="$(_PackedPayloadPath)" />
+
+    <ItemGroup>
+      <EmbeddedResource Include="$(_PackedPayloadPath)">
+        <LogicalName>LeafTab.Payload.gz</LogicalName>
+      </EmbeddedResource>
+    </ItemGroup>
+  </Target>
+
+</Project>

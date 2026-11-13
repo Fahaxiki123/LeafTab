@@ -44,27 +44,20 @@ namespace LeafTab.Services
         public static AppConfig Load(string? customPath = null)
         {
             string path = customPath ?? ConfigFilePath;
-            try
+            string bakPath = path + ".bak";
+
+            AppConfig? primary = TryDeserializeFile(path);
+            if (primary != null)
             {
-                if (File.Exists(path))
-                {
-                    byte[] raw = File.ReadAllBytes(path);
-                    if (raw.Length > 0)
-                    {
-                        var serializer = new DataContractJsonSerializer(typeof(AppConfig));
-                        using var ms = new MemoryStream(raw);
-                        if (serializer.ReadObject(ms) is AppConfig loaded)
-                        {
-                            loaded.Bookmarks ??= new List<BookmarkConfigItem>();
-                            loaded.OpenTabs ??= new List<SavedTabConfigItem>();
-                            EnsureDefaultBookmarksIfNeeded(loaded);
-                            return loaded;
-                        }
-                    }
-                }
+                EnsureDefaultBookmarksIfNeeded(primary);
+                return primary;
             }
-            catch
+
+            AppConfig? backup = TryDeserializeFile(bakPath);
+            if (backup != null)
             {
+                EnsureDefaultBookmarksIfNeeded(backup);
+                return backup;
             }
 
             var fresh = new AppConfig();
@@ -72,9 +65,39 @@ namespace LeafTab.Services
             return fresh;
         }
 
+        private static AppConfig? TryDeserializeFile(string filePath)
+        {
+            try
+            {
+                if (!File.Exists(filePath))
+                    return null;
+
+                byte[] raw = File.ReadAllBytes(filePath);
+                if (raw.Length == 0)
+                    return null;
+
+                var serializer = new DataContractJsonSerializer(typeof(AppConfig));
+                using var ms = new MemoryStream(raw);
+                if (serializer.ReadObject(ms) is AppConfig loaded)
+                {
+                    loaded.Bookmarks ??= new List<BookmarkConfigItem>();
+                    loaded.OpenTabs ??= new List<SavedTabConfigItem>();
+                    return loaded;
+                }
+            }
+            catch
+            {
+            }
+
+            return null;
+        }
+
         public static bool Save(AppConfig config, string? customPath = null)
         {
             string path = customPath ?? ConfigFilePath;
+            string tempPath = path + ".tmp";
+            string bakPath = path + ".bak";
+
             try
             {
                 string? dir = Path.GetDirectoryName(path);
@@ -82,30 +105,99 @@ namespace LeafTab.Services
                     Directory.CreateDirectory(dir);
 
                 var serializer = new DataContractJsonSerializer(typeof(AppConfig));
-                using var ms = new MemoryStream();
-                using (XmlDictionaryWriter writer = JsonReaderWriterFactory.CreateJsonWriter(
-                    ms,
-                    Encoding.UTF8,
-                    ownsStream: false,
-                    indent: true,
-                    indentChars: "  "))
+                byte[] payload;
+                using (var ms = new MemoryStream())
                 {
-                    serializer.WriteObject(writer, config);
-                    writer.Flush();
+                    using (XmlDictionaryWriter writer = JsonReaderWriterFactory.CreateJsonWriter(
+                        ms,
+                        Encoding.UTF8,
+                        ownsStream: false,
+                        indent: true,
+                        indentChars: "  "))
+                    {
+                        serializer.WriteObject(writer, config);
+                        writer.Flush();
+                    }
+                    payload = ms.ToArray();
                 }
 
-                string tempPath = path + ".tmp";
-                File.WriteAllBytes(tempPath, ms.ToArray());
+                using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    fs.Write(payload, 0, payload.Length);
+                    fs.Flush(flushToDisk: true);
+                }
+
                 if (File.Exists(path))
                 {
-                    File.Delete(path);
+                    try
+                    {
+                        File.Replace(tempPath, path, bakPath, ignoreMetadataErrors: true);
+                        return true;
+                    }
+                    catch
+                    {
+                        // Fallback for filesystems that do not support ReplaceFileW (e.g. FAT32/exFAT USB drives)
+                        File.Copy(path, bakPath, overwrite: true);
+                        File.Copy(tempPath, path, overwrite: true);
+                        File.Delete(tempPath);
+                        return true;
+                    }
                 }
+
                 File.Move(tempPath, path);
                 return true;
             }
             catch
             {
+                try
+                {
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+                }
+                catch { }
                 return false;
+            }
+        }
+
+        public static BookmarkItemViewModel CreateBookmarkViewModelFast(string? title, string? targetPath)
+        {
+            string safePath = targetPath ?? string.Empty;
+            string displayTitle = title ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(displayTitle))
+            {
+                string trimmed = safePath.TrimEnd('\\', '/');
+                string leaf = Path.GetFileName(trimmed);
+                displayTitle = !string.IsNullOrWhiteSpace(leaf) ? leaf : (string.IsNullOrWhiteSpace(safePath) ? "文件夹" : safePath);
+            }
+
+            return new BookmarkItemViewModel
+            {
+                Title = displayTitle,
+                TargetPath = safePath,
+                Icon = null
+            };
+        }
+
+        public static void HydrateBookmarkIcon(BookmarkItemViewModel vm)
+        {
+            if (vm == null || vm.Icon != null || string.IsNullOrWhiteSpace(vm.TargetPath))
+                return;
+
+            IntPtr pidl = PidlManager.TryParseLocalOrShellFast(vm.TargetPath);
+            if (pidl == IntPtr.Zero)
+                return;
+
+            try
+            {
+                FolderDisplayInfo info = PidlManager.GetDisplayInfo(pidl);
+                if (info.Icon != null)
+                {
+                    vm.Icon = info.Icon;
+                }
+            }
+            finally
+            {
+                PidlManager.Free(ref pidl);
             }
         }
 

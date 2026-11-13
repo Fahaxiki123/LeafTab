@@ -11,9 +11,14 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\LeafTab.ico</ApplicationIcon>
     <AssemblyName>LeafTab</AssemblyName>
     <RootNamespace>LeafTab</RootNamespace>
-    <Version>0.4.0</Version>
+    <Version>0.6.0</Version>
+    <AssemblyTitle>LeafTab（一叶）多标签资源管理器</AssemblyTitle>
+    <Product>LeafTab（一叶）</Product>
+    <Company>LeafTab</Company>
+    <Copyright>Copyright © LeafTab</Copyright>
     <Deterministic>true</Deterministic>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>

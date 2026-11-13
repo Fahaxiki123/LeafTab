@@ -136,6 +136,8 @@ namespace LeafTab.Controls
         private readonly SUBCLASSPROC _directUiSubclassDelegate;
         private int _viewGeneration;
         private bool _showPreviewPane;
+        private bool _isMouseDownInView;
+        private bool _isKeyboardFocusActive;
         private bool _isDestroyed;
 
         private IExplorerBrowser? ActiveBrowser => (_isShowingSearchResults && _searchBrowser != null) ? _searchBrowser : _browser;
@@ -152,6 +154,7 @@ namespace LeafTab.Controls
         private bool _isShowingSearchResults;
         private bool _isFillSearchTransition;
         private bool _isSearchRunning;
+        private bool _isSearchTruncated;
         private int _searchMatchCount;
         private int _searchGeneration;
         private CancellationTokenSource? _searchCts;
@@ -161,6 +164,7 @@ namespace LeafTab.Controls
         public bool ShowPreviewPane => _showPreviewPane;
         public bool IsShowingSearchResults => _isShowingSearchResults;
         public bool IsSearchRunning => _isSearchRunning;
+        public bool IsSearchTruncated => _isSearchTruncated;
         public int SearchMatchCount => _searchMatchCount;
 
         public event EventHandler<NavigationCompletedEventArgs>? NavigationCompleted;
@@ -170,12 +174,41 @@ namespace LeafTab.Controls
         public event EventHandler? ViewInteractionOccurred;
         public event EventHandler? SearchStateChanged;
 
+        private bool _forwardingWheel;
+
         public ExplorerBrowserHost(IntPtr initialPidl, bool showPreviewPane = false)
         {
             _pendingInitialPidl = PidlManager.Clone(initialPidl);
             _showPreviewPane = showPreviewPane;
             _directUiSubclassDelegate = DirectUiSubclassProc;
             Focusable = true;
+        }
+
+        protected override IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            // When keyboard focus is parked on _hostHwnd (0 items selected), ensure mouse wheel still scrolls DirectUIHWND
+            // even on systems where Windows "Scroll inactive windows" is disabled.
+            if (!_isDestroyed &&
+                !_forwardingWheel &&
+                (msg == 0x020A || msg == 0x020E) &&
+                NativeMethods.GetFocus() == _hostHwnd &&
+                _subclassedDirectUiHwnd != IntPtr.Zero &&
+                NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+            {
+                _forwardingWheel = true;
+                try
+                {
+                    IntPtr res = NativeMethods.SendMessageW(_subclassedDirectUiHwnd, (uint)msg, wParam, lParam);
+                    handled = true;
+                    return res;
+                }
+                finally
+                {
+                    _forwardingWheel = false;
+                }
+            }
+
+            return base.WndProc(hwnd, msg, wParam, lParam, ref handled);
         }
 
         protected override HandleRef BuildWindowCore(HandleRef hwndParent)
@@ -243,7 +276,7 @@ namespace LeafTab.Controls
             var fs = new FOLDERSETTINGS
             {
                 ViewMode = FOLDERVIEWMODE.FVM_AUTO,
-                fFlags = FOLDERFLAGS.FWF_AUTOARRANGE | FOLDERFLAGS.FWF_SHOWSELALWAYS
+                fFlags = FOLDERFLAGS.FWF_AUTOARRANGE
             };
 
             int hr = _browser.Initialize(_browseHostHwnd, ref rc, ref fs);
@@ -827,57 +860,73 @@ namespace LeafTab.Controls
                     return (false, "未知的新建类型。");
             }
 
-            string createdName = baseName + ext;
-            string fullPath = Path.Combine(dir, createdName);
-            int suffix = 2;
-            while (File.Exists(fullPath) || Directory.Exists(fullPath))
-            {
-                createdName = $"{baseName} ({suffix}){ext}";
-                fullPath = Path.Combine(dir, createdName);
-                suffix++;
-            }
+            string createdName = string.Empty;
+            string fullPath = string.Empty;
+            bool created = false;
 
             try
             {
-                if (kind == NewItemKind.Folder)
+                for (int suffix = 1; suffix <= 500; suffix++)
                 {
-                    Directory.CreateDirectory(fullPath);
-                    NativeMethods.SHChangeNotifyPath(
-                        NativeMethods.SHCNE_MKDIR,
-                        NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
-                        fullPath,
-                        null);
-                }
-                else if (kind == NewItemKind.ZipArchive)
-                {
-                    // Standard 22-byte End of Central Directory (EOCD) empty ZIP header
-                    byte[] emptyZip =
+                    createdName = suffix == 1
+                        ? (baseName + ext)
+                        : $"{baseName} ({suffix}){ext}";
+                    fullPath = Path.Combine(dir, createdName);
+
+                    if (File.Exists(fullPath) || Directory.Exists(fullPath))
+                        continue;
+
+                    if (kind == NewItemKind.Folder)
                     {
-                        0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-                    };
-                    File.WriteAllBytes(fullPath, emptyZip);
-                    NativeMethods.SHChangeNotifyPath(
-                        NativeMethods.SHCNE_CREATE,
-                        NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
-                        fullPath,
-                        null);
+                        Directory.CreateDirectory(fullPath);
+                        NativeMethods.SHChangeNotifyPath(
+                            NativeMethods.SHCNE_MKDIR,
+                            NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
+                            fullPath,
+                            null);
+                        created = true;
+                        break;
+                    }
+
+                    try
+                    {
+                        using (var fs = new FileStream(fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                        {
+                            if (kind == NewItemKind.ZipArchive)
+                            {
+                                // Standard 22-byte End of Central Directory (EOCD) empty ZIP header
+                                byte[] emptyZip =
+                                {
+                                    0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                                };
+                                fs.Write(emptyZip, 0, emptyZip.Length);
+                            }
+                            fs.Flush();
+                        }
+
+                        NativeMethods.SHChangeNotifyPath(
+                            NativeMethods.SHCNE_CREATE,
+                            NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
+                            fullPath,
+                            null);
+                        created = true;
+                        break;
+                    }
+                    catch (IOException) when (File.Exists(fullPath) || Directory.Exists(fullPath))
+                    {
+                        // Concurrent creation won the name; retry atomically with the next suffix
+                    }
                 }
-                else
-                {
-                    File.WriteAllBytes(fullPath, Array.Empty<byte>());
-                    NativeMethods.SHChangeNotifyPath(
-                        NativeMethods.SHCNE_CREATE,
-                        NativeMethods.SHCNF_PATHW | NativeMethods.SHCNF_FLUSHNOWAIT,
-                        fullPath,
-                        null);
-                }
+
+                if (!created)
+                    return (false, "新建失败：同名项目过多。");
 
                 RefreshView();
                 await Task.Delay(120).ConfigureAwait(true);
                 FocusNativeView();
-                TrySelectAndEditByName(createdName);
+                TrySelectChildByName(createdName, beginRename: true);
                 InvalidateSelectionCache();
                 return (true, $"已创建 {createdName}");
             }
@@ -887,15 +936,38 @@ namespace LeafTab.Controls
             }
         }
 
-        private void TrySelectAndEditByName(string childFileName)
+        public async Task<bool> SelectChildItemWhenReadyAsync(string childFileName)
         {
-            if (_isDestroyed || _browser == null)
-                return;
+            if (string.IsNullOrWhiteSpace(childFileName))
+                return false;
+
+            for (int attempt = 0; attempt < 18; attempt++)
+            {
+                if (_isDestroyed)
+                    return false;
+
+                if (TrySelectChildByName(childFileName, beginRename: false))
+                {
+                    InvalidateSelectionCache();
+                    FocusNativeView();
+                    return true;
+                }
+
+                await Task.Delay(40).ConfigureAwait(true);
+            }
+
+            return false;
+        }
+
+        private bool TrySelectChildByName(string childFileName, bool beginRename)
+        {
+            if (_isDestroyed || _browser == null || string.IsNullOrWhiteSpace(childFileName))
+                return false;
 
             Guid iidSv = ShellConstants.IID_IShellView;
             Guid iidFv = ShellConstants.IID_IFolderView;
             if (_browser.GetCurrentView(ref iidSv, out IntPtr psv) != ShellConstants.S_OK || psv == IntPtr.Zero)
-                return;
+                return false;
 
             var sv = (IShellView)Marshal.GetObjectForIUnknown(psv);
             IntPtr pfv = IntPtr.Zero;
@@ -914,16 +986,17 @@ namespace LeafTab.Controls
                         sf = (IShellFolder)Marshal.GetObjectForIUnknown(pFolder);
                         uint eaten = 0;
                         uint attrs = 0;
-                        if (sf.ParseDisplayName(_hostHwnd, IntPtr.Zero, childFileName, ref eaten, out IntPtr childPidl, ref attrs) == ShellConstants.S_OK &&
+                        if (sf.ParseDisplayName(IntPtr.Zero, IntPtr.Zero, childFileName, ref eaten, out IntPtr childPidl, ref attrs) == ShellConstants.S_OK &&
                             childPidl != IntPtr.Zero)
                         {
                             try
                             {
-                                uint flags = ShellConstants.SVSI_EDIT |
+                                uint modeFlag = beginRename ? ShellConstants.SVSI_EDIT : ShellConstants.SVSI_SELECT;
+                                uint flags = modeFlag |
                                              ShellConstants.SVSI_DESELECTOTHERS |
                                              ShellConstants.SVSI_ENSUREVISIBLE |
                                              ShellConstants.SVSI_FOCUSED;
-                                sv.SelectItem(childPidl, flags);
+                                return sv.SelectItem(childPidl, flags) >= 0;
                             }
                             finally
                             {
@@ -932,6 +1005,8 @@ namespace LeafTab.Controls
                         }
                     }
                 }
+
+                return false;
             }
             finally
             {
@@ -1205,7 +1280,7 @@ namespace LeafTab.Controls
             var fs = new FOLDERSETTINGS
             {
                 ViewMode = FOLDERVIEWMODE.FVM_DETAILS,
-                fFlags = FOLDERFLAGS.FWF_AUTOARRANGE | FOLDERFLAGS.FWF_SHOWSELALWAYS
+                fFlags = FOLDERFLAGS.FWF_AUTOARRANGE
             };
 
             if (_searchBrowser.Initialize(_searchHostHwnd, ref initRect, ref fs) != ShellConstants.S_OK)
@@ -1258,10 +1333,11 @@ namespace LeafTab.Controls
 
             // Snapshot virtual folder children BEFORE switching view if there is no filesystem path
             List<byte[]>? virtualCandidates = null;
+            bool virtualTruncated = false;
             if (string.IsNullOrWhiteSpace(folderFileSystemPath) || !Directory.Exists(folderFileSystemPath))
             {
                 IntPtr sourceFolder = _preSearchFolderPidl != IntPtr.Zero ? _preSearchFolderPidl : currentFolderPidl;
-                virtualCandidates = CollectMatchingVirtualChildren(sourceFolder, query);
+                (virtualCandidates, virtualTruncated) = CollectMatchingVirtualChildren(sourceFolder, query);
             }
 
             CancelSearchWorkerOnly();
@@ -1273,29 +1349,33 @@ namespace LeafTab.Controls
             if (!EnsureSearchBrowserReady() || _searchBrowser == null)
             {
                 _isSearchRunning = false;
+                _isSearchTruncated = false;
                 SearchStateChanged?.Invoke(this, EventArgs.Empty);
                 return 0;
             }
 
             _isShowingSearchResults = true;
             _isSearchRunning = true;
+            _isSearchTruncated = false;
             _searchMatchCount = 0;
             InvalidateSelectionCache();
             _searchBrowser.SetEmptyText($"正在搜索“{query}”…");
             SearchStateChanged?.Invoke(this, EventArgs.Empty);
 
-            if (firstInit)
+            // Wait until the ResultsFolder IShellView is mounted and ready to accept items
+            for (int waitIdx = 0; waitIdx < (firstInit ? 16 : 6); waitIdx++)
             {
-                // Yield briefly on first lazy creation so ResultsFolder IShellView finishes mounting
-                await Task.Delay(60).ConfigureAwait(true);
-                _isFillSearchTransition = false;
                 if (_isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
                     return 0;
+
+                if (IsResultsFolderReady())
+                    break;
+
+                await Task.Delay(18).ConfigureAwait(true);
             }
-            else
-            {
-                _isFillSearchTransition = false;
-            }
+            _isFillSearchTransition = false;
+            if (_isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
+                return 0;
 
             AttachDirectUiSubclassIfNeeded();
             TrySetViewStyle(ExplorerViewStyle.Details);
@@ -1306,6 +1386,7 @@ namespace LeafTab.Controls
             {
                 int added = AddPidlBatchToResultsFolder(virtualCandidates);
                 _searchMatchCount = added;
+                _isSearchTruncated = virtualTruncated;
                 _isSearchRunning = false;
                 _searchBrowser.SetEmptyText(added == 0 ? "没有与搜索条件匹配的项。" : string.Empty);
                 InvalidateSelectionCache();
@@ -1316,6 +1397,7 @@ namespace LeafTab.Controls
             string rootDir = folderFileSystemPath!;
             (_, bool includeHidden) = PidlManager.GetShellVisibilityFlags();
             Func<string, bool> predicate = BuildFileNameMatcher(query);
+            bool fsTruncated = false;
 
             try
             {
@@ -1325,8 +1407,9 @@ namespace LeafTab.Controls
                     var dirStack = new Stack<string>();
                     dirStack.Push(rootDir);
                     int totalMatched = 0;
+                    bool stopScan = false;
 
-                    while (dirStack.Count > 0 && !token.IsCancellationRequested && totalMatched < MaxResults)
+                    while (dirStack.Count > 0 && !token.IsCancellationRequested && !stopScan)
                     {
                         string currentDir = dirStack.Pop();
                         IEnumerable<string> entries;
@@ -1344,8 +1427,11 @@ namespace LeafTab.Controls
                         {
                             foreach (string fullPath in entries)
                             {
-                                if (token.IsCancellationRequested || totalMatched >= MaxResults)
+                                if (token.IsCancellationRequested)
+                                {
+                                    stopScan = true;
                                     break;
+                                }
 
                                 string name = Path.GetFileName(fullPath);
                                 if (string.IsNullOrEmpty(name))
@@ -1366,6 +1452,13 @@ namespace LeafTab.Controls
 
                                 if (predicate(name))
                                 {
+                                    if (totalMatched >= MaxResults)
+                                    {
+                                        fsTruncated = true;
+                                        stopScan = true;
+                                        break;
+                                    }
+
                                     pendingBatch.Add(fullPath);
                                     totalMatched++;
 
@@ -1390,9 +1483,12 @@ namespace LeafTab.Controls
                             // Ignore transient IO/permission errors mid-enumeration
                         }
 
-                        for (int i = childDirsToVisit.Count - 1; i >= 0; i--)
+                        if (!stopScan)
                         {
-                            dirStack.Push(childDirsToVisit[i]);
+                            for (int i = childDirsToVisit.Count - 1; i >= 0; i--)
+                            {
+                                dirStack.Push(childDirsToVisit[i]);
+                            }
                         }
                     }
 
@@ -1408,6 +1504,7 @@ namespace LeafTab.Controls
 
             if (!_isDestroyed && myGen == _searchGeneration && !token.IsCancellationRequested)
             {
+                _isSearchTruncated = fsTruncated;
                 _isSearchRunning = false;
                 _searchBrowser?.SetEmptyText(_searchMatchCount == 0 ? "没有与搜索条件匹配的项。" : string.Empty);
                 InvalidateSelectionCache();
@@ -1508,6 +1605,18 @@ namespace LeafTab.Controls
             return added;
         }
 
+        private bool IsResultsFolderReady()
+        {
+            IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf);
+            if (rf == null)
+                return false;
+
+            Marshal.ReleaseComObject(rf);
+            if (prf != IntPtr.Zero)
+                Marshal.Release(prf);
+            return true;
+        }
+
         private IResultsFolder? AcquireResultsFolder(out IntPtr prf)
         {
             prf = IntPtr.Zero;
@@ -1535,16 +1644,17 @@ namespace LeafTab.Controls
             }
         }
 
-        private static List<byte[]> CollectMatchingVirtualChildren(IntPtr folderPidl, string query)
+        private static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(IntPtr folderPidl, string query)
         {
             var matched = new List<byte[]>();
+            bool truncated = false;
             if (folderPidl == IntPtr.Zero)
-                return matched;
+                return (matched, false);
 
             Func<string, bool> matcher = BuildFileNameMatcher(query);
             Guid iidShellItem = ShellConstants.IID_IShellItem;
             if (NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? folderItem) != ShellConstants.S_OK || folderItem == null)
-                return matched;
+                return (matched, false);
 
             IntPtr pSf = IntPtr.Zero;
             IShellFolder? sf = null;
@@ -1556,15 +1666,15 @@ namespace LeafTab.Controls
                 Guid bhid = new Guid("3981e224-f559-11d3-8e3a-00c04f6837d5");
                 Guid iidSf = ShellConstants.IID_IShellFolder;
                 if (folderItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidSf, out pSf) != ShellConstants.S_OK || pSf == IntPtr.Zero)
-                    return matched;
+                    return (matched, false);
 
                 sf = (IShellFolder)Marshal.GetObjectForIUnknown(pSf);
                 uint flags = ShellConstants.SHCONTF_FOLDERS | ShellConstants.SHCONTF_NONFOLDERS;
                 if (sf.EnumObjects(IntPtr.Zero, flags, out pEnum) != ShellConstants.S_OK || pEnum == IntPtr.Zero)
-                    return matched;
+                    return (matched, false);
 
                 enumList = (IEnumIDList)Marshal.GetObjectForIUnknown(pEnum);
-                while (matched.Count < 200 && enumList.Next(1, out IntPtr childRel, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRel != IntPtr.Zero)
+                while (enumList.Next(1, out IntPtr childRel, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRel != IntPtr.Zero)
                 {
                     IntPtr fullChild = IntPtr.Zero;
                     try
@@ -1576,6 +1686,12 @@ namespace LeafTab.Controls
                                 string? name = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
                                 if (!string.IsNullOrEmpty(name) && matcher(name!))
                                 {
+                                    if (matched.Count >= 200)
+                                    {
+                                        truncated = true;
+                                        break;
+                                    }
+
                                     fullChild = PidlManager.Combine(folderPidl, childRel);
                                     if (fullChild != IntPtr.Zero)
                                         matched.Add(PidlManager.ToBytes(fullChild));
@@ -1606,7 +1722,7 @@ namespace LeafTab.Controls
                 Marshal.ReleaseComObject(folderItem);
             }
 
-            return matched;
+            return (matched, truncated);
         }
 
         private static Func<string, bool> BuildFileNameMatcher(string query)
@@ -1664,6 +1780,7 @@ namespace LeafTab.Controls
             CancelSearchWorkerOnly();
             _isShowingSearchResults = false;
             _isFillSearchTransition = false;
+            _isSearchTruncated = false;
             _searchMatchCount = 0;
 
             if (freeSavedPidl)
@@ -1720,11 +1837,59 @@ namespace LeafTab.Controls
             return names;
         }
 
+        public void SuppressNativeFocusRect()
+        {
+            if (_isDestroyed || _hostHwnd == IntPtr.Zero || !NativeMethods.IsWindow(_hostHwnd))
+                return;
+
+            IntPtr hideWParam = NativeMethods.MakeUiStateWParam(
+                NativeMethods.UIS_SET,
+                (ushort)(NativeMethods.UISF_HIDEFOCUS | NativeMethods.UISF_HIDEACCEL));
+
+            IntPtr rootHwnd = NativeMethods.GetAncestor(_hostHwnd, NativeMethods.GA_ROOT);
+            if (rootHwnd != IntPtr.Zero && NativeMethods.IsWindow(rootHwnd))
+            {
+                NativeMethods.SendMessageW(rootHwnd, NativeMethods.WM_CHANGEUISTATE, hideWParam, IntPtr.Zero);
+                NativeMethods.SendMessageW(rootHwnd, NativeMethods.WM_UPDATEUISTATE, hideWParam, IntPtr.Zero);
+            }
+
+            NativeMethods.SendMessageW(_hostHwnd, NativeMethods.WM_UPDATEUISTATE, hideWParam, IntPtr.Zero);
+
+            NativeMethods.EnumChildWindows(_hostHwnd, (child, _) =>
+            {
+                NativeMethods.SendMessageW(child, NativeMethods.WM_UPDATEUISTATE, hideWParam, IntPtr.Zero);
+                return true;
+            }, IntPtr.Zero);
+
+            if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+            {
+                NativeMethods.InvalidateRect(_subclassedDirectUiHwnd, IntPtr.Zero, false);
+            }
+        }
+
+        public void ClearUnselectedItemFocusBoxIfNeeded()
+        {
+            if (_isDestroyed || _hostHwnd == IntPtr.Zero || _isMouseDownInView || _isKeyboardFocusActive)
+                return;
+
+            IntPtr focused = NativeMethods.GetFocus();
+            if (focused != IntPtr.Zero && _subclassedDirectUiHwnd != IntPtr.Zero && focused == _subclassedDirectUiHwnd)
+            {
+                InvalidateSelectionCache();
+                if (GetItemCounts().SelectedItems == 0)
+                {
+                    NativeMethods.SetFocus(_hostHwnd);
+                }
+            }
+        }
+
         public void FocusNativeView()
         {
             if (_isDestroyed || _hostHwnd == IntPtr.Zero) return;
 
+            _isKeyboardFocusActive = false;
             System.Windows.Input.Keyboard.ClearFocus();
+            SuppressNativeFocusRect();
 
             IExplorerBrowser? active = ActiveBrowser;
             if (active != null)
@@ -1735,19 +1900,23 @@ namespace LeafTab.Controls
                     var sv = (IShellView)Marshal.GetObjectForIUnknown(psv);
                     try
                     {
-                        sv.UIActivate(2); // SVUIA_ACTIVATE_FOCUS
+                        sv.UIActivate(1); // SVUIA_ACTIVATE_NOFOCUS
                         AttachDirectUiSubclassIfNeeded();
-                        if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+                        InvalidateSelectionCache();
+                        bool hasSelection = GetItemCounts().SelectedItems > 0;
+
+                        if (hasSelection && _subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
                         {
                             NativeMethods.SetFocus(_subclassedDirectUiHwnd);
+                            SuppressNativeFocusRect();
                             return;
                         }
 
-                        if (sv.GetWindow(out IntPtr viewHwnd) == ShellConstants.S_OK && viewHwnd != IntPtr.Zero)
-                        {
-                            NativeMethods.SetFocus(viewHwnd);
-                            return;
-                        }
+                        // Keep keyboard focus on outer _hostHwnd when 0 items are selected so DirectUI ItemsView
+                        // never sets keyfocused="true" (the 1px solid black rectangle) on unselected item 0!
+                        NativeMethods.SetFocus(_hostHwnd);
+                        SuppressNativeFocusRect();
+                        return;
                     }
                     finally
                     {
@@ -1758,10 +1927,8 @@ namespace LeafTab.Controls
             }
 
             AttachDirectUiSubclassIfNeeded();
-            if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
-            {
-                NativeMethods.SetFocus(_subclassedDirectUiHwnd);
-            }
+            NativeMethods.SetFocus(_hostHwnd);
+            SuppressNativeFocusRect();
         }
 
         public bool IsNativeFocusInside()
@@ -1778,6 +1945,23 @@ namespace LeafTab.Controls
             IExplorerBrowser? active = ActiveBrowser;
             if (_isDestroyed || active == null || !IsNativeFocusInside())
                 return false;
+
+            bool parkedOnHost = NativeMethods.GetFocus() == _hostHwnd;
+            if (parkedOnHost && wpfMsg.message == (int)NativeMethods.WM_KEYDOWN)
+            {
+                int vk = wpfMsg.wParam.ToInt32();
+                // Ignore bare modifier presses (Shift=0x10, Ctrl=0x11, Alt=0x12, LWin=0x5B, RWin=0x5C)
+                if (vk != 0x10 && vk != 0x11 && vk != 0x12 && vk != 0x5B && vk != 0x5C)
+                {
+                    _isKeyboardFocusActive = true;
+                    AttachDirectUiSubclassIfNeeded();
+                    if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+                    {
+                        NativeMethods.SetFocus(_subclassedDirectUiHwnd);
+                        wpfMsg.hwnd = _subclassedDirectUiHwnd;
+                    }
+                }
+            }
 
             Guid iidShellView = ShellConstants.IID_IShellView;
             if (active.GetCurrentView(ref iidShellView, out IntPtr psv) != ShellConstants.S_OK || psv == IntPtr.Zero)
@@ -1796,7 +1980,21 @@ namespace LeafTab.Controls
                     pt = new POINT(wpfMsg.pt_x, wpfMsg.pt_y)
                 };
 
-                return sv.TranslateAccelerator(ref nativeMsg) == ShellConstants.S_OK;
+                if (sv.TranslateAccelerator(ref nativeMsg) == ShellConstants.S_OK)
+                    return true;
+
+                // If focus was parked on _hostHwnd when this keydown began, forward navigation/type-ahead keys directly to DirectUIHWND
+                if (parkedOnHost &&
+                    _isKeyboardFocusActive &&
+                    wpfMsg.message == (int)NativeMethods.WM_KEYDOWN &&
+                    _subclassedDirectUiHwnd != IntPtr.Zero &&
+                    NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+                {
+                    NativeMethods.SendMessageW(_subclassedDirectUiHwnd, (uint)wpfMsg.message, wpfMsg.wParam, wpfMsg.lParam);
+                    return true;
+                }
+
+                return false;
             }
             finally
             {
@@ -1812,15 +2010,20 @@ namespace LeafTab.Controls
             InvalidateSelectionCache();
             SyncBrowserRect();
             AttachDirectUiSubclassIfNeeded();
+            SuppressNativeFocusRect();
         }
 
         private void OnNativeNavigationComplete(IntPtr pidlFolder)
         {
             if (_isDestroyed) return;
             _viewGeneration++;
+            _isKeyboardFocusActive = false;
+            _isMouseDownInView = false;
             InvalidateSelectionCache();
             SyncBrowserRect();
             AttachDirectUiSubclassIfNeeded();
+            SuppressNativeFocusRect();
+            ClearUnselectedItemFocusBoxIfNeeded();
 
             // Internal ResultsFolder creation during FillFromObject(null, 0)
             if (_isFillSearchTransition)
@@ -1853,7 +2056,9 @@ namespace LeafTab.Controls
                     {
                         SyncBrowserRect();
                         AttachDirectUiSubclassIfNeeded();
+                        SuppressNativeFocusRect();
                         NavigationCompleted?.Invoke(this, new NavigationCompletedEventArgs(cloned));
+                        ClearUnselectedItemFocusBoxIfNeeded();
                     }
                 }
                 finally
@@ -1893,6 +2098,7 @@ namespace LeafTab.Controls
             if (NativeMethods.SetWindowSubclass(foundDirectUi, _directUiSubclassDelegate, DirectUiSubclassId, UIntPtr.Zero))
             {
                 _subclassedDirectUiHwnd = foundDirectUi;
+                SuppressNativeFocusRect();
             }
         }
 
@@ -1975,8 +2181,28 @@ namespace LeafTab.Controls
                 return NativeMethods.DefSubclassProc(hWnd, uMsg, wParam, lParam);
             }
 
+            bool checkFocusParkAfter = false;
             if (!_isDestroyed)
             {
+                if (uMsg == NativeMethods.WM_LBUTTONDOWN ||
+                    uMsg == NativeMethods.WM_RBUTTONDOWN ||
+                    uMsg == NativeMethods.WM_MBUTTONDOWN)
+                {
+                    _isMouseDownInView = true;
+                    _isKeyboardFocusActive = false;
+                }
+                else if (uMsg == NativeMethods.WM_LBUTTONUP ||
+                         uMsg == NativeMethods.WM_RBUTTONUP ||
+                         uMsg == NativeMethods.WM_MBUTTONUP)
+                {
+                    _isMouseDownInView = false;
+                    checkFocusParkAfter = true;
+                }
+                else if (uMsg == NativeMethods.WM_SETFOCUS)
+                {
+                    checkFocusParkAfter = true;
+                }
+
                 if (uMsg == NativeMethods.WM_MBUTTONUP || uMsg == NativeMethods.WM_LBUTTONDBLCLK)
                 {
                     POINT ptScreen = NativeMethods.PointFromLParam(lParam);
@@ -2002,7 +2228,12 @@ namespace LeafTab.Controls
                 }
             }
 
-            return NativeMethods.DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            IntPtr result = NativeMethods.DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            if (checkFocusParkAfter && !_isDestroyed)
+            {
+                ClearUnselectedItemFocusBoxIfNeeded();
+            }
+            return result;
         }
 
         private void OnUiaGestureEvaluatedFromMta(UiaHitResult result, int expectedGeneration)

@@ -69,11 +69,28 @@ flowchart TD
    - 标签栏水平拖拽排序、`Ctrl+Shift+T` 恢复最近关闭标签（最多保留 25 条历史快照）、每标签独立前进/后退历史栈；
    - 零外部依赖 `config.json` 本地持久化（基于内置 `DataContractJsonSerializer`，便携目录可写时优先存于程序同级，否则自动回退 `%LOCALAPPDATA%\LeafTab\config.json`），自动保存与恢复窗口位置、打开标签、历史栈、书签栏及预览窗格状态。
 
-### 阶段三：独立增强项与安全系统集成（规划中）
-1. **窗口拆合与单实例汇聚**：基于 `NamedPipe` 合并外部传入路径；支持标签拖出独立成新窗口及拖入合并。
-2. **系统入口集成（全部可选、默认关闭）**：
-   - 文件夹背景与目录右键菜单**「在 LeafTab 中打开」**；
-   - 可选 `Win+E` 与默认打开文件夹接管（含 `HKCU` 原值备份 + **关闭恢复前比对当前键值是否仍属 LeafTab** 的防误伤锁，并在 Win10/Win11 逐项验证桌面、开始菜单、第三方软件“打开所在文件夹”入口）。
-3. **专项增强验证（按需开启）**：
-   - **原生视图深色模式专项验证**：实测文件列表、导航树、列头与菜单深色一致性达标后再开放深色开关；
-   - **后台标签休眠回收（备选）**：仅在超多标签极端负载下按需启用，严格保护正在拖放、内联重命名或弹出上下文菜单的标签不被回收，唤醒时完整还原路径、历史栈、排序及滚动/选中状态。
+### 阶段三：单实例汇聚、安全系统集成与数据可靠性加固（已完成 - v0.5.0）
+1. **单实例多标签汇聚与命令行兼容（`SingleInstanceService`）**：
+   - 基于当前登录用户作用域 `Mutex` + 异步并发 `NamedPipe`（`MaxAllowedServerInstances`），配合 `AllowSetForegroundWindow(ASFW_ANY)` 跨进程前台唤醒；
+   - 完整兼容 `LeafTab.exe "<目录>"`、`/select,"<文件>"`、`/n,/e` 组合参数、直接传入非压缩包文件路径以及盘符根目录 `"%V "` 反斜杠引号转义，自动打开新标签并通过 `IShellView::SelectItem` 定位选中目标项。
+2. **纯 `HKCU` 系统入口集成与 `DelegateExecute` 本地 COM 路由（默认关闭，位于 `⋯` 菜单）**：
+   - **文件夹与磁盘右键菜单「在 LeafTab 中打开」**：注册 `Directory\shell`、`Directory\Background\shell` 与 `Drive\shell`；
+   - **设为默认资源管理器（接管文件夹与 `Win + E`）**：覆盖 `Directory\shell`、`Drive\shell`、`Folder\shell`（含 `open` / `explore` / `opennewwindow` 显式动词）与 `CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}`；通过内置 `IExecuteCommand`（`DelegateExecute`）智能分流：遇到控制面板/系统组件虚拟项时原位委托系统 `CLSID_ExecuteFolder`，在 LeafTab 自身视图及任何软件 `#32770` 文件打开/保存对话框内保持 **`0ms` 原位目录跳转**，而对桌面、`此电脑`、任务栏「文件资源管理器」、`Win + E` 及外部软件打开目录请求 100% 汇入 LeafTab；
+   - **关闭窗口后热驻留秒开与原生窗口生命周期**：关闭主窗口时干净销毁当次窗口标签并进入零 CPU 热驻留（保留 1 个预热宿主供任意目标文件夹直接接管），使后续打开任意目录耗时降至毫秒级；同时在未选中项目时将 Win32 键盘焦点停靠于外层宿主窗口以彻底消除 DirectUI `ItemsView` 默认首项 `1px` 黑框，首键按下即无感归还焦点；
+   - **安全备份、归属校验锁与路径自愈**：写入前备份原值至 `HKCU\Software\LeafTab\RegistryBackup`，关闭时校验归属权避免覆盖第三方工具；程序移动目录或升级后启动自动修复补全注册表路径，并提供 `--quit` 与 `--unregister-shell` 命令行控制开关。
+3. **高性价比可靠性加固**：
+   - 会话变更 `1.8s` 空闲防抖自动保存 + `File.Replace` 原子替换 + `.bak` 损坏自动回退恢复；
+   - 新建文件采用 `FileMode.CreateNew`（`FileShare.None`）原子创建与后缀重试，杜绝并发覆盖；
+   - 修正预热「此电脑」页签恢复历史与导航失败索引回滚，完善跨标签异步地址跳转/搜索防抖隔离与 `--self-test` 严格断言退出码。
+
+### 阶段四：多窗口协同、开发者快捷流与公开发布防呆打磨（已完成 - v0.6.0）
+1. **单进程多窗口协同（`App.ManagedWindows` + 双 `DelegateExecute` CLSID）**：
+   - 支持 `Ctrl+N`、`--new-window`、系统右键 `Folder\shell\opennewwindow` 专属 COM CLSID、标签右键「移动到新窗口 / 在新窗口中打开」及标签垂直拖出撕裂分屏（通过 `ClosedTabSnapshot` 重建跨窗口页签并无损迁移历史栈）；
+   - 按顶层窗口 `GA_ROOT` 句柄隔离 `ComponentDispatcher.ThreadPreprocessMessage` 键盘与鼠标侧键消息，多窗口共享书签栏与最近访问目录同步，关闭副窗口立即销毁，仅最后一个可见窗口进入热驻留。
+2. **高频操作体验与开发者工作流补齐**：
+   - 统一拦截 `WM_XBUTTONDOWN/UP` 与 `WM_APPCOMMAND` 实现全区域鼠标侧键前进/后退；
+   - 外部重复打开已存在目录时跨窗口智能激活复用原页签（并刷新 `/select` 选中项）；
+   - 地址栏支持 `wt` / `powershell` / `pwsh` / `cmd` / `code .` 原地启动与 `` Ctrl + ` `` 快捷键，配备悬浮 `Popup`（`Focusable="False"` 规避 `HwndHost` 空域遮挡与失焦冲突）实现最近目录历史与本地子文件夹 `Tab` 逐级自动补全；
+   - 非激活/最小化窗口自动暂停 `350ms` 状态栏轮询，恢复激活时即时同步。
+3. **易清理目录防误删自安装保护（`QuickLaunchAndInstallService`）**：
+   - 检测 `Downloads / Desktop / Temp` 等易清理运行路径，在开启默认资源管理器时引导一键自我复制至 `%LOCALAPPDATA%\Programs\LeafTab\LeafTab.exe`、通过原生 `IShellLinkW` 生成开始菜单快捷方式并执行 `--handoff` 无缝进程接力；同时防止临时目录副本在启动自愈时反向覆盖已安装的固定路径。

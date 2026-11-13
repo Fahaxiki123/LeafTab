@@ -526,6 +526,65 @@ namespace LeafTab.Interop
             }
         }
 
+        public static bool IsExplorerLauncherTarget(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                return false;
+
+            string s = raw!.Trim().Trim('"').Trim();
+            if (s.Length == 0)
+                return false;
+
+            // Windows 10/11 File Explorer launcher stub CLSID (invoked by Taskbar/Start Menu File Explorer shortcut & Win+E)
+            if (s.IndexOf("52205fd8-5dfb-447d-801a-d0b52f2e83e1", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            if (string.Equals(s, "文件资源管理器", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "File Explorer", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "Windows 资源管理器", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "Windows Explorer", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (s.EndsWith(@"\File Explorer.lnk", StringComparison.OrdinalIgnoreCase) ||
+                s.EndsWith(@"\文件资源管理器.lnk", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "File Explorer.lnk", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "文件资源管理器.lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static IntPtr NormalizeToBrowsablePidl(IntPtr pidl)
+        {
+            if (pidl == IntPtr.Zero)
+                return IntPtr.Zero;
+
+            Guid iidShellItem = ShellConstants.IID_IShellItem;
+            if (NativeMethods.SHCreateItemFromIDList(pidl, ref iidShellItem, out IShellItem? item) == ShellConstants.S_OK && item != null)
+            {
+                try
+                {
+                    string? parsing = GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
+                    string? title = GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
+                    if (IsExplorerLauncherTarget(parsing) || IsExplorerLauncherTarget(title))
+                    {
+                        Free(ref pidl);
+                        return CreateThisPcPidl();
+                    }
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(item);
+                }
+            }
+
+            return pidl;
+        }
+
         /// <summary>
         /// Synchronous local/shell parsing helper used during startup session restoration for known local/virtual paths.
         /// Skips blocking UNC network paths unless allowUnc is true.
@@ -537,36 +596,9 @@ namespace LeafTab.Interop
 
             string expanded = Environment.ExpandEnvironmentVariables(rawPath!.Trim().Trim('"'));
 
-            if (string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "This PC", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "计算机", StringComparison.OrdinalIgnoreCase))
-            {
-                return CreateThisPcPidl();
-            }
-
-            if (string.Equals(expanded, "桌面", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Desktop", StringComparison.OrdinalIgnoreCase))
-            {
-                return CreateDesktopPidl();
-            }
-
-            if (string.Equals(expanded, "回收站", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Recycle Bin", StringComparison.OrdinalIgnoreCase))
-            {
-                return CreateKnownFolderPidl(NativeMethods.FOLDERID_RecycleBinFolder);
-            }
-
-            if (string.Equals(expanded, "下载", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Downloads", StringComparison.OrdinalIgnoreCase))
-            {
-                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Downloads);
-            }
-
-            if (string.Equals(expanded, "文档", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Documents", StringComparison.OrdinalIgnoreCase))
-            {
-                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Documents);
-            }
+            IntPtr known = TryParseKnownAlias(expanded);
+            if (known != IntPtr.Zero)
+                return known;
 
             bool isUnc = expanded.StartsWith(@"\\", StringComparison.Ordinal) &&
                          !expanded.StartsWith(@"\\wsl", StringComparison.OrdinalIgnoreCase);
@@ -577,7 +609,7 @@ namespace LeafTab.Interop
                 expanded += @"\";
 
             if (NativeMethods.SHParseDisplayName(expanded, IntPtr.Zero, out IntPtr pidl, 0, out _) == ShellConstants.S_OK && pidl != IntPtr.Zero)
-                return pidl;
+                return NormalizeToBrowsablePidl(pidl);
 
             return IntPtr.Zero;
         }
@@ -636,13 +668,13 @@ namespace LeafTab.Interop
 
             int parseHr = NativeMethods.SHParseDisplayName(expanded, IntPtr.Zero, out IntPtr resultPidl, 0, out _);
             if (parseHr == ShellConstants.S_OK && resultPidl != IntPtr.Zero)
-                return (resultPidl, null);
+                return (NormalizeToBrowsablePidl(resultPidl), null);
 
             if (Directory.Exists(expanded))
             {
                 string full = Path.GetFullPath(expanded);
                 if (NativeMethods.SHParseDisplayName(full, IntPtr.Zero, out resultPidl, 0, out _) == ShellConstants.S_OK)
-                    return (resultPidl, null);
+                    return (NormalizeToBrowsablePidl(resultPidl), null);
             }
 
             return (IntPtr.Zero, $"找不到路径：{expanded}");
@@ -650,10 +682,20 @@ namespace LeafTab.Interop
 
         private static IntPtr TryParseKnownAlias(string expanded)
         {
-            if (string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
+            if (IsExplorerLauncherTarget(expanded) ||
+                string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(expanded, "This PC", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(expanded, "计算机", StringComparison.OrdinalIgnoreCase))
             {
+                return CreateThisPcPidl();
+            }
+
+            if (string.Equals(expanded, "主文件夹", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "快速访问", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Quick access", StringComparison.OrdinalIgnoreCase))
+            {
+                if (NativeMethods.SHParseDisplayName("shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}", IntPtr.Zero, out IntPtr homePidl, 0, out _) == ShellConstants.S_OK && homePidl != IntPtr.Zero)
+                    return homePidl;
                 return CreateThisPcPidl();
             }
 

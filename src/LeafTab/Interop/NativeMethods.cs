@@ -129,21 +129,54 @@ namespace LeafTab.Interop
         public const int WS_CLIPSIBLINGS = 0x04000000;
 
         public const int SW_HIDE = 0;
-        public const int SW_SHOW = 5;
         public const int SW_SHOWNORMAL = 1;
+        public const int SW_SHOWMAXIMIZED = 3;
+        public const int SW_SHOW = 5;
+        public const int SW_RESTORE = 9;
+        public const int ASFW_ANY = -1;
+        public const uint GA_ROOT = 2;
 
+        public const uint CLSCTX_INPROC_SERVER = 0x1;
+        public const uint CLSCTX_LOCAL_SERVER = 0x4;
+        public const uint REGCLS_MULTIPLEUSE = 0x1;
+
+        public const uint WM_SETFOCUS = 0x0007;
         public const uint WM_KEYDOWN = 0x0100;
         public const uint WM_KEYUP = 0x0101;
         public const uint WM_CHAR = 0x0102;
         public const uint WM_SYSKEYDOWN = 0x0104;
         public const uint WM_SYSKEYUP = 0x0105;
+        public const uint WM_CHANGEUISTATE = 0x0127;
+        public const uint WM_UPDATEUISTATE = 0x0128;
+        public const uint WM_QUERYUISTATE = 0x0129;
+        public const uint WM_LBUTTONDOWN = 0x0201;
         public const uint WM_LBUTTONUP = 0x0202;
         public const uint WM_LBUTTONDBLCLK = 0x0203;
+        public const uint WM_RBUTTONDOWN = 0x0204;
         public const uint WM_RBUTTONUP = 0x0205;
         public const uint WM_MBUTTONDOWN = 0x0207;
         public const uint WM_MBUTTONUP = 0x0208;
+        public const uint WM_XBUTTONDOWN = 0x020B;
+        public const uint WM_XBUTTONUP = 0x020C;
+        public const uint WM_NCXBUTTONDOWN = 0x00AB;
+        public const uint WM_NCXBUTTONUP = 0x00AC;
+        public const uint WM_APPCOMMAND = 0x0319;
         public const uint WM_ERASEBKGND = 0x0014;
         public const uint WM_NCDESTROY = 0x0082;
+
+        public const int XBUTTON1 = 1;
+        public const int XBUTTON2 = 2;
+        public const int APPCOMMAND_BROWSER_BACKWARD = 1;
+        public const int APPCOMMAND_BROWSER_FORWARD = 2;
+
+        public const ushort UIS_SET = 1;
+        public const ushort UIS_CLEAR = 2;
+        public const ushort UIS_INITIALIZE = 3;
+        public const ushort UISF_HIDEFOCUS = 0x1;
+        public const ushort UISF_HIDEACCEL = 0x2;
+
+        public static IntPtr MakeUiStateWParam(ushort action, ushort flags) =>
+            (IntPtr)(((uint)flags << 16) | action);
 
         public const int WHITE_BRUSH = 0;
 
@@ -242,6 +275,57 @@ namespace LeafTab.Interop
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [DllImport("ole32.dll")]
+        public static extern int CoRegisterClassObject(
+            ref Guid rclsid,
+            [MarshalAs(UnmanagedType.Interface)] IClassFactory pUnk,
+            uint dwClsContext,
+            uint flags,
+            out uint lpdwRegister);
+
+        [DllImport("ole32.dll")]
+        public static extern int CoRevokeClassObject(uint dwRegister);
+
+        [DllImport("ole32.dll")]
+        public static extern int CoCreateInstance(
+            ref Guid rclsid,
+            IntPtr pUnkOuter,
+            uint dwClsContext,
+            ref Guid riid,
+            out IntPtr ppv);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr SendMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, [MarshalAs(UnmanagedType.Bool)] bool bErase);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
 
         [DllImport("user32.dll")]
@@ -323,6 +407,13 @@ namespace LeafTab.Interop
             uint dwFlags,
             IntPtr hToken,
             out IntPtr ppidl);
+
+        [DllImport("shell32.dll")]
+        public static extern int SHGetKnownFolderPath(
+            ref Guid rfid,
+            uint dwFlags,
+            IntPtr hToken,
+            out IntPtr ppszPath);
 
         [DllImport("shell32.dll")]
         public static extern int SHCreateItemFromIDList(

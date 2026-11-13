@@ -1,49 +1,65 @@
-# LeafTab 兼容性与资源压测记录（v0.4.0 液态玻璃与丝滑切换版）
+﻿# LeafTab Stage 1-3 + Liquid Glass (v0.6.0) Automated Diagnostic Telemetry
+- Timestamp: 2026-11-13 18:30:22
+- OSVersion: Microsoft Windows NT 10.0.26200.0 (64BitOS=True, 64BitProc=True)
+- CLR Version: 4.0.30319.42000
+- Executable: D:\LeafTab\src\LeafTab\bin\x64\Release\net48\LeafTab.exe (321.5 KB)
+- ResolvedProjectDir: D:\LeafTab
 
-- **测试时间**：2026-11-13 13:32
-- **编译产物**：`src\LeafTab\bin\x64\Release\net48\LeafTab.exe`（单执行文件 **`200.5 KB`**，64 位 `x64`，零第三方 DLL）
-- **当前实测环境**：Windows 11 x64（`10.0.26200.0`）+ `.NET Framework 4.8`（CLR `4.0.30319.42000`）
-- **目标待复测环境**：真实 **Windows 10 x64（1903~22H2）** 物理机/虚拟机（待手动复核云雾纯色降级视觉）
+## 1. Folder & Namespace Navigation Checks
+- [此电脑] Title='此电脑', ItemCount=3, Items=[WPS云盘, 系统 (C:), 新加卷 (D:)]
+  - [此电脑 GroupHeader '设备和驱动器'] DoubleClick -> IgnoredOrAmbiguous (Leaf='UIProperty')
+  - [此电脑 Item 'WPS云盘'] MiddleClick -> HitItem (3.01ms), Resolved=True ('D:\WPS\WPS Cloud\WPSDrive\603841493\WPS云盘')
+  - [此电脑 Item '系统 (C:)'] MiddleClick -> HitItem (3.92ms), Resolved=True ('C:\')
+  - [此电脑 Item '新加卷 (D:)'] MiddleClick -> HitItem (2.68ms), Resolved=True ('D:\')
+- [当前项目目录 D:\LeafTab] Input='D:\LeafTab' -> OK (411ms), Title='LeafTab', Count=6, Sample=[src, .gitignore, COMPATIBILITY_REPORT, DESIGN, LeafTab.sln, README]
+  - GestureProbe [详细信息视图 (FVM_DETAILS)]: DirectUIHWND=0xC21246, DiscoveredElements=6
+    * Item 'src' (AutoId='0'): MiddleClick -> HitItem (3.00ms, FOLDER_RESOLVED='D:\LeafTab\src'); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIProperty')
+    * Item '.gitignore' (AutoId='1'): MiddleClick -> HitItem (2.29ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIProperty')
+    * Item 'COMPATIBILITY_REPORT' (AutoId='2'): MiddleClick -> HitItem (2.78ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIProperty')
+    * Item 'DESIGN' (AutoId='3'): MiddleClick -> HitItem (2.25ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIProperty')
+    * BlankArea (727,828): DoubleClick -> HitBlankView (1.97ms, Leaf='UIItemsView')
+  - GestureProbe [图标视图 (FVM_ICON)]: DirectUIHWND=0xC21246, DiscoveredElements=6
+    * Item 'src' (AutoId='0'): MiddleClick -> HitItem (3.67ms, FOLDER_RESOLVED='D:\LeafTab\src'); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIItem')
+    * Item '.gitignore' (AutoId='1'): MiddleClick -> HitItem (2.17ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIItem')
+    * Item 'COMPATIBILITY_REPORT' (AutoId='2'): MiddleClick -> HitItem (2.66ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIProperty')
+    * Item 'DESIGN' (AutoId='3'): MiddleClick -> HitItem (2.93ms, REJECTED (Non-folder or ambiguous)); DoubleClickOnItem -> IgnoredOrAmbiguous (Leaf='UIItem')
+    * BlankArea (727,828): DoubleClick -> HitBlankView (1.63ms, Leaf='UIItemsView')
 
----
+## 2. Stage 2 Feature Checks (Breadcrumbs, History Stack, Async Search, Reopen Tab, config.json)
+- BreadcrumbChain: [此电脑 > 新加卷 (D:) > LeafTab] (Count=3)
+- HistoryStack Back/Forward: CanBackBefore=True, CanFwdAfterBack=True, RestoredTitle='LeafTab'
+- AsyncSearch '*.cs': MatchedCount=46, Elapsed=230ms, EnteredSearchMode=True, ExitedCleanly=True, Sample=[App.xaml.cs, AdaptiveTabStripPanel.cs, ExplorerBrowserHost.cs, SelfTestRunner.cs, NativeMethods.cs]
+- ReopenClosedTab (Ctrl+Shift+T): Closed='下载', Reopened=True, ActiveTitle='下载'
+- PrewarmedThisPcTabPool: Armed=True, SwitchLatency=27.10ms, DirectUiImmediate=True, ConsumedCleanly=True
+- PrewarmedReopenHistoryRetention: Reopened=True, NavigatedProject=True, CanNavigateBack=True
+- ConfigJsonAtomicAndBackupRecovery: SavedV1=True, SavedV2=True, LoadedV2Bar=True, BakRecovered=True
 
-## 一、 功能、UI 与流畅度矩阵（状态：通过 / 存在限制 / 暂不支持 / 待人工复核）
+## 2B. Stage 3 & v0.6.0 Checks (CLI Parser, Multi-Window, Side Buttons, Smart Reuse, Address Autocomplete, Volatile Guard, HKCU Sandbox)
+- LaunchRequestParserChecks: Passed=True (QuoteFix='D:\', CommaSelect='D:\Work, 2026' -> 'report.pdf', ExplorerLauncherRedirect='此电脑', Flags=True)
+- ExplorerLauncherClsidRedirect: Passed=True
+- DirectUiFocusSuppression: DirectUIHWND=0x1C12DC, FocusHwnd=0x2710A0, Selected=0, UIState=0x3, HideFocusActive=True, ParkedAwayFromDirectUI=True
+- MouseSideButtons (XBUTTON1/XBUTTON2): Back=True, Forward=True, RestoredTitle='LeafTab' (Matched=True)
+- MultiWindowSplitAndClose: Duplicated=True, SecondWindowOpenedWithHistory=True, SecondaryClosedCleanly=True
+- ExternalLaunchAndSmartReuse: NewTabForUnopen=True, ReusedDuplicateFolder=True, ReusedAndSelectedSln=True
+- AddressAutocompleteAndVolatileGuard: ToolCmds=True, AutocompleteMatchedSrc=True, VolatileGuard=True
+- MinimizedStatusPollingThrottle: PausedWhenMinimized=True
+- ShellIntegrationSandbox: Enabled=True, SelfHealed=True, FolderOpenAndNewWinUpgraded=True, VolatileRefusedClobber=True, OwnershipProtected=True, RestoredPriorVerb='CustomPriorVerb' (CleanRollback=True)
+- [虚拟目录：回收站] Input='回收站' -> OK (400ms), Title='回收站', Count=9, Sample=[D:\project\trunk\Client\assets\resources\ConfigForClient.zip.r44, D:\project\trunk\Config\sharedata\excel\D-单位属性表(UnitAttrData), D:\project\trunk\Client\assets\script\Config\Typings\HeroData.ts.mine, D:\project\trunk\Client\assets\script\Config\Typings\HeroData.ts.r44, C:\Users\Administrator\Desktop\Screen, D:\project\trunk\Client\assets\script\Config\Typings\SoldierData.ts.mine, D:\project\trunk\Client\assets\script\Config\Typings\SoldierData.ts.r44, D:\project\trunk\Config\sharedata\excel\Z-战斗属性表(FightAttrData), C:\Users\Administrator\Desktop\迅雷]
+- [WSL 命名空间 (\\wsl.localhost)] Input='\\wsl.localhost' -> OK (393ms), Title='wsl.localhost', Count=0, Sample=[]
 
-| 测试项 | 验收状态 | 实测数据与真实边界说明 |
-| :--- | :---: | :--- |
-| **x64 位数锁定与 64 位扩展加载** | **通过** | `Environment.Is64BitProcess = True`；编译锁死 `x64`，「此电脑」完整显示 64 位命名空间项（`WPS云盘`、`C:`、`D:`） |
-| **分区液态玻璃（Desktop Acrylic）与零滚动条标签栏** | **通过** | 顶部功能区（Row 0~3）与底栏（Row 5）启用 `DWMSBT_TRANSIENTWINDOW` 实时亚克力与圆弧内凹耳片连接页签，自定义 `AdaptiveTabStripPanel` 在 1~20 标签压测下全程 `0` 滚动条；中间 `IExplorerBrowser` 保持 `100%` `#FFFFFF` 纯白底色 |
-| **后台预热秒开页签池（`PrewarmedThisPcTabPool`）** | **通过** | 空闲预热单个「此电脑」实例后，实测新建页签切换耗时仅 **`17.68 ms`**（含 WPF 容器创建与 `165ms` 展开动画起帧），且 `DirectUIHWND` 立即可用（`DirectUiImmediate = True`），彻底消除冷启动白屏与 `23px` 状态栏高度跳变 |
-| **纯白无擦除宿主窗口类 + 图标内存缓存** | **通过** | 自定义 `LeafTabWhiteHostWnd`（`WHITE_BRUSH`）替代默认灰色 `Static` 窗口类，配合 `PidlManager` 内存小图标缓存（上限 256 项）与首帧非阻塞计数（`computeBytes: false`），消除跳转与切页灰闪 |
-| **悬浮白玻璃面包屑舱与历史栈** | **通过** | 自动构建 `[此电脑 > 新加卷 (D:) > LeafTab]` 路径链并附带 `135ms` 柔滑位移过渡；`Back / Forward` 历史栈跳转、中键后台开新标签、`>` 子目录图标菜单、`Ctrl+L` 聚焦环编辑全部通过 |
-| **异步流式目录搜索 `IResultsFolder`** | **通过** | 按需惰性挂载独立 `ResultsFolder` 纯白宿主视图，实测递归搜索 `*.cs` 命中 `19` 个文件耗时 **`183 ms`**，`Esc` 无损退回原目录 |
-| **极简无框悬浮命令栏 + SF 双色调图标** | **通过** | 全套 `24×24` 光学网格双色调矢量图标渲染锐利；`新建 ▾`（带系统原生文件夹/`.txt`/`.md`/`.zip` 图标 + 自动内联重命名）、`剪切/复制/粘贴/重命名/复制路径/删除`、`排序 ▾`、`查看 ▾`、`⋯` 与 `预览` 窗格均工作正常，菜单关闭后自动归还原生列表焦点 |
-| **可折叠书签栏与会话持久化 `config.json`** | **通过** | `Ctrl+Shift+B` 切换书签栏并同步更新液态玻璃透光高度；`Ctrl+Shift+T` 成功恢复已关闭的 `下载` 标签；`config.json` 序列化往返通过（`--self-test` 模式自动跳过覆盖用户会话） |
-| **中键点击文件夹后台开新标签** | **通过** | 独立 MTA 线程查询 `CUIAutomation8`，在**详细信息视图**（`2.60ms`）、**图标视图**（`2.65ms`）及**此电脑分组视图**（`2.49~3.39ms`）下均精准解析目录 `PIDL`；非文件夹项准确拒绝 |
-| **双击文件区空白处返回上级** | **通过** | 严格限定叶子元素为 `UIItemsView` 时触发（耗时 `1.86~1.91ms`）；双击文件项或「此电脑」分组标题均安全忽略 |
-| **左侧导航树（`EBO_SHOWFRAMES`）** | **存在限制** | 左键点击快速访问、磁盘、WSL 正常在本标签跳转；左侧目录树节点中键新开标签暂未挂载（仅右侧文件列表区与顶部面包屑/书签栏生效） |
-| **断开/不可达网络路径输入防护** | **通过（存在边界）** | 地址栏输入不可达 `\\192.0.2.1\nonexistent_share` 时在 `2514ms` 超时返回提示，等待期间 UI 线程跳动 `22` 次心跳无假死 |
-| **单实例管道 / 系统右键菜单与注册表接管 / 深色模式** | **暂不支持** | 按收敛计划列为**阶段三**独立可选增强项 |
+## 3. Unreachable Network Path Async Pre-Check
+- UNC \\192.0.2.1\nonexistent_share: NavSucceeded=False, ElapsedMs=2521ms, UiDispatcherHeartbeatsDuringWait=22
 
----
+## 4. Multi-Tab Resource Benchmark (1 / 10 / 20 Tabs)
+- [1 个标签 (此电脑)] Tabs=1, WorkingSet=165.6 MB, PrivateBytes=111.9 MB, GDI=204, USER=204
+- [10 个标签 (多磁盘与系统目录混合)] Tabs=10, WorkingSet=177.3 MB, PrivateBytes=124.6 MB, GDI=529, USER=596
+- [20 个标签 (满载保活状态)] Tabs=20, WorkingSet=191.1 MB, PrivateBytes=139.7 MB, GDI=909, USER=1033
+- [从 20 标签关闭回落至 2 标签 (压测起点)] Tabs=2, WorkingSet=186.4 MB, PrivateBytes=135.0 MB, GDI=305, USER=370
+- [反复开关第 10/50 次后 (保持 2 标签)] Tabs=2, WorkingSet=188.8 MB, PrivateBytes=137.6 MB, GDI=243, USER=372
+- [反复开关第 20/50 次后 (保持 2 标签)] Tabs=2, WorkingSet=189.2 MB, PrivateBytes=137.8 MB, GDI=243, USER=372
+- [反复开关第 30/50 次后 (保持 2 标签)] Tabs=2, WorkingSet=189.4 MB, PrivateBytes=138.1 MB, GDI=243, USER=372
+- [反复开关第 40/50 次后 (保持 2 标签)] Tabs=2, WorkingSet=189.7 MB, PrivateBytes=138.3 MB, GDI=243, USER=372
+- [反复开关第 50/50 次后 (保持 2 标签)] Tabs=2, WorkingSet=189.8 MB, PrivateBytes=138.8 MB, GDI=243, USER=372
+- [50 次开关静置收敛后 (保持 2 标签)] Tabs=2, WorkingSet=189.8 MB, PrivateBytes=138.8 MB, GDI=243, USER=370
 
-## 二、 多标签内存与句柄实测数据（v0.4.0，`EBO_SHOWFRAMES` 开启状态）
-
-由 `LeafTab.exe --self-test` 在真实桌面会话下自动采集：
-
-| 负载场景 | 打开标签数 | Working Set | Private Bytes | GDI 句柄 | USER 句柄 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **1 个标签**（初始「此电脑」） | 1 | `158.4 MB` | `95.6 MB` | `193` | `192` |
-| **10 个标签**（多磁盘与系统目录混合） | 10 | `172.4 MB` | `110.6 MB` | `520` | `592` |
-| **20 个标签**（全部隐藏保活） | 20 | `190.6 MB` | `131.4 MB` | `900` | `1034` |
-| **从 20 标签关闭回落至 2 标签** | 2 | `183.6 MB` | `125.4 MB` | `296` | `368` |
-| **反复新建导航并关闭第 10/50 次** | 2 | `185.9 MB` | `128.1 MB` | `234` | `369` |
-| **反复新建导航并关闭第 20/50 次** | 2 | `186.5 MB` | `128.6 MB` | `234` | `370` |
-| **反复新建导航并关闭第 30/50 次** | 2 | `186.7 MB` | `128.8 MB` | `234` | `370` |
-| **反复新建导航并关闭第 40/50 次** | 2 | `187.0 MB` | `129.0 MB` | `234` | `369` |
-| **反复新建导航并关闭第 50/50 次** | 2 | `187.4 MB` | `129.2 MB` | `234` | `370` |
-| **50 次开关静置收敛后** | 2 | **`187.4 MB`** | **`129.2 MB`** | **`234`** | **`368`** |
-
-### 资源实测结论
-1. **极高能效比与单文件体积**：包含全套 `24×24` 双色调矢量图标字典、分区液态玻璃与自适应页签布局面板后，单执行文件仅 **`200.5 KB`**；首标签私有内存 **`95.6 MB`**，每新增 1 个带完整左导航树的标签平均仅增加约 **`1.8 MB`** 私有内存。
-2. **句柄与内存 100% 平台收敛**：连续 50 次创建、导航并销毁标签后，`GDI` 句柄恒定锁定在 **`234`**，`USER` 句柄精确回落至压测起点 **`368`**，私有内存稳定在 **`129.2 MB`**，无任何 COM / PIDL / HWND / 动画时钟泄漏。
+## RESULT: PASS (All Automated Assertions Succeeded)

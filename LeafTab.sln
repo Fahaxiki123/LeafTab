@@ -4,6 +4,11 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LeafTab", "src\LeafTab\LeafTab.csproj", "{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LeafTab.Setup", "src\LeafTab.Setup\LeafTab.Setup.csproj", "{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}"
+	ProjectSection(ProjectDependencies) = postProject
+		{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101} = {8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,6 +19,10 @@ Global
 		{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}.Debug|x64.Build.0 = Debug|x64
 		{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}.Release|x64.ActiveCfg = Release|x64
 		{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}.Release|x64.Build.0 = Release|x64
+		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Debug|x64.ActiveCfg = Debug|x64
+		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Debug|x64.Build.0 = Debug|x64
+		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Release|x64.ActiveCfg = Release|x64
+		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

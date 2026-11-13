@@ -15,6 +15,7 @@ using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
 using LeafTab.Views;
+using Microsoft.Win32;
 
 namespace LeafTab.Diagnostics
 {
@@ -33,6 +34,14 @@ namespace LeafTab.Diagnostics
         public static async Task RunAndExitAsync(MainWindow window, string outputPath)
         {
             var log = new StringBuilder();
+            var failures = new List<string>();
+
+            void AssertCheck(bool condition, string name)
+            {
+                if (!condition)
+                    failures.Add(name);
+            }
+
             try
             {
                 await Task.Delay(900);
@@ -41,7 +50,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab Stage 1 & Stage 2 + Liquid Glass (v0.4.0) Automated Diagnostic Telemetry");
+                log.AppendLine("# LeafTab Stage 1-3 + Liquid Glass (v0.6.0) Automated Diagnostic Telemetry");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -118,7 +127,7 @@ namespace LeafTab.Diagnostics
                         PidlManager.Free(ref dlPidl);
                     }
 
-                    // Pre-warmed background '此电脑' tab pool instant switch check
+                    // Pre-warmed background '此电脑' tab pool instant switch + reopen history retention check
                     window.EnsurePrewarmedThisPcHostReady();
                     await Task.Delay(350);
                     bool poolArmed = window.HasPrewarmedHost;
@@ -127,35 +136,333 @@ namespace LeafTab.Diagnostics
                     prewarmSw.Stop();
                     bool directUiImmediate = instantTab.BrowserHost.DirectUiHwnd != IntPtr.Zero;
                     log.AppendLine($"- PrewarmedThisPcTabPool: Armed={poolArmed}, SwitchLatency={prewarmSw.Elapsed.TotalMilliseconds:F2}ms, DirectUiImmediate={directUiImmediate}, ConsumedCleanly={!window.HasPrewarmedHost}");
+                    AssertCheck(poolArmed && directUiImmediate && !window.HasPrewarmedHost, "PrewarmedThisPcTabPool");
+
+                    window.EnsurePrewarmedThisPcHostReady();
+                    await Task.Delay(300);
                     window.CloseTab(instantTab);
+                    bool reopenedThisPc = window.ReopenLastClosedTab();
+                    await Task.Delay(200);
+                    bool navFromReopened = await window.NavigateAddressInputAsync(projectDir);
+                    await Task.Delay(350);
+                    bool canBackAfterPrewarmReopen = window.SelectedTab?.CanNavigateBack ?? false;
+                    log.AppendLine($"- PrewarmedReopenHistoryRetention: Reopened={reopenedThisPc}, NavigatedProject={navFromReopened}, CanNavigateBack={canBackAfterPrewarmReopen}");
+                    AssertCheck(reopenedThisPc && navFromReopened && canBackAfterPrewarmReopen, "PrewarmedReopenHistoryRetention");
+                    if (window.SelectedTab != null && window.Tabs.Count > 1)
+                    {
+                        window.CloseTab(window.SelectedTab);
+                    }
                     window.DiscardPrewarmedHost();
                 }
 
-                // config.json round-trip serialization check
+                // config.json atomic replace + .bak corruption recovery check
                 string tempCfgPath = Path.Combine(Path.GetTempPath(), $"leaftab_selftest_{Guid.NewGuid():N}.json");
                 try
                 {
-                    var sampleCfg = new AppConfig
+                    var v1Cfg = new AppConfig
                     {
-                        ShowBookmarkBar = true,
+                        ShowBookmarkBar = false,
                         ShowPreviewPane = false,
                         SelectedTabIndex = 0
                     };
-                    sampleCfg.Bookmarks.Add(new BookmarkConfigItem { Title = "LeafTab", TargetPath = projectDir });
-                    sampleCfg.OpenTabs.Add(new SavedTabConfigItem
+                    v1Cfg.Bookmarks.Add(new BookmarkConfigItem { Title = "LeafTab_V1", TargetPath = projectDir });
+                    v1Cfg.OpenTabs.Add(new SavedTabConfigItem
                     {
                         CurrentPath = projectDir,
                         HistoryPaths = new List<string> { "此电脑", projectDir },
                         HistoryIndex = 1
                     });
+                    bool savedV1 = AppConfigService.Save(v1Cfg, tempCfgPath);
 
-                    bool savedOk = AppConfigService.Save(sampleCfg, tempCfgPath);
-                    AppConfig loadedCfg = AppConfigService.Load(tempCfgPath);
-                    log.AppendLine($"- ConfigJsonRoundTrip: Saved={savedOk}, LoadedBookmarks={loadedCfg.Bookmarks.Count}, LoadedTabs={loadedCfg.OpenTabs.Count}, ShowBookmarkBar={loadedCfg.ShowBookmarkBar}");
+                    var v2Cfg = new AppConfig
+                    {
+                        ShowBookmarkBar = true,
+                        ShowPreviewPane = true,
+                        SelectedTabIndex = 0
+                    };
+                    v2Cfg.Bookmarks.Add(new BookmarkConfigItem { Title = "LeafTab_V2", TargetPath = projectDir });
+                    bool savedV2 = AppConfigService.Save(v2Cfg, tempCfgPath);
+                    AppConfig loadedV2 = AppConfigService.Load(tempCfgPath);
+
+                    // Corrupt primary config.json and verify automatic fallback to config.json.bak (which holds v1Cfg)
+                    File.WriteAllText(tempCfgPath, "{ corrupted_json_payload", Encoding.UTF8);
+                    AppConfig recoveredFromBak = AppConfigService.Load(tempCfgPath);
+                    bool bakRecoveredOk = recoveredFromBak.Bookmarks.Count == 1 &&
+                                          recoveredFromBak.Bookmarks[0].Title == "LeafTab_V1" &&
+                                          recoveredFromBak.OpenTabs.Count == 1;
+
+                    log.AppendLine($"- ConfigJsonAtomicAndBackupRecovery: SavedV1={savedV1}, SavedV2={savedV2}, LoadedV2Bar={loadedV2.ShowBookmarkBar}, BakRecovered={bakRecoveredOk}");
+                    AssertCheck(savedV1 && savedV2 && loadedV2.ShowBookmarkBar && bakRecoveredOk, "ConfigJsonAtomicAndBackupRecovery");
                 }
                 finally
                 {
                     if (File.Exists(tempCfgPath)) File.Delete(tempCfgPath);
+                    if (File.Exists(tempCfgPath + ".bak")) File.Delete(tempCfgPath + ".bak");
+                    if (File.Exists(tempCfgPath + ".tmp")) File.Delete(tempCfgPath + ".tmp");
+                }
+
+                // ==================== 2B. STAGE 3 + v0.6.0 SYSTEM INTEGRATION & UX CHECKS ====================
+                log.AppendLine();
+                log.AppendLine("## 2B. Stage 3 & v0.6.0 Checks (CLI Parser, Multi-Window, Side Buttons, Smart Reuse, Address Autocomplete, Volatile Guard, HKCU Sandbox)");
+
+                LaunchActionRequest pQuote = LaunchRequestParser.Parse(new[] { "D:\"", "C:\\ " });
+                LaunchActionRequest pSelect = LaunchRequestParser.Parse(new[] { "/n,/select,D:\\Work, 2026\\report.pdf" });
+                LaunchActionRequest pExplorerClsid = LaunchRequestParser.Parse(new[] { "::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", @"C:\Users\Public\File Explorer.lnk" });
+                LaunchActionRequest pBgQuit = LaunchRequestParser.Parse(new[] { "--background", "--quit", "--new-window", "--handoff" });
+                string slnFile = Path.Combine(projectDir, "LeafTab.sln");
+                string csprojFile = Path.Combine(projectDir, "src", "LeafTab", "LeafTab.csproj");
+                LaunchActionRequest pDirectFile = File.Exists(slnFile)
+                    ? LaunchRequestParser.Parse(new[] { slnFile })
+                    : LaunchRequestParser.Parse(new[] { $"/select,{slnFile}" });
+
+                bool parserOk = pQuote.Targets.Count == 2 &&
+                                pQuote.Targets[0].FolderOrAlias == "D:\\" &&
+                                pQuote.Targets[1].FolderOrAlias == "C:\\" &&
+                                pSelect.Targets.Count == 1 &&
+                                pSelect.Targets[0].FolderOrAlias == "D:\\Work, 2026" &&
+                                pSelect.Targets[0].SelectItemName == "report.pdf" &&
+                                pDirectFile.Targets.Count == 1 &&
+                                pDirectFile.Targets[0].SelectItemName == "LeafTab.sln" &&
+                                pExplorerClsid.Targets.Count == 2 &&
+                                pExplorerClsid.Targets[0].FolderOrAlias == "此电脑" &&
+                                pExplorerClsid.Targets[1].FolderOrAlias == "此电脑" &&
+                                pBgQuit.IsBackgroundWarmup &&
+                                pBgQuit.IsQuitProcess &&
+                                pBgQuit.OpenInNewWindow &&
+                                pBgQuit.WaitMutexHandoff;
+                log.AppendLine($"- LaunchRequestParserChecks: Passed={parserOk} (QuoteFix='{pQuote.Targets[0].FolderOrAlias}', CommaSelect='{pSelect.Targets[0].FolderOrAlias}' -> '{pSelect.Targets[0].SelectItemName}', ExplorerLauncherRedirect='{pExplorerClsid.Targets[0].FolderOrAlias}', Flags={pBgQuit.IsBackgroundWarmup && pBgQuit.IsQuitProcess && pBgQuit.OpenInNewWindow && pBgQuit.WaitMutexHandoff})");
+                AssertCheck(parserOk, "LaunchRequestParserChecks");
+
+                // Verify File Explorer launcher stub CLSID & display alias normalize to This PC PIDL
+                IntPtr expectedThisPc = PidlManager.CreateThisPcPidl();
+                (IntPtr parsedClsidPidl, _) = await PidlManager.TryParseAddressAsync("::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", CancellationToken.None);
+                (IntPtr parsedLabelPidl, _) = await PidlManager.TryParseAddressAsync("文件资源管理器", CancellationToken.None);
+                try
+                {
+                    bool launcherRedirectOk = PidlManager.AreEqual(parsedClsidPidl, expectedThisPc) &&
+                                              PidlManager.AreEqual(parsedLabelPidl, expectedThisPc);
+                    log.AppendLine($"- ExplorerLauncherClsidRedirect: Passed={launcherRedirectOk}");
+                    AssertCheck(launcherRedirectOk, "ExplorerLauncherClsidRedirect");
+                }
+                finally
+                {
+                    PidlManager.Free(ref expectedThisPc);
+                    PidlManager.Free(ref parsedClsidPidl);
+                    PidlManager.Free(ref parsedLabelPidl);
+                }
+
+                // Verify DirectUIHWND UISF_HIDEFOCUS + focus-parking on _hostHwnd when 0 items are selected (eliminates 1px black item box)
+                if (window.SelectedTab != null)
+                {
+                    await WaitForDirectUiAsync(window.SelectedTab.BrowserHost, 1500);
+                    window.SelectedTab.BrowserHost.FocusNativeView();
+                    IntPtr dui = window.SelectedTab.BrowserHost.DirectUiHwnd;
+                    long uiState = dui != IntPtr.Zero
+                        ? NativeMethods.SendMessageW(dui, NativeMethods.WM_QUERYUISTATE, IntPtr.Zero, IntPtr.Zero).ToInt64()
+                        : 0;
+                    bool hideFocusSet = (uiState & NativeMethods.UISF_HIDEFOCUS) != 0;
+                    int selCount = window.SelectedTab.BrowserHost.GetItemCounts().SelectedItems;
+                    IntPtr curFocus = NativeMethods.GetFocus();
+                    bool parkedAwayFromDirectUi = selCount > 0 || (curFocus != dui);
+                    log.AppendLine($"- DirectUiFocusSuppression: DirectUIHWND=0x{dui.ToInt64():X}, FocusHwnd=0x{curFocus.ToInt64():X}, Selected={selCount}, UIState=0x{uiState:X}, HideFocusActive={hideFocusSet}, ParkedAwayFromDirectUI={parkedAwayFromDirectUi}");
+                    AssertCheck(hideFocusSet && parkedAwayFromDirectUi, "DirectUiFocusSuppression");
+                }
+
+                // Activate Tab 0 (projectDir, which navigated from '此电脑' -> projectDir) to test Mouse Side Buttons & History-Preserving Tear-Out
+                if (window.Tabs.Count > 0)
+                {
+                    window.ActivateTab(window.Tabs[0], focusNativeView: true);
+                    await Task.Delay(150);
+                }
+
+                // Verify Mouse Side Buttons (XBUTTON1 = Back, XBUTTON2 = Forward)
+                if (window.SelectedTab != null)
+                {
+                    string beforeSideBtnTitle = window.SelectedTab.Title;
+                    bool sideBackOk = window.HandleMouseSideButton(NativeMethods.XBUTTON1);
+                    await Task.Delay(300);
+                    bool sideFwdOk = window.HandleMouseSideButton(NativeMethods.XBUTTON2);
+                    await Task.Delay(300);
+                    bool restoredAfterSideBtn = string.Equals(window.SelectedTab.Title, beforeSideBtnTitle, StringComparison.Ordinal);
+                    log.AppendLine($"- MouseSideButtons (XBUTTON1/XBUTTON2): Back={sideBackOk}, Forward={sideFwdOk}, RestoredTitle='{window.SelectedTab.Title}' (Matched={restoredAfterSideBtn})");
+                    AssertCheck(sideBackOk && sideFwdOk && restoredAfterSideBtn, "MouseSideButtons");
+                }
+
+                // Verify Tab Duplication + Tear-Out to Independent Secondary Window + Secondary Window Clean Close
+                if (window.SelectedTab != null && App.CurrentApp != null)
+                {
+                    ExplorerTabItem? dupTab = window.DuplicateTab(window.SelectedTab);
+                    await Task.Delay(200);
+                    bool dupOk = dupTab != null && window.Tabs.Count >= 2;
+                    MainWindow? secondWin = dupTab != null
+                        ? await window.MoveTabToNewWindowAsync(dupTab)
+                        : null;
+                    await Task.Delay(250);
+                    bool multiWinOpened = secondWin != null &&
+                                          App.CurrentApp.ManagedWindows.Count == 2 &&
+                                          secondWin.SelectedTab != null &&
+                                          secondWin.SelectedTab.CanNavigateBack;
+                    secondWin?.Close();
+                    await Task.Delay(150);
+                    bool secondaryDisposedCleanly = App.CurrentApp.ManagedWindows.Count == 1 && !window.IsClosingOrClosed;
+                    window.BringWindowToFront();
+                    log.AppendLine($"- MultiWindowSplitAndClose: Duplicated={dupOk}, SecondWindowOpenedWithHistory={multiWinOpened}, SecondaryClosedCleanly={secondaryDisposedCleanly}");
+                    AssertCheck(dupOk && multiWinOpened && secondaryDisposedCleanly, "MultiWindowSplitAndClose");
+                }
+
+                // Verify External /select Launch + Smart Duplicate Folder Reuse
+                if (File.Exists(csprojFile) && File.Exists(slnFile))
+                {
+                    int tabsBeforeExt = window.Tabs.Count;
+                    // 1) Subfolder src\LeafTab is NOT currently open -> should open a new tab and select LeafTab.csproj
+                    var extNewFolderReq = LaunchRequestParser.Parse(new[] { $"/select,{csprojFile}" });
+                    await window.HandleExternalLaunchRequestAsync(extNewFolderReq, isInitialLaunch: false);
+                    await Task.Delay(280);
+                    List<string> selectedCsproj = window.SelectedTab?.BrowserHost.GetSelectedPaths() ?? new List<string>();
+                    bool openedNewForUnopenFolder = window.Tabs.Count == tabsBeforeExt + 1 &&
+                                                    selectedCsproj.Any(p => p.EndsWith("LeafTab.csproj", StringComparison.OrdinalIgnoreCase));
+
+                    // 2) Re-launching the ALREADY-OPEN src\LeafTab folder -> should REUSE that tab without piling up duplicates!
+                    int tabsBeforeReuse = window.Tabs.Count;
+                    var extDuplicateFolderReq = LaunchRequestParser.Parse(new[] { Path.GetDirectoryName(csprojFile)! });
+                    await window.HandleExternalLaunchRequestAsync(extDuplicateFolderReq, isInitialLaunch: false);
+                    await Task.Delay(180);
+                    bool reusedExistingTab = window.Tabs.Count == tabsBeforeReuse;
+
+                    // 3) /select on LeafTab.sln whose parent (projectDir) is ALSO already open in tab 0 -> switches back & selects LeafTab.sln!
+                    var extSelectExistingTabReq = LaunchRequestParser.Parse(new[] { $"/select,{slnFile}" });
+                    await window.HandleExternalLaunchRequestAsync(extSelectExistingTabReq, isInitialLaunch: false);
+                    await Task.Delay(250);
+                    List<string> selectedSln = window.SelectedTab?.BrowserHost.GetSelectedPaths() ?? new List<string>();
+                    bool reusedAndSelectedSln = window.Tabs.Count == tabsBeforeReuse &&
+                                                selectedSln.Any(p => p.EndsWith("LeafTab.sln", StringComparison.OrdinalIgnoreCase));
+
+                    log.AppendLine($"- ExternalLaunchAndSmartReuse: NewTabForUnopen={openedNewForUnopenFolder}, ReusedDuplicateFolder={reusedExistingTab}, ReusedAndSelectedSln={reusedAndSelectedSln}");
+                    AssertCheck(openedNewForUnopenFolder && reusedExistingTab && reusedAndSelectedSln, "ExternalLaunchAndSmartReuse");
+
+                    while (window.Tabs.Count > tabsBeforeExt)
+                    {
+                        window.CloseTab(window.Tabs[window.Tabs.Count - 1]);
+                    }
+                }
+
+                // Verify Address Bar Tool Commands, Subdirectory Autocomplete & Volatile Folder Guard
+                bool toolCmdWt = QuickLaunchAndInstallService.IsAddressBarToolCommand("wt", out string parsedTool, out _) && parsedTool == "wt";
+                bool toolCmdCode = QuickLaunchAndInstallService.IsAddressBarToolCommand("code .", out string parsedCode, out _) && parsedCode == "code";
+                bool toolCmdRejectPath = !QuickLaunchAndInstallService.IsAddressBarToolCommand(@"C:\wt", out _, out _);
+
+                string acQuery = Path.Combine(projectDir, "sr");
+                List<AddressSuggestionItem> acItems = QuickLaunchAndInstallService.BuildAddressSuggestions(
+                    acQuery,
+                    showDefaultHistory: false,
+                    window.RecentFolders,
+                    Array.Empty<string>());
+                bool acMatchedSrc = acItems.Any(s => s.InsertText.EndsWith(@"\src", StringComparison.OrdinalIgnoreCase));
+
+                string volatileTempExe = Path.Combine(Path.GetTempPath(), "LeafTab.exe");
+                string fixedInstallExe = QuickLaunchAndInstallService.GetRecommendedInstallExePath();
+                bool volatileGuardOk = QuickLaunchAndInstallService.IsVolatileLaunchLocation(volatileTempExe) &&
+                                       !QuickLaunchAndInstallService.IsVolatileLaunchLocation(fixedInstallExe);
+
+                log.AppendLine($"- AddressAutocompleteAndVolatileGuard: ToolCmds={toolCmdWt && toolCmdCode && toolCmdRejectPath}, AutocompleteMatchedSrc={acMatchedSrc}, VolatileGuard={volatileGuardOk}");
+                AssertCheck(toolCmdWt && toolCmdCode && toolCmdRejectPath && acMatchedSrc && volatileGuardOk, "AddressAutocompleteAndVolatileGuard");
+
+                // Verify Status Bar Timer Throttling when Minimized
+                WindowState prevWinState = window.WindowState;
+                window.WindowState = WindowState.Minimized;
+                await Task.Delay(80);
+                bool pausedWhenMinimized = !window.IsStatusPollingActive;
+                window.WindowState = prevWinState == WindowState.Minimized ? WindowState.Normal : prevWinState;
+                window.BringWindowToFront();
+                await Task.Delay(80);
+                log.AppendLine($"- MinimizedStatusPollingThrottle: PausedWhenMinimized={pausedWhenMinimized}");
+                AssertCheck(pausedWhenMinimized, "MinimizedStatusPollingThrottle");
+
+                // Isolated HKCU sandbox test (strictly NEVER touches real Software\Classes!)
+                string sandboxBase = $@"Software\LeafTab\SelfTestSandbox_{Guid.NewGuid():N}";
+                string sandboxClasses = $@"{sandboxBase}\Classes";
+                string sandboxBackup = $@"{sandboxBase}\Backup";
+                try
+                {
+                    using (RegistryKey priorKey = Registry.CurrentUser.CreateSubKey($@"{sandboxClasses}\Directory\shell"))
+                    {
+                        priorKey.SetValue(null, "CustomPriorVerb", RegistryValueKind.String);
+                    }
+
+                    var ctxOn = ShellIntegrationService.SetContextMenuEnabledCore(true, exePath, sandboxClasses, notifyShell: false);
+                    var defOn = ShellIntegrationService.SetDefaultExplorerEnabledCore(true, exePath, sandboxClasses, sandboxBackup, notifyShell: false);
+                    bool enabledBoth = ctxOn.Ok && defOn.Ok &&
+                                       ShellIntegrationService.IsContextMenuEnabledCore(sandboxClasses) &&
+                                       ShellIntegrationService.IsDefaultExplorerEnabledCore(sandboxClasses);
+
+                    // Simulate missing Folder\shell\open\command (schema upgrade) + moved exe and verify startup self-healing
+                    Registry.CurrentUser.DeleteSubKeyTree($@"{sandboxClasses}\Folder", throwOnMissingSubKey: false);
+                    using (RegistryKey? verbCmd = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Directory\shell\{ShellIntegrationService.DefaultVerbKeyName}\command", writable: true))
+                    {
+                        verbCmd?.SetValue(null, "\"C:\\OldMovedFolder\\LeafTab.exe\" \"%V \"", RegistryValueKind.String);
+                    }
+                    bool selfHealed = ShellIntegrationService.RepairRegisteredPathsIfMovedCore(exePath, sandboxClasses, sandboxBackup, notifyShell: false);
+                    bool folderOpenUpgraded;
+                    using (RegistryKey? folderOpenCmd = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Folder\shell\open\command"))
+                    using (RegistryKey? folderNewWinCmd = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Folder\shell\opennewwindow\command"))
+                    {
+                        folderOpenUpgraded =
+                            string.Equals(
+                                folderOpenCmd?.GetValue("DelegateExecute") as string,
+                                ShellIntegrationService.LeafTabExecuteClsidString,
+                                StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(
+                                folderNewWinCmd?.GetValue("DelegateExecute") as string,
+                                ShellIntegrationService.LeafTabNewWindowExecuteClsidString,
+                                StringComparison.OrdinalIgnoreCase);
+                    }
+
+                    // Verify volatile Temp copy refuses to overwrite an existing valid non-volatile registration
+                    bool volatileRefusedClobber = !ShellIntegrationService.RepairRegisteredPathsIfMovedCore(
+                        volatileTempExe,
+                        sandboxClasses,
+                        sandboxBackup,
+                        notifyShell: false);
+
+                    // Disable while owned by LeafTab and verify clean rollback back to "CustomPriorVerb" AND complete cleanup of Folder\shell
+                    ShellIntegrationService.SetDefaultExplorerEnabledCore(false, exePath, sandboxClasses, sandboxBackup, notifyShell: false);
+                    ShellIntegrationService.SetContextMenuEnabledCore(false, exePath, sandboxClasses, notifyShell: false);
+
+                    string? restoredPrior;
+                    using (RegistryKey? dirShell = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Directory\shell"))
+                    {
+                        restoredPrior = dirShell?.GetValue(null) as string;
+                    }
+                    bool folderCleanedUp;
+                    using (RegistryKey? folderShell = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Folder\shell"))
+                    {
+                        folderCleanedUp = folderShell == null;
+                    }
+                    bool cleanRollback = string.Equals(restoredPrior, "CustomPriorVerb", StringComparison.Ordinal) &&
+                                         folderCleanedUp &&
+                                         !ShellIntegrationService.IsContextMenuEnabledCore(sandboxClasses) &&
+                                         !ShellIntegrationService.IsDefaultExplorerEnabledCore(sandboxClasses);
+
+                    // Re-enable, then simulate a third-party file manager taking over (Default); verify ownership protection refuses to clobber it
+                    ShellIntegrationService.SetDefaultExplorerEnabledCore(true, exePath, sandboxClasses, sandboxBackup, notifyShell: false);
+                    using (RegistryKey? dirShell = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Directory\shell", writable: true))
+                    {
+                        dirShell?.SetValue(null, "OtherFileManagerVerb", RegistryValueKind.String);
+                    }
+                    ShellIntegrationService.SetDefaultExplorerEnabledCore(false, exePath, sandboxClasses, sandboxBackup, notifyShell: false);
+                    string? afterProtectedUnreg;
+                    using (RegistryKey? dirShell = Registry.CurrentUser.OpenSubKey($@"{sandboxClasses}\Directory\shell"))
+                    {
+                        afterProtectedUnreg = dirShell?.GetValue(null) as string;
+                    }
+                    bool ownershipProtected = string.Equals(afterProtectedUnreg, "OtherFileManagerVerb", StringComparison.Ordinal);
+
+                    log.AppendLine($"- ShellIntegrationSandbox: Enabled={enabledBoth}, SelfHealed={selfHealed}, FolderOpenAndNewWinUpgraded={folderOpenUpgraded}, VolatileRefusedClobber={volatileRefusedClobber}, OwnershipProtected={ownershipProtected}, RestoredPriorVerb='{restoredPrior}' (CleanRollback={cleanRollback})");
+                    AssertCheck(enabledBoth && selfHealed && folderOpenUpgraded && volatileRefusedClobber && ownershipProtected && cleanRollback, "ShellIntegrationSandbox");
+                }
+                finally
+                {
+                    Registry.CurrentUser.DeleteSubKeyTree(sandboxBase, throwOnMissingSubKey: false);
                 }
 
                 await TestNavigateFolderAsync(window, "回收站", "虚拟目录：回收站", log);
@@ -293,9 +600,21 @@ namespace LeafTab.Diagnostics
                 {
                     log.AppendLine($"- [{s.Label}] Tabs={s.TabCount}, WorkingSet={s.WorkingSetMb:F1} MB, PrivateBytes={s.PrivateBytesMb:F1} MB, GDI={s.GdiObjects}, USER={s.UserObjects}");
                 }
+
+                log.AppendLine();
+                if (failures.Count == 0)
+                {
+                    log.AppendLine("## RESULT: PASS (All Automated Assertions Succeeded)");
+                }
+                else
+                {
+                    log.AppendLine($"## RESULT: FAIL ({failures.Count} Assertion(s) Failed: {string.Join(", ", failures)})");
+                    Environment.ExitCode = 1;
+                }
             }
             catch (Exception ex)
             {
+                Environment.ExitCode = 1;
                 log.AppendLine();
                 log.AppendLine("## ERROR");
                 log.AppendLine(ex.ToString());

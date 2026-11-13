@@ -40,7 +40,9 @@ namespace LeafTab.Models
 
         private readonly List<TabHistoryEntry> _history = new List<TabHistoryEntry>();
         private int _historyIndex = -1;
+        private int _pendingHistoryIndex = -1;
         private bool _suppressNextHistoryPush;
+        private bool _initialNavigationCompleted;
 
         public Guid Id { get; } = Guid.NewGuid();
 
@@ -112,20 +114,60 @@ namespace LeafTab.Models
             BrowserHost = prewarmedHost ?? new ExplorerBrowserHost(_currentPidl, showPreviewPane);
             if (prewarmedHost != null)
             {
-                RecordHistory(_currentPidl, _parsingName);
+                IntPtr thisPcPidl = PidlManager.CreateThisPcPidl();
+                try
+                {
+                    bool isAlreadyAtTarget = thisPcPidl != IntPtr.Zero && PidlManager.AreEqual(_currentPidl, thisPcPidl);
+                    if (isAlreadyAtTarget)
+                    {
+                        _initialNavigationCompleted = prewarmedHost.DirectUiHwnd != IntPtr.Zero;
+                        RecordHistory(_currentPidl, _parsingName);
+                    }
+                    else
+                    {
+                        _initialNavigationCompleted = false;
+                        RecordHistory(_currentPidl, _parsingName);
+                        prewarmedHost.NavigateToPidl(_currentPidl);
+                    }
+                }
+                finally
+                {
+                    PidlManager.Free(ref thisPcPidl);
+                }
             }
         }
 
         internal void SuppressNextHistoryRecord() => _suppressNextHistoryPush = true;
+
+        internal void NotifyNavigationFailed()
+        {
+            _pendingHistoryIndex = -1;
+            _suppressNextHistoryPush = false;
+        }
 
         internal void UpdateFromNavigation(IntPtr navigatedPidl)
         {
             if (_disposed || navigatedPidl == IntPtr.Zero)
                 return;
 
+            _initialNavigationCompleted = true;
             PidlManager.Free(ref _currentPidl);
             _currentPidl = PidlManager.Clone(navigatedPidl);
             UpdateDisplayMetadata(_currentPidl);
+
+            if (_pendingHistoryIndex >= 0 && _pendingHistoryIndex < _history.Count)
+            {
+                _historyIndex = _pendingHistoryIndex;
+                _pendingHistoryIndex = -1;
+                _suppressNextHistoryPush = false;
+                if (_history[_historyIndex].PidlBytes.Length == 0)
+                {
+                    _history[_historyIndex].PidlBytes = PidlManager.ToBytes(_currentPidl);
+                }
+                return;
+            }
+
+            _pendingHistoryIndex = -1;
 
             if (_suppressNextHistoryPush)
             {
@@ -195,7 +237,8 @@ namespace LeafTab.Models
                 return BrowserHost.ExitSearchMode();
             }
 
-            int targetIdx = _historyIndex + delta;
+            int baseIdx = _pendingHistoryIndex >= 0 ? _pendingHistoryIndex : _historyIndex;
+            int targetIdx = baseIdx + delta;
             if (targetIdx < 0 || targetIdx >= _history.Count)
                 return false;
 
@@ -211,11 +254,12 @@ namespace LeafTab.Models
 
             try
             {
-                _historyIndex = targetIdx;
+                _pendingHistoryIndex = targetIdx;
                 _suppressNextHistoryPush = true;
                 SearchQuery = string.Empty;
                 if (!BrowserHost.NavigateToPidl(targetPidl))
                 {
+                    _pendingHistoryIndex = -1;
                     _suppressNextHistoryPush = false;
                     return false;
                 }
@@ -230,6 +274,8 @@ namespace LeafTab.Models
         internal void RestoreHistory(IReadOnlyList<string>? historyPaths, int savedIndex)
         {
             _history.Clear();
+            _pendingHistoryIndex = -1;
+
             if (historyPaths != null)
             {
                 foreach (string p in historyPaths)
@@ -249,17 +295,20 @@ namespace LeafTab.Models
                     PidlBytes = PidlManager.ToBytes(_currentPidl)
                 });
                 _historyIndex = 0;
+                _suppressNextHistoryPush = !_initialNavigationCompleted;
                 return;
             }
 
             _historyIndex = Math.Max(0, Math.Min(savedIndex, _history.Count - 1));
             _history[_historyIndex].PidlBytes = PidlManager.ToBytes(_currentPidl);
-            _suppressNextHistoryPush = true;
+            _suppressNextHistoryPush = !_initialNavigationCompleted;
         }
 
         internal void RestoreHistoryFromSnapshot(ClosedTabSnapshot snapshot)
         {
             _history.Clear();
+            _pendingHistoryIndex = -1;
+
             foreach (var h in snapshot.History)
             {
                 _history.Add(new TabHistoryEntry
@@ -277,11 +326,12 @@ namespace LeafTab.Models
                     PidlBytes = PidlManager.ToBytes(_currentPidl)
                 });
                 _historyIndex = 0;
+                _suppressNextHistoryPush = !_initialNavigationCompleted;
                 return;
             }
 
             _historyIndex = Math.Max(0, Math.Min(snapshot.HistoryIndex, _history.Count - 1));
-            _suppressNextHistoryPush = true;
+            _suppressNextHistoryPush = !_initialNavigationCompleted;
         }
 
         internal ClosedTabSnapshot CreateClosedSnapshot()

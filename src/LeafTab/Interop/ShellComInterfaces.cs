@@ -164,6 +164,8 @@ namespace LeafTab.Interop
         public static readonly Guid IID_IEnumIDList = new Guid("000214F2-0000-0000-C000-000000000046");
         public static readonly Guid IID_IContextMenu = new Guid("000214e4-0000-0000-c000-000000000046");
         public static readonly Guid IID_IResultsFolder = new Guid("96E5AE6D-6AE1-4b1c-900C-C6480EAA8828");
+        public static readonly Guid IID_IShellBrowser = new Guid("000214E2-0000-0000-C000-000000000046");
+        public static readonly Guid SID_STopLevelBrowser = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
     }
 
     // Verified slot-for-slot against Windows SDK ShObjIdl_core.h lines 16447-16553
@@ -611,5 +613,111 @@ namespace LeafTab.Interop
     {
         [PreserveSig]
         int GetPaneState(ref Guid ep, out uint peps);
+    }
+
+    // Verified against Unknwnbase.h IClassFactory
+    [ComImport]
+    [Guid("00000001-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IClassFactory
+    {
+        [PreserveSig]
+        int CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject);
+
+        [PreserveSig]
+        int LockServer([MarshalAs(UnmanagedType.Bool)] bool fLock);
+    }
+
+    // Verified against ShObjIdl_core.h lines 2859-2883
+    [ComImport]
+    [Guid("7F9185B0-CB92-43c5-80A9-92277A4F7B54")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IExecuteCommand
+    {
+        [PreserveSig]
+        int SetKeyState(uint grfKeyState);
+
+        [PreserveSig]
+        int SetParameters([MarshalAs(UnmanagedType.LPWStr)] string? pszParameters);
+
+        [PreserveSig]
+        int SetPosition(POINT pt);
+
+        [PreserveSig]
+        int SetShowWindow(int nShow);
+
+        [PreserveSig]
+        int SetNoShowUI([MarshalAs(UnmanagedType.Bool)] bool fNoShowUI);
+
+        [PreserveSig]
+        int SetDirectory([MarshalAs(UnmanagedType.LPWStr)] string? pszDirectory);
+
+        [PreserveSig]
+        int Execute();
+    }
+
+    // Verified against ShObjIdl_core.h lines 11278-11289
+    [ComImport]
+    [Guid("1c9cd5bb-98e9-4491-a60f-31aacc72b83c")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IObjectWithSelection
+    {
+        [PreserveSig]
+        int SetSelection([MarshalAs(UnmanagedType.Interface)] IShellItemArray? psia);
+
+        [PreserveSig]
+        int GetSelection(ref Guid riid, out IntPtr ppv);
+    }
+
+    // Verified slot-for-slot against ShObjIdl_core.h lines 8350-8414 (inherits IOleWindow)
+    [ComImport]
+    [Guid("000214E2-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellBrowser
+    {
+        // IOleWindow (2 slots)
+        [PreserveSig] int GetWindow(out IntPtr phwnd);
+        [PreserveSig] int ContextSensitiveHelp([MarshalAs(UnmanagedType.Bool)] bool fEnterMode);
+
+        // IShellBrowser (13 slots)
+        [PreserveSig] int InsertMenusSB(IntPtr hmenuShared, IntPtr lpMenuWidths);
+        [PreserveSig] int SetMenuSB(IntPtr hmenuShared, IntPtr holemenuRes, IntPtr hwndActiveObject);
+        [PreserveSig] int RemoveMenusSB(IntPtr hmenuShared);
+        [PreserveSig] int SetStatusTextSB([MarshalAs(UnmanagedType.LPWStr)] string? pszStatusText);
+        [PreserveSig] int EnableModelessSB([MarshalAs(UnmanagedType.Bool)] bool fEnable);
+        [PreserveSig] int TranslateAcceleratorSB(ref NATIVE_MSG pmsg, ushort wID);
+        [PreserveSig] int BrowseObject(IntPtr pidl, uint wFlags);
+        [PreserveSig] int GetViewStateStream(uint grfMode, out IntPtr ppStrm);
+        [PreserveSig] int GetControlWindow(uint id, out IntPtr phwnd);
+        [PreserveSig] int SendControlMsg(uint id, uint uMsg, IntPtr wParam, IntPtr lParam, out IntPtr pret);
+        [PreserveSig] int QueryActiveShellView([MarshalAs(UnmanagedType.Interface)] out IShellView? ppshv);
+        [PreserveSig] int OnViewWindowActive([MarshalAs(UnmanagedType.Interface)] IShellView? pshv);
+        [PreserveSig] int SetToolbarItems(IntPtr lpButtons, uint nButtons, uint uFlags);
+    }
+
+    // Verified slot-for-slot against ShObjIdl_core.h IShellLinkW (18 slots)
+    [ComImport]
+    [Guid("000214F9-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellLinkW
+    {
+        [PreserveSig] int GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszFile, int cch, IntPtr pfd, uint fFlags);
+        [PreserveSig] int GetIDList(out IntPtr ppidl);
+        [PreserveSig] int SetIDList(IntPtr pidl);
+        [PreserveSig] int GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszName, int cch);
+        [PreserveSig] int SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        [PreserveSig] int GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszDir, int cch);
+        [PreserveSig] int SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+        [PreserveSig] int GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszArgs, int cch);
+        [PreserveSig] int SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+        [PreserveSig] int GetHotkey(out ushort pwHotkey);
+        [PreserveSig] int SetHotkey(ushort wHotkey);
+        [PreserveSig] int GetShowCmd(out int piShowCmd);
+        [PreserveSig] int SetShowCmd(int iShowCmd);
+        [PreserveSig] int GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder pszIconPath, int cch, out int piIcon);
+        [PreserveSig] int SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+        [PreserveSig] int SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, uint dwReserved);
+        [PreserveSig] int Resolve(IntPtr hwnd, uint fFlags);
+        [PreserveSig] int SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
     }
 }

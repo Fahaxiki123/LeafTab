@@ -44,6 +44,27 @@ namespace LeafTab.Models
 
         [DataMember(Order = 12)]
         public int SelectedTabIndex { get; set; }
+
+        [DataMember(Order = 13)]
+        public bool EnableWarmStandby { get; set; } = true;
+
+        [DataMember(Order = 14)]
+        public List<string> RecentFolders { get; set; } = new List<string>();
+
+        [OnDeserializing]
+        private void OnDeserializing(StreamingContext context)
+        {
+            EnableWarmStandby = true;
+            RecentFolders = new List<string>();
+        }
+
+        [OnDeserialized]
+        private void OnDeserialized(StreamingContext context)
+        {
+            Bookmarks ??= new List<BookmarkConfigItem>();
+            OpenTabs ??= new List<SavedTabConfigItem>();
+            RecentFolders ??= new List<string>();
+        }
     }
 
     [DataContract]
