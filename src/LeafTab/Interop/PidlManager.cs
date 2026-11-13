@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -15,11 +16,22 @@ namespace LeafTab.Interop
         public string Title { get; set; } = "文件夹";
         public string AddressText { get; set; } = string.Empty;
         public string ParsingName { get; set; } = string.Empty;
+        public string? FileSystemPath { get; set; }
+        public ImageSource? Icon { get; set; }
+    }
+
+    internal sealed class BreadcrumbNode
+    {
+        public string Title { get; set; } = string.Empty;
+        public string ParsingName { get; set; } = string.Empty;
+        public byte[] PidlBytes { get; set; } = Array.Empty<byte>();
         public ImageSource? Icon { get; set; }
     }
 
     internal static class PidlManager
     {
+        private static readonly Guid BHID_SFObject = new Guid("3981e224-f559-11d3-8e3a-00c04f6837d5");
+
         public static IntPtr CreateKnownFolderPidl(Guid knownFolderId)
         {
             Guid copy = knownFolderId;
@@ -29,6 +41,9 @@ namespace LeafTab.Interop
 
         public static IntPtr CreateThisPcPidl() =>
             CreateKnownFolderPidl(NativeMethods.FOLDERID_ComputerFolder);
+
+        public static IntPtr CreateDesktopPidl() =>
+            CreateKnownFolderPidl(NativeMethods.FOLDERID_Desktop);
 
         public static IntPtr Clone(IntPtr pidl) =>
             pidl == IntPtr.Zero ? IntPtr.Zero : NativeMethods.ILClone(pidl);
@@ -54,6 +69,64 @@ namespace LeafTab.Interop
             if (a == b) return true;
             if (a == IntPtr.Zero || b == IntPtr.Zero) return false;
             return NativeMethods.ILIsEqual(a, b);
+        }
+
+        /// <summary>
+        /// Copies an unmanaged PIDL into a GC-managed byte[] so UI models (breadcrumbs, history, closed tabs)
+        /// never hold unmanaged CoTaskMem pointers.
+        /// </summary>
+        public static byte[] ToBytes(IntPtr pidl)
+        {
+            if (pidl == IntPtr.Zero)
+                return Array.Empty<byte>();
+
+            int offset = 0;
+            const int MaxSafePidlBytes = 65536;
+            while (offset < MaxSafePidlBytes)
+            {
+                ushort cb = (ushort)Marshal.ReadInt16(pidl, offset);
+                if (cb == 0)
+                {
+                    int total = offset + 2;
+                    byte[] data = new byte[total];
+                    Marshal.Copy(pidl, data, 0, total);
+                    return data;
+                }
+                if (cb < 2)
+                {
+                    return Array.Empty<byte>();
+                }
+                offset += cb;
+            }
+
+            return Array.Empty<byte>();
+        }
+
+        public static IntPtr FromBytes(byte[]? data)
+        {
+            if (data == null || data.Length < 2)
+                return IntPtr.Zero;
+
+            IntPtr temp = Marshal.AllocHGlobal(data.Length);
+            try
+            {
+                Marshal.Copy(data, 0, temp, data.Length);
+                return NativeMethods.ILClone(temp);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(temp);
+            }
+        }
+
+        public static bool CanNavigateUp(IntPtr pidl)
+        {
+            if (pidl == IntPtr.Zero)
+                return false;
+
+            // Empty root IDList (Desktop namespace root) has cb == 0 at offset 0
+            ushort firstCb = (ushort)Marshal.ReadInt16(pidl, 0);
+            return firstCb >= 2;
         }
 
         public static string? GetShellItemString(IShellItem item, SIGDN sigdn)
@@ -90,11 +163,13 @@ namespace LeafTab.Interop
                     if (!string.IsNullOrWhiteSpace(title))
                         info.Title = title!;
 
+                    info.FileSystemPath = !string.IsNullOrWhiteSpace(fsPath) ? fsPath : null;
+
                     info.AddressText = !string.IsNullOrWhiteSpace(fsPath)
                         ? fsPath!
-                        : (!string.IsNullOrWhiteSpace(editPath) ? editPath! : (info.Title));
+                        : (!string.IsNullOrWhiteSpace(editPath) ? editPath! : info.Title);
 
-                    info.ParsingName = parsing ?? info.AddressText;
+                    info.ParsingName = !string.IsNullOrWhiteSpace(parsing) ? parsing! : info.AddressText;
                 }
                 finally
                 {
@@ -104,6 +179,225 @@ namespace LeafTab.Interop
 
             info.Icon = ExtractSmallIcon(pidl);
             return info;
+        }
+
+        /// <summary>
+        /// Builds the root-to-leaf breadcrumb node chain matching Windows 11 File Explorer
+        /// (e.g. [此电脑] > [新加卷 (D:)] > [project] > [trunk] > [Client]).
+        /// </summary>
+        public static List<BreadcrumbNode> BuildBreadcrumbChain(IntPtr folderPidl)
+        {
+            var reversed = new List<(BreadcrumbNode Node, IntPtr RawPidl)>();
+            if (folderPidl == IntPtr.Zero)
+                return new List<BreadcrumbNode>();
+
+            Guid iidShellItem = ShellConstants.IID_IShellItem;
+            if (NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? current) != ShellConstants.S_OK || current == null)
+                return new List<BreadcrumbNode>();
+
+            try
+            {
+                for (int depth = 0; depth < 32 && current != null; depth++)
+                {
+                    if (NativeMethods.SHGetIDListFromObject(current, out IntPtr itemPidl) == ShellConstants.S_OK && itemPidl != IntPtr.Zero)
+                    {
+                        string title = GetShellItemString(current, SIGDN.SIGDN_NORMALDISPLAY) ?? "文件夹";
+                        string parsing = GetShellItemString(current, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING) ?? title;
+
+                        reversed.Add((new BreadcrumbNode
+                        {
+                            Title = title,
+                            ParsingName = parsing,
+                            PidlBytes = ToBytes(itemPidl),
+                            Icon = depth == 0 ? ExtractSmallIcon(itemPidl) : null
+                        }, itemPidl));
+                    }
+
+                    int hrParent = current.GetParent(out IShellItem? parent);
+                    Marshal.ReleaseComObject(current);
+                    current = (hrParent == ShellConstants.S_OK) ? parent : null;
+                }
+                current = null;
+
+                reversed.Reverse();
+
+                // Match Win11 Explorer: omit top-level "桌面" when browsing under "此电脑" / "回收站" / "网络" / "Linux"
+                int startIndex = 0;
+                if (reversed.Count >= 2)
+                {
+                    ushort rootCb = (ushort)Marshal.ReadInt16(reversed[0].RawPidl, 0);
+                    if (rootCb == 0)
+                    {
+                        startIndex = 1;
+                    }
+                }
+
+                var result = new List<BreadcrumbNode>(reversed.Count - startIndex);
+                for (int i = startIndex; i < reversed.Count; i++)
+                {
+                    if (i == startIndex && reversed[i].Node.Icon == null)
+                    {
+                        reversed[i].Node.Icon = ExtractSmallIcon(reversed[i].RawPidl);
+                    }
+                    result.Add(reversed[i].Node);
+                }
+
+                return result;
+            }
+            finally
+            {
+                if (current != null)
+                    Marshal.ReleaseComObject(current);
+
+                for (int i = 0; i < reversed.Count; i++)
+                {
+                    IntPtr p = reversed[i].RawPidl;
+                    Free(ref p);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Enumerates immediate child folders for a breadcrumb chevron '>' dropdown popup.
+        /// </summary>
+        public static List<BreadcrumbNode> EnumerateChildFolders(IntPtr parentPidl, int maxCount = 80)
+        {
+            var children = new List<BreadcrumbNode>();
+            if (parentPidl == IntPtr.Zero)
+                return children;
+
+            Guid iidShellItem = ShellConstants.IID_IShellItem;
+            if (NativeMethods.SHCreateItemFromIDList(parentPidl, ref iidShellItem, out IShellItem? parentItem) != ShellConstants.S_OK || parentItem == null)
+                return children;
+
+            IntPtr pFolder = IntPtr.Zero;
+            IShellFolder? shellFolder = null;
+            IntPtr pEnum = IntPtr.Zero;
+            IEnumIDList? enumIdList = null;
+
+            try
+            {
+                Guid bhid = BHID_SFObject;
+                Guid iidFolder = ShellConstants.IID_IShellFolder;
+                if (parentItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidFolder, out pFolder) != ShellConstants.S_OK || pFolder == IntPtr.Zero)
+                    return children;
+
+                shellFolder = (IShellFolder)Marshal.GetObjectForIUnknown(pFolder);
+                (bool _, bool showHidden) = GetShellVisibilityFlags();
+                uint flags = ShellConstants.SHCONTF_FOLDERS | (showHidden ? ShellConstants.SHCONTF_INCLUDEHIDDEN : 0u);
+
+                if (shellFolder.EnumObjects(IntPtr.Zero, flags, out pEnum) != ShellConstants.S_OK || pEnum == IntPtr.Zero)
+                    return children;
+
+                enumIdList = (IEnumIDList)Marshal.GetObjectForIUnknown(pEnum);
+                while (children.Count < maxCount && enumIdList.Next(1, out IntPtr childRelPidl, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRelPidl != IntPtr.Zero)
+                {
+                    IntPtr fullChildPidl = IntPtr.Zero;
+                    try
+                    {
+                        if (NativeMethods.SHCreateItemWithParent(parentPidl, shellFolder, childRelPidl, ref iidShellItem, out IShellItem? childItem) == ShellConstants.S_OK && childItem != null)
+                        {
+                            try
+                            {
+                                uint attrMask = ShellConstants.SFGAO_FOLDER | ShellConstants.SFGAO_STREAM;
+                                if (childItem.GetAttributes(attrMask, out uint attrs) >= 0 &&
+                                    (attrs & ShellConstants.SFGAO_FOLDER) != 0 &&
+                                    (attrs & ShellConstants.SFGAO_STREAM) == 0)
+                                {
+                                    fullChildPidl = Combine(parentPidl, childRelPidl);
+                                    if (fullChildPidl != IntPtr.Zero)
+                                    {
+                                        string title = GetShellItemString(childItem, SIGDN.SIGDN_NORMALDISPLAY) ?? "文件夹";
+                                        string parsing = GetShellItemString(childItem, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING) ?? title;
+                                        children.Add(new BreadcrumbNode
+                                        {
+                                            Title = title,
+                                            ParsingName = parsing,
+                                            PidlBytes = ToBytes(fullChildPidl),
+                                            Icon = ExtractSmallIcon(fullChildPidl)
+                                        });
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                Marshal.ReleaseComObject(childItem);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Free(ref fullChildPidl);
+                        Free(ref childRelPidl);
+                    }
+                }
+
+                children.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
+                return children;
+            }
+            catch
+            {
+                return children;
+            }
+            finally
+            {
+                if (enumIdList != null) Marshal.ReleaseComObject(enumIdList);
+                if (pEnum != IntPtr.Zero) Marshal.Release(pEnum);
+                if (shellFolder != null) Marshal.ReleaseComObject(shellFolder);
+                if (pFolder != IntPtr.Zero) Marshal.Release(pFolder);
+                Marshal.ReleaseComObject(parentItem);
+            }
+        }
+
+        public static (bool ShowExtensions, bool ShowHidden) GetShellVisibilityFlags()
+        {
+            var state = new SHELLSTATE();
+            NativeMethods.SHGetSetSettings(
+                ref state,
+                NativeMethods.SSF_SHOWEXTENSIONS | NativeMethods.SSF_SHOWALLOBJECTS,
+                false);
+            return (state.ShowExtensions, state.ShowAllObjects);
+        }
+
+        public static void SetShellVisibilityFlags(bool? showExtensions, bool? showHidden)
+        {
+            var state = new SHELLSTATE();
+            uint mask = 0;
+
+            if (showExtensions.HasValue)
+            {
+                state.ShowExtensions = showExtensions.Value;
+                mask |= NativeMethods.SSF_SHOWEXTENSIONS;
+            }
+
+            if (showHidden.HasValue)
+            {
+                state.ShowAllObjects = showHidden.Value;
+                mask |= NativeMethods.SSF_SHOWALLOBJECTS;
+            }
+
+            if (mask != 0)
+            {
+                NativeMethods.SHGetSetSettings(ref state, mask, true);
+                NativeMethods.SHChangeNotify(NativeMethods.SHCNE_ASSOCCHANGED, NativeMethods.SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+            }
+        }
+
+        public static string FormatByteSize(ulong bytes)
+        {
+            if (bytes < 1024UL)
+                return $"{bytes} 字节";
+            double kb = bytes / 1024.0;
+            if (kb < 1024.0)
+                return kb >= 100 ? $"{kb:F0} KB" : $"{kb:F1} KB";
+            double mb = kb / 1024.0;
+            if (mb < 1024.0)
+                return mb >= 100 ? $"{mb:F0} MB" : $"{mb:F2} MB";
+            double gb = mb / 1024.0;
+            if (gb < 1024.0)
+                return $"{gb:F2} GB";
+            double tb = gb / 1024.0;
+            return $"{tb:F2} TB";
         }
 
         public static ImageSource? ExtractSmallIcon(IntPtr pidl)
@@ -142,6 +436,62 @@ namespace LeafTab.Interop
         }
 
         /// <summary>
+        /// Synchronous local/shell parsing helper used during startup session restoration for known local/virtual paths.
+        /// Skips blocking UNC network paths unless allowUnc is true.
+        /// </summary>
+        public static IntPtr TryParseLocalOrShellFast(string? rawPath)
+        {
+            if (string.IsNullOrWhiteSpace(rawPath))
+                return IntPtr.Zero;
+
+            string expanded = Environment.ExpandEnvironmentVariables(rawPath!.Trim().Trim('"'));
+
+            if (string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "This PC", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "计算机", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateThisPcPidl();
+            }
+
+            if (string.Equals(expanded, "桌面", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Desktop", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateDesktopPidl();
+            }
+
+            if (string.Equals(expanded, "回收站", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Recycle Bin", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_RecycleBinFolder);
+            }
+
+            if (string.Equals(expanded, "下载", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Downloads", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Downloads);
+            }
+
+            if (string.Equals(expanded, "文档", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Documents", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Documents);
+            }
+
+            bool isUnc = expanded.StartsWith(@"\\", StringComparison.Ordinal) &&
+                         !expanded.StartsWith(@"\\wsl", StringComparison.OrdinalIgnoreCase);
+            if (isUnc)
+                return IntPtr.Zero;
+
+            if (expanded.Length == 2 && char.IsLetter(expanded[0]) && expanded[1] == ':')
+                expanded += @"\";
+
+            if (NativeMethods.SHParseDisplayName(expanded, IntPtr.Zero, out IntPtr pidl, 0, out _) == ShellConstants.S_OK && pidl != IntPtr.Zero)
+                return pidl;
+
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
         /// Parses user address bar input (local path, environment variables, friendly aliases, shell: commands, or UNC paths).
         /// For UNC paths (\\server\share), performs a bounded async pre-check on a ThreadPool worker so dead network hosts
         /// time out cleanly instead of freezing the UI thread for 20-30s during synchronous SHParseDisplayName.
@@ -155,24 +505,9 @@ namespace LeafTab.Interop
 
             string expanded = Environment.ExpandEnvironmentVariables(rawInput.Trim().Trim('"'));
 
-            if (string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "This PC", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "计算机", StringComparison.OrdinalIgnoreCase))
-            {
-                return (CreateThisPcPidl(), null);
-            }
-
-            if (string.Equals(expanded, "回收站", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Recycle Bin", StringComparison.OrdinalIgnoreCase))
-            {
-                return (CreateKnownFolderPidl(NativeMethods.FOLDERID_RecycleBinFolder), null);
-            }
-
-            if (string.Equals(expanded, "下载", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(expanded, "Downloads", StringComparison.OrdinalIgnoreCase))
-            {
-                return (CreateKnownFolderPidl(NativeMethods.FOLDERID_Downloads), null);
-            }
+            IntPtr fastKnown = TryParseKnownAlias(expanded);
+            if (fastKnown != IntPtr.Zero)
+                return (fastKnown, null);
 
             bool isUnc = expanded.StartsWith(@"\\", StringComparison.Ordinal) &&
                          !expanded.StartsWith(@"\\wsl", StringComparison.OrdinalIgnoreCase);
@@ -188,7 +523,6 @@ namespace LeafTab.Interop
                 Task completed = await Task.WhenAny(uncParseTask, Task.Delay(2500, cancellationToken)).ConfigureAwait(true);
                 if (completed != uncParseTask)
                 {
-                    // If the background parse eventually returns a PIDL later, free it safely so nothing leaks.
                     _ = uncParseTask.ContinueWith(t =>
                     {
                         if (t.Status == TaskStatus.RanToCompletion && t.Result != IntPtr.Zero)
@@ -206,7 +540,6 @@ namespace LeafTab.Interop
                     : (IntPtr.Zero, $"无法访问网络路径：{expanded}");
             }
 
-            // Local paths, ::{GUID}, shell:*, \\wsl.localhost\*
             if (expanded.Length == 2 && char.IsLetter(expanded[0]) && expanded[1] == ':')
                 expanded += @"\";
 
@@ -222,6 +555,48 @@ namespace LeafTab.Interop
             }
 
             return (IntPtr.Zero, $"找不到路径：{expanded}");
+        }
+
+        private static IntPtr TryParseKnownAlias(string expanded)
+        {
+            if (string.Equals(expanded, "此电脑", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "This PC", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "计算机", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateThisPcPidl();
+            }
+
+            if (string.Equals(expanded, "桌面", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Desktop", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateDesktopPidl();
+            }
+
+            if (string.Equals(expanded, "回收站", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Recycle Bin", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_RecycleBinFolder);
+            }
+
+            if (string.Equals(expanded, "下载", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Downloads", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Downloads);
+            }
+
+            if (string.Equals(expanded, "文档", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Documents", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Documents);
+            }
+
+            if (string.Equals(expanded, "图片", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(expanded, "Pictures", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateKnownFolderPidl(NativeMethods.FOLDERID_Pictures);
+            }
+
+            return IntPtr.Zero;
         }
     }
 }

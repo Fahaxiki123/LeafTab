@@ -48,6 +48,55 @@ namespace LeafTab.Interop
         public FOLDERFLAGS fFlags;
     }
 
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    internal struct PROPERTYKEY : IEquatable<PROPERTYKEY>
+    {
+        public Guid fmtid;
+        public uint pid;
+
+        public PROPERTYKEY(Guid fmtid, uint pid)
+        {
+            this.fmtid = fmtid;
+            this.pid = pid;
+        }
+
+        public bool Equals(PROPERTYKEY other) => fmtid == other.fmtid && pid == other.pid;
+        public override bool Equals(object? obj) => obj is PROPERTYKEY other && Equals(other);
+        public override int GetHashCode() => (fmtid.GetHashCode() * 397) ^ (int)pid;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct SORTCOLUMN
+    {
+        public PROPERTYKEY propkey;
+        public int direction; // SORT_ASCENDING = 1, SORT_DESCENDING = -1
+    }
+
+    // Verified against ShObjIdl_core.h lines 2146-2163 (pshpack8)
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    internal struct CMINVOKECOMMANDINFO
+    {
+        public uint cbSize;
+        public uint fMask;
+        public IntPtr hwnd;
+        public IntPtr lpVerb;
+        public IntPtr lpParameters;
+        public IntPtr lpDirectory;
+        public int nShow;
+        public uint dwHotKey;
+        public IntPtr hIcon;
+    }
+
+    internal static class PropertyKeys
+    {
+        private static readonly Guid StorageFmtId = new Guid("B725F130-47EF-101A-A5F1-02608C9EEBAC");
+
+        public static readonly PROPERTYKEY ItemTypeText = new PROPERTYKEY(StorageFmtId, 4);
+        public static readonly PROPERTYKEY ItemNameDisplay = new PROPERTYKEY(StorageFmtId, 10);
+        public static readonly PROPERTYKEY Size = new PROPERTYKEY(StorageFmtId, 12);
+        public static readonly PROPERTYKEY DateModified = new PROPERTYKEY(StorageFmtId, 14);
+    }
+
     internal enum SIGDN : int
     {
         SIGDN_NORMALDISPLAY = 0,
@@ -67,6 +116,9 @@ namespace LeafTab.Interop
         public const int S_OK = 0;
         public const int S_FALSE = 1;
 
+        public const int SORT_ASCENDING = 1;
+        public const int SORT_DESCENDING = -1;
+
         public const uint SBSP_DEFBROWSER = 0x0000;
         public const uint SBSP_SAMEBROWSER = 0x0001;
         public const uint SBSP_ABSOLUTE = 0x0000;
@@ -79,6 +131,23 @@ namespace LeafTab.Interop
         public const uint SVGIO_SELECTION = 0x1;
         public const uint SVGIO_ALLVIEW = 0x2;
 
+        public const uint SVSI_DESELECT = 0x0;
+        public const uint SVSI_SELECT = 0x1;
+        public const uint SVSI_EDIT = 0x3;
+        public const uint SVSI_DESELECTOTHERS = 0x4;
+        public const uint SVSI_ENSUREVISIBLE = 0x8;
+        public const uint SVSI_FOCUSED = 0x10;
+
+        public const uint SHCONTF_FOLDERS = 0x0020;
+        public const uint SHCONTF_NONFOLDERS = 0x0040;
+        public const uint SHCONTF_INCLUDEHIDDEN = 0x0080;
+
+        public const uint CMF_NORMAL = 0x00000000;
+        public const uint CMF_DEFAULTONLY = 0x00000001;
+        public const uint CMF_CANRENAME = 0x00000010;
+
+        public const uint SFGAO_CANRENAME = 0x00000010;
+        public const uint SFGAO_CANDELETE = 0x00000020;
         public const uint SFGAO_STREAM = 0x00400000;
         public const uint SFGAO_FOLDER = 0x20000000;
         public const uint SFGAO_FILESYSTEM = 0x40000000;
@@ -86,10 +155,15 @@ namespace LeafTab.Interop
         public static readonly Guid CLSID_ExplorerBrowser = new Guid("71f96385-ddd6-48d3-a0c1-ae06e8b055fb");
         public static readonly Guid IID_IShellView = new Guid("000214E3-0000-0000-C000-000000000046");
         public static readonly Guid IID_IFolderView = new Guid("cde725b0-ccc9-4519-917e-325d72fab4ce");
+        public static readonly Guid IID_IFolderView2 = new Guid("1af3a467-214f-4298-908e-06b03e0b39f9");
         public static readonly Guid IID_IPersistFolder2 = new Guid("1AC3D9F0-175C-11d1-95BE-00609797EA4F");
         public static readonly Guid IID_IShellFolder = new Guid("000214E6-0000-0000-C000-000000000046");
         public static readonly Guid IID_IShellItem = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+        public static readonly Guid IID_IShellItem2 = new Guid("7e9fb0d3-919f-4307-ab2e-9b1860310c93");
+        public static readonly Guid IID_IShellItemArray = new Guid("b63ea76d-1f85-456f-a19c-48159efa858b");
         public static readonly Guid IID_IEnumIDList = new Guid("000214F2-0000-0000-C000-000000000046");
+        public static readonly Guid IID_IContextMenu = new Guid("000214e4-0000-0000-c000-000000000046");
+        public static readonly Guid IID_IResultsFolder = new Guid("96E5AE6D-6AE1-4b1c-900C-C6480EAA8828");
     }
 
     // Verified slot-for-slot against Windows SDK ShObjIdl_core.h lines 16447-16553
@@ -104,7 +178,6 @@ namespace LeafTab.Interop
         [PreserveSig]
         int Destroy();
 
-        // Note: rcBrowser is passed BY VALUE in ShObjIdl_core.h line 16486
         [PreserveSig]
         int SetRect([In, Out] ref IntPtr phdwp, RECT rcBrowser);
 
@@ -264,6 +337,56 @@ namespace LeafTab.Interop
         int SelectAndPositionItems(uint cidl, IntPtr apidl, IntPtr apt, uint dwFlags);
     }
 
+    // Verified slot-for-slot against ShObjIdl_core.h lines 6199-6520 (14 IFolderView slots + 21 IFolderView2 slots)
+    [ComImport]
+    [Guid("1af3a467-214f-4298-908e-06b03e0b39f9")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IFolderView2
+    {
+        // --- IFolderView base slots (14) ---
+        [PreserveSig] int GetCurrentViewMode(out uint pViewMode);
+        [PreserveSig] int SetCurrentViewMode(uint ViewMode);
+        [PreserveSig] int GetFolder(ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int Item(int iItemIndex, out IntPtr ppidl);
+        [PreserveSig] int ItemCount(uint uFlags, out int pcItems);
+        [PreserveSig] int Items(uint uFlags, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetSelectionMarkedItem(out int piItem);
+        [PreserveSig] int GetFocusedItem(out int piItem);
+        [PreserveSig] int GetItemPosition(IntPtr pidl, out POINT ppt);
+        [PreserveSig] int GetSpacing(ref POINT ppt);
+        [PreserveSig] int GetDefaultSpacing(out POINT ppt);
+        [PreserveSig] int GetAutoArrange();
+        [PreserveSig] int SelectItem(int iItem, uint dwFlags);
+        [PreserveSig] int SelectAndPositionItems(uint cidl, IntPtr apidl, IntPtr apt, uint dwFlags);
+
+        // --- IFolderView2 own slots (21) ---
+        [PreserveSig] int SetGroupBy([In] ref PROPERTYKEY key, [MarshalAs(UnmanagedType.Bool)] bool fAscending);
+        [PreserveSig] int GetGroupBy(out PROPERTYKEY pkey, [MarshalAs(UnmanagedType.Bool)] out bool pfAscending);
+        [PreserveSig] int SetViewProperty(IntPtr pidl, [In] ref PROPERTYKEY propkey, IntPtr propvar);
+        [PreserveSig] int GetViewProperty(IntPtr pidl, [In] ref PROPERTYKEY propkey, IntPtr ppropvar);
+        [PreserveSig] int SetTileViewProperties(IntPtr pidl, [MarshalAs(UnmanagedType.LPWStr)] string pszPropList);
+        [PreserveSig] int SetExtendedTileViewProperties(IntPtr pidl, [MarshalAs(UnmanagedType.LPWStr)] string pszPropList);
+        [PreserveSig] int SetText(int iType, [MarshalAs(UnmanagedType.LPWStr)] string pwszText);
+        [PreserveSig] int SetCurrentFolderFlags(uint dwMask, uint dwFlags);
+        [PreserveSig] int GetCurrentFolderFlags(out uint pdwFlags);
+        [PreserveSig] int GetSortColumnCount(out int pcColumns);
+        [PreserveSig] int SetSortColumns([In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] SORTCOLUMN[] rgSortColumns, int cColumns);
+        [PreserveSig] int GetSortColumns([Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] SORTCOLUMN[] rgSortColumns, int cColumns);
+        [PreserveSig] int GetItem(int iItem, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetVisibleItem(int iStart, [MarshalAs(UnmanagedType.Bool)] bool fPrevious, out int piItem);
+        [PreserveSig] int GetSelectedItem(int iStart, out int piItem);
+        [PreserveSig] int GetSelection([MarshalAs(UnmanagedType.Bool)] bool fNoneImpliesFolder, [MarshalAs(UnmanagedType.Interface)] out IShellItemArray? ppsia);
+        [PreserveSig] int GetSelectionState(IntPtr pidl, out uint pdwFlags);
+        [PreserveSig] int InvokeVerbOnSelection([MarshalAs(UnmanagedType.LPStr)] string? pszVerb);
+        [PreserveSig] int SetViewModeAndIconSize(FOLDERVIEWMODE uViewMode, int iImageSize);
+        [PreserveSig] int GetViewModeAndIconSize(out FOLDERVIEWMODE puViewMode, out int piImageSize);
+        [PreserveSig] int SetGroupSubsetCount(uint cVisibleRows);
+        [PreserveSig] int GetGroupSubsetCount(out uint pcVisibleRows);
+        [PreserveSig] int SetRedraw([MarshalAs(UnmanagedType.Bool)] bool fRedrawOn);
+        [PreserveSig] int IsMoveInSameFolder();
+        [PreserveSig] int DoRename();
+    }
+
     // Verified against ShObjIdl_core.h lines 3426-3461
     [ComImport]
     [Guid("1AC3D9F0-175C-11d1-95BE-00609797EA4F")]
@@ -278,6 +401,25 @@ namespace LeafTab.Interop
 
         [PreserveSig]
         int GetCurFolder(out IntPtr ppidl);
+    }
+
+    // Verified against ShObjIdl_core.h lines 4505-4540
+    [ComImport]
+    [Guid("000214F2-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IEnumIDList
+    {
+        [PreserveSig]
+        int Next(uint celt, out IntPtr rgelt, out uint pceltFetched);
+
+        [PreserveSig]
+        int Skip(uint celt);
+
+        [PreserveSig]
+        int Reset();
+
+        [PreserveSig]
+        int Clone([MarshalAs(UnmanagedType.Interface)] out IEnumIDList? ppenum);
     }
 
     // Verified against ShObjIdl_core.h lines 4643-4750
@@ -354,6 +496,88 @@ namespace LeafTab.Interop
 
         [PreserveSig]
         int Compare([MarshalAs(UnmanagedType.Interface)] IShellItem? psi, uint hint, out int piOrder);
+    }
+
+    // Verified against ShObjIdl_core.h lines 9057-9120
+    [ComImport]
+    [Guid("7e9fb0d3-919f-4307-ab2e-9b1860310c93")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellItem2
+    {
+        // --- IShellItem base slots (5) ---
+        [PreserveSig] int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetParent([MarshalAs(UnmanagedType.Interface)] out IShellItem? ppsi);
+        [PreserveSig] int GetDisplayName(SIGDN sigdnName, out IntPtr ppszName);
+        [PreserveSig] int GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        [PreserveSig] int Compare([MarshalAs(UnmanagedType.Interface)] IShellItem? psi, uint hint, out int piOrder);
+
+        // --- IShellItem2 own slots (13) ---
+        [PreserveSig] int GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetPropertyStoreWithCreateObject(int flags, [MarshalAs(UnmanagedType.IUnknown)] object? punkCreateObject, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetPropertyStoreForKeys(IntPtr rgKeys, uint cKeys, int flags, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetPropertyDescriptionList([In] ref PROPERTYKEY keyType, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int Update(IntPtr pbc);
+        [PreserveSig] int GetProperty([In] ref PROPERTYKEY key, IntPtr ppropvar);
+        [PreserveSig] int GetCLSID([In] ref PROPERTYKEY key, out Guid pclsid);
+        [PreserveSig] int GetFileTime([In] ref PROPERTYKEY key, out System.Runtime.InteropServices.ComTypes.FILETIME pft);
+        [PreserveSig] int GetInt32([In] ref PROPERTYKEY key, out int pi);
+        [PreserveSig] int GetString([In] ref PROPERTYKEY key, out IntPtr ppsz);
+        [PreserveSig] int GetUInt32([In] ref PROPERTYKEY key, out uint pui);
+        [PreserveSig] int GetUInt64([In] ref PROPERTYKEY key, out ulong pull);
+        [PreserveSig] int GetBool([In] ref PROPERTYKEY key, [MarshalAs(UnmanagedType.Bool)] out bool pf);
+    }
+
+    // Verified against ShObjIdl_core.h lines 11008-11043
+    [ComImport]
+    [Guid("b63ea76d-1f85-456f-a19c-48159efa858b")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellItemArray
+    {
+        [PreserveSig] int BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppvOut);
+        [PreserveSig] int GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetPropertyDescriptionList([In] ref PROPERTYKEY keyType, ref Guid riid, out IntPtr ppv);
+        [PreserveSig] int GetAttributes(int AttribFlags, uint sfgaoMask, out uint psfgaoAttribs);
+        [PreserveSig] int GetCount(out uint pdwNumItems);
+        [PreserveSig] int GetItemAt(uint dwIndex, [MarshalAs(UnmanagedType.Interface)] out IShellItem? ppsi);
+        [PreserveSig] int EnumItems(out IntPtr ppenumShellItems);
+    }
+
+    // Verified against ShObjIdl_core.h lines 2229-2258
+    [ComImport]
+    [Guid("000214e4-0000-0000-c000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IContextMenu
+    {
+        [PreserveSig]
+        int QueryContextMenu(IntPtr hmenu, uint indexMenu, uint idCmdFirst, uint idCmdLast, uint uFlags);
+
+        [PreserveSig]
+        int InvokeCommand(ref CMINVOKECOMMANDINFO pici);
+
+        [PreserveSig]
+        int GetCommandString(UIntPtr idCmd, uint uType, IntPtr pReserved, IntPtr pszName, uint cchMax);
+    }
+
+    // Verified against ShObjIdl.h lines 4213-4234
+    [ComImport]
+    [Guid("96E5AE6D-6AE1-4b1c-900C-C6480EAA8828")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IResultsFolder
+    {
+        [PreserveSig]
+        int AddItem([MarshalAs(UnmanagedType.Interface)] IShellItem? psi);
+
+        [PreserveSig]
+        int AddIDList(IntPtr pidl, out IntPtr ppidlAdded);
+
+        [PreserveSig]
+        int RemoveItem([MarshalAs(UnmanagedType.Interface)] IShellItem? psi);
+
+        [PreserveSig]
+        int RemoveIDList(IntPtr pidl);
+
+        [PreserveSig]
+        int RemoveAll();
     }
 
     // Verified against OCIdl.h lines 6106-6117

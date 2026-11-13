@@ -28,9 +28,9 @@ namespace LeafTab.Interop
         private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
 
         private const int DWMWCP_ROUND = 2;
-        private const int DWMWA_COLOR_NONE = unchecked((int)0xFFFFFFFE); // Suppresses AccentColor titlebar strip (ColorPrevalence=1)
-        private const int DWMSBT_TRANSIENTWINDOW = 3;                    // Desktop Acrylic (real-time frosted blur)
-        private const int DWMSBT_MAINWINDOW = 2;                         // Mica fallback
+        private const int DWMWA_COLOR_NONE = unchecked((int)0xFFFFFFFE);
+        private const int DWMSBT_MAINWINDOW = 2;      // Windows 11 Mica (native Explorer tab strip material)
+        private const int DWMSBT_TRANSIENTWINDOW = 3; // Desktop Acrylic fallback
 
         [StructLayout(LayoutKind.Sequential)]
         private struct MARGINS
@@ -72,13 +72,13 @@ namespace LeafTab.Interop
             uint uFlags);
 
         /// <summary>
-        /// 1. Suppresses Windows 11 DWM's native overlapping [_ □ X] caption buttons (strips WS_SYSMENU and guards WM_STYLECHANGING)
-        ///    while preserving native WS_THICKFRAME | WS_CAPTION animations, Aero Snap, and titlebar right-click system menu.
-        /// 2. Suppresses Windows 11 DWM's 37px AccentColor titlebar band (DWMWA_CAPTION_COLOR = DWMWA_COLOR_NONE) when ColorPrevalence=1.
-        /// 3. Applies bounded-margin DWM Desktop Acrylic strictly to the top header & bottom footer so the center Win32
-        ///    IExplorerBrowser (GDI ClearType text) remains 100% opaque and razor-sharp.
+        /// Configures Windows 11 File Explorer style window chrome:
+        /// 1. Suppresses overlapping native [_ □ X] caption buttons while keeping Aero Snap, animations, and titlebar right-click menu.
+        /// 2. Suppresses Windows 11 AccentColor titlebar band (DWMWA_CAPTION_COLOR = DWMWA_COLOR_NONE).
+        /// 3. Applies Windows 11 Mica strictly to the top Tab Strip margin (topTabStripPx), keeping Navigation Bar,
+        ///    Command Bar, IExplorerBrowser, and Status Bar 100% opaque and sharp.
         /// </summary>
-        public static bool TryApplyLiquidGlassBackdrop(Window window, IntPtr hwnd, int topGlassPx, int bottomGlassPx)
+        public static bool TryApplyExplorerMicaBackdrop(Window window, IntPtr hwnd, int topTabStripPx)
         {
             if (hwnd == IntPtr.Zero)
                 return false;
@@ -90,7 +90,6 @@ namespace LeafTab.Interop
                     SuppressNativeCaptionChromeHook(window, h, msg, wParam, lParam, ref handled));
             }
 
-            // Strip WS_SYSMENU immediately so DWMWA_CAPTION_BUTTON_BOUNDS width becomes 0 (no duplicate system [_ □ X] buttons)
             int currentStyle = GetWindowLongW(hwnd, GWL_STYLE);
             if ((currentStyle & WS_SYSMENU) != 0)
             {
@@ -111,8 +110,6 @@ namespace LeafTab.Interop
                 int cornerPref = DWMWCP_ROUND;
                 NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref cornerPref, sizeof(int));
 
-                // Critical when user has "Show accent color on title bars" (ColorPrevalence=1):
-                // prevents DWM from painting a 37px colored titlebar band across the top half of our glass header.
                 int colorNone = DWMWA_COLOR_NONE;
                 NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, ref colorNone, sizeof(int));
             }
@@ -131,17 +128,17 @@ namespace LeafTab.Interop
                 source.CompositionTarget.BackgroundColor = Colors.Transparent;
             }
 
-            UpdateGlassFrameMargins(hwnd, topGlassPx, bottomGlassPx);
-
-            int acrylic = DWMSBT_TRANSIENTWINDOW;
-            if (NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref acrylic, sizeof(int)) == 0)
-                return true;
+            UpdateTopMicaMargin(hwnd, topTabStripPx);
 
             int mica = DWMSBT_MAINWINDOW;
-            return NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref mica, sizeof(int)) == 0;
+            if (NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref mica, sizeof(int)) == 0)
+                return true;
+
+            int acrylic = DWMSBT_TRANSIENTWINDOW;
+            return NativeMethods.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref acrylic, sizeof(int)) == 0;
         }
 
-        public static void UpdateGlassFrameMargins(IntPtr hwnd, int topGlassPx, int bottomGlassPx)
+        public static void UpdateTopMicaMargin(IntPtr hwnd, int topTabStripPx)
         {
             if (hwnd == IntPtr.Zero)
                 return;
@@ -150,8 +147,8 @@ namespace LeafTab.Interop
             {
                 cxLeftWidth = 0,
                 cxRightWidth = 0,
-                cyTopHeight = Math.Max(0, topGlassPx),
-                cyBottomHeight = Math.Max(0, bottomGlassPx)
+                cyTopHeight = Math.Max(0, topTabStripPx),
+                cyBottomHeight = 0
             };
             DwmExtendFrameIntoClientArea(hwnd, ref margins);
         }

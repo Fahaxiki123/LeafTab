@@ -14,20 +14,6 @@ namespace LeafTab
         {
             base.OnStartup(e);
 
-            DispatcherUnhandledException += (_, args) =>
-            {
-                MessageBox.Show(
-                    $"LeafTab 遇到未处理异常：\n{args.Exception.Message}",
-                    "LeafTab",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                args.Handled = true;
-            };
-
-            var mainWindow = new MainWindow();
-            MainWindow = mainWindow;
-            mainWindow.Show();
-
             string? selfTestOut = null;
             string? initialPath = null;
 
@@ -45,6 +31,39 @@ namespace LeafTab
                 }
             }
 
+            bool isSelfTest = !string.IsNullOrEmpty(selfTestOut);
+
+            DispatcherUnhandledException += (_, args) =>
+            {
+                if (isSelfTest && !string.IsNullOrEmpty(selfTestOut))
+                {
+                    try
+                    {
+                        string? dir = Path.GetDirectoryName(Path.GetFullPath(selfTestOut!));
+                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                        File.WriteAllText(selfTestOut!, "# Unhandled Exception\r\n" + args.Exception);
+                    }
+                    catch
+                    {
+                        // Ignore logging errors during shutdown
+                    }
+
+                    args.Handled = true;
+                    Shutdown(1);
+                    return;
+                }
+
+                MessageBox.Show(
+                    $"LeafTab 遇到未处理异常：\n{args.Exception.Message}",
+                    "LeafTab",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                args.Handled = true;
+            };
+            var mainWindow = new MainWindow(skipSessionPersistence: isSelfTest);
+            MainWindow = mainWindow;
+            mainWindow.Show();
+
             if (!string.IsNullOrEmpty(initialPath))
             {
                 (IntPtr pidl, _) = await PidlManager.TryParseAddressAsync(initialPath!, CancellationToken.None);
@@ -52,7 +71,14 @@ namespace LeafTab
                 {
                     try
                     {
-                        mainWindow.SelectedTab?.BrowserHost.NavigateToPidl(pidl);
+                        if (mainWindow.Tabs.Count > 1)
+                        {
+                            mainWindow.AddNewTab(pidl, activate: true);
+                        }
+                        else
+                        {
+                            mainWindow.SelectedTab?.BrowserHost.NavigateToPidl(pidl);
+                        }
                     }
                     finally
                     {
@@ -61,7 +87,7 @@ namespace LeafTab
                 }
             }
 
-            if (!string.IsNullOrEmpty(selfTestOut))
+            if (isSelfTest)
             {
                 await SelfTestRunner.RunAndExitAsync(mainWindow, selfTestOut!);
             }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -12,6 +13,7 @@ using System.Windows.Threading;
 using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
+using LeafTab.Services;
 using LeafTab.Views;
 
 namespace LeafTab.Diagnostics
@@ -33,16 +35,18 @@ namespace LeafTab.Diagnostics
             var log = new StringBuilder();
             try
             {
-                await Task.Delay(900); // Allow initial "此电脑" tab to finish rendering
+                await Task.Delay(900);
 
                 string exePath = Assembly.GetExecutingAssembly().Location;
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
+                string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab Stage 1 Automated Diagnostic Raw Telemetry");
+                log.AppendLine("# LeafTab Stage 1 & Stage 2 Automated Diagnostic Telemetry");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
                 log.AppendLine($"- Executable: {exePath} ({exeBytes / 1024.0:F1} KB)");
+                log.AppendLine($"- ResolvedProjectDir: {projectDir}");
                 log.AppendLine();
 
                 // ==================== 1. SPECIAL & VIRTUAL FOLDERS ====================
@@ -55,29 +59,99 @@ namespace LeafTab.Diagnostics
                     List<string> thisPcItems = tab1.BrowserHost.GetDisplayedItemNames(30);
                     log.AppendLine($"- [此电脑] Title='{tab1.Title}', ItemCount={thisPcItems.Count}, Items=[{string.Join(", ", thisPcItems)}]");
 
-                    // Probe grouped view gestures in "此电脑"
                     await ProbeThisPcGesturesAsync(tab1.BrowserHost, log);
                 }
 
-                await TestNavigateFolderAsync(window, @"E:\LeafTab", "普通项目目录 E:\\LeafTab", log);
-
-                if (Directory.Exists(@"D:\Clover_v3.5.4_Final\Clover"))
+                bool projNavOk = await TestNavigateFolderAsync(window, projectDir, $"当前项目目录 {projectDir}", log);
+                if (projNavOk && window.SelectedTab != null)
                 {
-                    bool ok = await TestNavigateFolderAsync(window, @"D:\Clover_v3.5.4_Final\Clover", "含子目录与可执行文件的目录", log);
-                    if (ok && window.SelectedTab != null)
+                    await ProbeDirectoryGesturesAsync(window.SelectedTab.BrowserHost, FOLDERVIEWMODE.FVM_DETAILS, "详细信息视图 (FVM_DETAILS)", log);
+                    await ProbeDirectoryGesturesAsync(window.SelectedTab.BrowserHost, FOLDERVIEWMODE.FVM_ICON, "图标视图 (FVM_ICON)", log);
+                    window.SelectedTab.BrowserHost.TrySetViewStyle(ExplorerViewStyle.Details);
+                }
+
+                // ==================== 2. STAGE 2 FEATURE VERIFICATION ====================
+                log.AppendLine();
+                log.AppendLine("## 2. Stage 2 Feature Checks (Breadcrumbs, History Stack, Async Search, Reopen Tab, config.json)");
+
+                if (window.SelectedTab != null)
+                {
+                    var crumbs = PidlManager.BuildBreadcrumbChain(window.SelectedTab.CurrentPidl);
+                    string crumbText = string.Join(" > ", crumbs.Select(c => c.Title));
+                    log.AppendLine($"- BreadcrumbChain: [{crumbText}] (Count={crumbs.Count})");
+
+                    bool canBackBefore = window.SelectedTab.CanNavigateBack;
+                    window.SelectedTab.NavigateHistoryStep(-1);
+                    await Task.Delay(350);
+                    bool canFwdAfterBack = window.SelectedTab.CanNavigateForward;
+                    window.SelectedTab.NavigateHistoryStep(+1);
+                    await Task.Delay(350);
+                    log.AppendLine($"- HistoryStack Back/Forward: CanBackBefore={canBackBefore}, CanFwdAfterBack={canFwdAfterBack}, RestoredTitle='{window.SelectedTab.Title}'");
+
+                    // Async directory search into IResultsFolder
+                    var searchSw = Stopwatch.StartNew();
+                    int foundCs = await window.SelectedTab.BrowserHost.StartSearchAsync(
+                        "*.cs",
+                        window.SelectedTab.CurrentPidl,
+                        window.SelectedTab.FileSystemPath);
+                    searchSw.Stop();
+                    bool inSearch = window.SelectedTab.BrowserHost.IsShowingSearchResults;
+                    List<string> searchSample = window.SelectedTab.BrowserHost.GetDisplayedItemNames(5);
+                    window.SelectedTab.BrowserHost.ExitSearchMode();
+                    await Task.Delay(150);
+                    log.AppendLine($"- AsyncSearch '*.cs': MatchedCount={foundCs}, Elapsed={searchSw.ElapsedMilliseconds}ms, EnteredSearchMode={inSearch}, ExitedCleanly={!window.SelectedTab.BrowserHost.IsShowingSearchResults}, Sample=[{string.Join(", ", searchSample)}]");
+
+                    // Reopen closed tab (Ctrl+Shift+T)
+                    (IntPtr dlPidl, _) = await PidlManager.TryParseAddressAsync("下载", CancellationToken.None);
+                    try
                     {
-                        await ProbeDirectoryGesturesAsync(window.SelectedTab.BrowserHost, FOLDERVIEWMODE.FVM_DETAILS, "详细信息视图 (FVM_DETAILS)", log);
-                        await ProbeDirectoryGesturesAsync(window.SelectedTab.BrowserHost, FOLDERVIEWMODE.FVM_ICON, "图标视图 (FVM_ICON)", log);
-                        window.SelectedTab.BrowserHost.TrySetViewMode(FOLDERVIEWMODE.FVM_DETAILS);
+                        ExplorerTabItem tempDlTab = window.AddNewTab(dlPidl, activate: true);
+                        await Task.Delay(250);
+                        string closedTitle = tempDlTab.Title;
+                        window.CloseTab(tempDlTab);
+                        bool reopened = window.ReopenLastClosedTab();
+                        await Task.Delay(250);
+                        log.AppendLine($"- ReopenClosedTab (Ctrl+Shift+T): Closed='{closedTitle}', Reopened={reopened}, ActiveTitle='{window.SelectedTab?.Title}'");
                     }
+                    finally
+                    {
+                        PidlManager.Free(ref dlPidl);
+                    }
+                }
+
+                // config.json round-trip serialization check
+                string tempCfgPath = Path.Combine(Path.GetTempPath(), $"leaftab_selftest_{Guid.NewGuid():N}.json");
+                try
+                {
+                    var sampleCfg = new AppConfig
+                    {
+                        ShowBookmarkBar = true,
+                        ShowPreviewPane = false,
+                        SelectedTabIndex = 0
+                    };
+                    sampleCfg.Bookmarks.Add(new BookmarkConfigItem { Title = "LeafTab", TargetPath = projectDir });
+                    sampleCfg.OpenTabs.Add(new SavedTabConfigItem
+                    {
+                        CurrentPath = projectDir,
+                        HistoryPaths = new List<string> { "此电脑", projectDir },
+                        HistoryIndex = 1
+                    });
+
+                    bool savedOk = AppConfigService.Save(sampleCfg, tempCfgPath);
+                    AppConfig loadedCfg = AppConfigService.Load(tempCfgPath);
+                    log.AppendLine($"- ConfigJsonRoundTrip: Saved={savedOk}, LoadedBookmarks={loadedCfg.Bookmarks.Count}, LoadedTabs={loadedCfg.OpenTabs.Count}, ShowBookmarkBar={loadedCfg.ShowBookmarkBar}");
+                }
+                finally
+                {
+                    if (File.Exists(tempCfgPath)) File.Delete(tempCfgPath);
                 }
 
                 await TestNavigateFolderAsync(window, "回收站", "虚拟目录：回收站", log);
                 await TestNavigateFolderAsync(window, @"\\wsl.localhost", "WSL 命名空间 (\\\\wsl.localhost)", log);
 
-                // ==================== 2. UNREACHABLE UNC ASYNC PRE-CHECK ====================
+                // ==================== 3. UNREACHABLE UNC ASYNC PRE-CHECK ====================
                 log.AppendLine();
-                log.AppendLine("## 2. Unreachable Network Path Async Pre-Check");
+                log.AppendLine("## 3. Unreachable Network Path Async Pre-Check");
                 int uiHeartbeats = 0;
                 var heartbeatTimer = new DispatcherTimer(DispatcherPriority.Normal)
                 {
@@ -93,11 +167,10 @@ namespace LeafTab.Diagnostics
 
                 log.AppendLine($"- UNC \\\\192.0.2.1\\nonexistent_share: NavSucceeded={uncNavResult}, ElapsedMs={uncSw.ElapsedMilliseconds}ms, UiDispatcherHeartbeatsDuringWait={uiHeartbeats}");
 
-                // ==================== 3. 1 / 10 / 20 TABS RESOURCE BENCHMARK ====================
+                // ==================== 4. 1 / 10 / 20 TABS RESOURCE BENCHMARK ====================
                 log.AppendLine();
-                log.AppendLine("## 3. Multi-Tab Resource Benchmark (1 / 10 / 20 Tabs)");
+                log.AppendLine("## 4. Multi-Tab Resource Benchmark (1 / 10 / 20 Tabs)");
 
-                // Ensure we start cleanly at 1 tab ("此电脑")
                 while (window.Tabs.Count > 1)
                 {
                     window.CloseTab(window.Tabs[window.Tabs.Count - 1]);
@@ -111,12 +184,10 @@ namespace LeafTab.Diagnostics
                     CaptureSnapshot("1 个标签 (此电脑)", window.Tabs.Count)
                 };
 
-                string[] sampleFolders =
+                var candidateFolders = new List<string>
                 {
                     @"C:\",
-                    @"D:\",
-                    @"E:\",
-                    @"E:\LeafTab",
+                    projectDir,
                     @"C:\Windows",
                     @"C:\Windows\System32",
                     @"C:\Program Files",
@@ -124,8 +195,10 @@ namespace LeafTab.Diagnostics
                     Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                     Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
                 };
+                if (Directory.Exists(@"D:\")) candidateFolders.Insert(1, @"D:\");
 
-                // Open up to 10 tabs
+                string[] sampleFolders = candidateFolders.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
                 int folderIdx = 0;
                 while (window.Tabs.Count < 10)
                 {
@@ -146,7 +219,6 @@ namespace LeafTab.Diagnostics
                 ForceGcAndPump();
                 snapshots.Add(CaptureSnapshot("10 个标签 (多磁盘与系统目录混合)", window.Tabs.Count));
 
-                // Open up to 20 tabs
                 while (window.Tabs.Count < 20)
                 {
                     string path = sampleFolders[folderIdx % sampleFolders.Length];
@@ -166,7 +238,6 @@ namespace LeafTab.Diagnostics
                 ForceGcAndPump();
                 snapshots.Add(CaptureSnapshot("20 个标签 (满载保活状态)", window.Tabs.Count));
 
-                // Close back down to 2 tabs before 50x stress loop
                 while (window.Tabs.Count > 2)
                 {
                     window.CloseTab(window.Tabs[window.Tabs.Count - 1]);
@@ -175,7 +246,7 @@ namespace LeafTab.Diagnostics
                 ForceGcAndPump();
                 snapshots.Add(CaptureSnapshot("从 20 标签关闭回落至 2 标签 (压测起点)", window.Tabs.Count));
 
-                // ==================== 4. 50x OPEN / CLOSE STABILITY CURVE ====================
+                // ==================== 5. 50x OPEN / CLOSE STABILITY CURVE ====================
                 for (int i = 1; i <= 50; i++)
                 {
                     string path = sampleFolders[i % sampleFolders.Length];
@@ -218,8 +289,33 @@ namespace LeafTab.Diagnostics
                 log.AppendLine(ex.ToString());
             }
 
-            File.WriteAllText(outputPath, log.ToString(), Encoding.UTF8);
+            string fullOut = Path.GetFullPath(outputPath);
+            string? outDir = Path.GetDirectoryName(fullOut);
+            if (!string.IsNullOrEmpty(outDir))
+            {
+                Directory.CreateDirectory(outDir);
+            }
+
+            File.WriteAllText(fullOut, log.ToString(), Encoding.UTF8);
             window.Close();
+        }
+
+        private static string ResolveProjectDirectory()
+        {
+            string cur = Environment.CurrentDirectory;
+            if (Directory.Exists(cur))
+                return cur;
+
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            DirectoryInfo? dir = new DirectoryInfo(baseDir);
+            while (dir != null)
+            {
+                if (File.Exists(Path.Combine(dir.FullName, "LeafTab.sln")))
+                    return dir.FullName;
+                dir = dir.Parent;
+            }
+
+            return baseDir;
         }
 
         private static async Task<bool> TestNavigateFolderAsync(MainWindow window, string address, string description, StringBuilder log)
@@ -258,18 +354,17 @@ namespace LeafTab.Diagnostics
                 return;
             }
 
-            // Locate live child elements inside DirectUIHWND on an MTA ThreadPool worker
             var elements = await Task.Run(() => InspectDirectUiElementsFromMta(directUi));
             log.AppendLine($"  - GestureProbe [{modeLabel}]: DirectUIHWND=0x{directUi.ToInt64():X}, DiscoveredElements={elements.Count}");
 
+            int checkedCount = 0;
             foreach (var el in elements)
             {
                 if (string.Equals(el.ClassName, "UIItem", StringComparison.Ordinal) &&
-                    (string.Equals(el.Name, "lang", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(el.Name, "Clover", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(el.Name, "Clover.exe", StringComparison.OrdinalIgnoreCase) ||
-                     string.Equals(el.Name, "DuiLib_u.dll", StringComparison.OrdinalIgnoreCase)))
+                    el.Bounds.Width > 8 && el.Bounds.Height > 8 &&
+                    checkedCount < 4)
                 {
+                    checkedCount++;
                     POINT center = new POINT((el.Bounds.Left + el.Bounds.Right) / 2, (el.Bounds.Top + el.Bounds.Bottom) / 2);
 
                     UiaHitResult midHit = await Task.Run(() =>
@@ -291,7 +386,6 @@ namespace LeafTab.Diagnostics
                 }
             }
 
-            // Probe empty bottom area of DirectUIHWND
             if (NativeMethods.GetWindowRect(directUi, out RECT viewRect) && viewRect.Width > 120 && viewRect.Height > 120)
             {
                 POINT blankPt = new POINT(viewRect.Left + 160, viewRect.Bottom - 30);
@@ -311,7 +405,6 @@ namespace LeafTab.Diagnostics
             {
                 if (string.Equals(el.ClassName, "UIGroupItem", StringComparison.Ordinal))
                 {
-                    // Probe top-left header area of group item
                     POINT headerPt = new POINT(el.Bounds.Left + 45, el.Bounds.Top + 12);
                     UiaHitResult groupHdrDbl = await Task.Run(() =>
                         UiaGestureDetector.Shared.ProbePointFromMta(GestureRequestKind.DoubleClickBlank, directUi, headerPt));

@@ -62,6 +62,32 @@ namespace LeafTab.Interop
         public string szTypeName;
     }
 
+    // Verified against Windows SDK ShlObj_core.h lines 95, 3101, 3253-3298 (pshpack1, 32 bytes)
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct SHELLSTATE
+    {
+        public uint BitVector1;
+        public uint dwWin95Unused;
+        public uint uWin95Unused;
+        public int lParamSort;
+        public int iSortDirection;
+        public uint version;
+        public uint uNotUsed;
+        public uint BitVector2;
+
+        public bool ShowAllObjects
+        {
+            get => (BitVector1 & 0x00000001u) != 0;
+            set => BitVector1 = value ? (BitVector1 | 0x00000001u) : (BitVector1 & ~0x00000001u);
+        }
+
+        public bool ShowExtensions
+        {
+            get => (BitVector1 & 0x00000002u) != 0;
+            set => BitVector1 = value ? (BitVector1 | 0x00000002u) : (BitVector1 & ~0x00000002u);
+        }
+    }
+
     internal delegate IntPtr SUBCLASSPROC(
         IntPtr hWnd,
         uint uMsg,
@@ -81,13 +107,16 @@ namespace LeafTab.Interop
 
         public const int SW_HIDE = 0;
         public const int SW_SHOW = 5;
+        public const int SW_SHOWNORMAL = 1;
 
         public const uint WM_KEYDOWN = 0x0100;
         public const uint WM_KEYUP = 0x0101;
         public const uint WM_CHAR = 0x0102;
         public const uint WM_SYSKEYDOWN = 0x0104;
         public const uint WM_SYSKEYUP = 0x0105;
+        public const uint WM_LBUTTONUP = 0x0202;
         public const uint WM_LBUTTONDBLCLK = 0x0203;
+        public const uint WM_RBUTTONUP = 0x0205;
         public const uint WM_MBUTTONDOWN = 0x0207;
         public const uint WM_MBUTTONUP = 0x0208;
         public const uint WM_NCDESTROY = 0x0082;
@@ -97,14 +126,29 @@ namespace LeafTab.Interop
         public const uint SHGFI_PIDL = 0x000000008;
         public const uint SHGFI_DISPLAYNAME = 0x000000200;
 
+        public const uint SSF_SHOWALLOBJECTS = 0x00000001;
+        public const uint SSF_SHOWEXTENSIONS = 0x00000002;
+
+        public const int SHCNE_CREATE = 0x00000002;
+        public const int SHCNE_MKDIR = 0x00000008;
+        public const int SHCNE_UPDATEDIR = 0x00001000;
+        public const int SHCNE_ASSOCCHANGED = 0x08000000;
+        public const uint SHCNF_IDLIST = 0x0000;
+        public const uint SHCNF_PATHW = 0x0005;
+        public const uint SHCNF_FLUSH = 0x1000;
+        public const uint SHCNF_FLUSHNOWAIT = 0x3000;
+
         public const uint GR_GDIOBJECTS = 0;
         public const uint GR_USEROBJECTS = 1;
 
         public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
         public const int DWMWCP_ROUND = 2;
 
-        public static readonly Guid FOLDERID_ComputerFolder = new Guid("0AC0837C-BBF8-452A-850D-79D08E667CA7");
+        public static readonly Guid FOLDERID_Desktop = new Guid("B4BFCC3A-DB2C-424C-B029-7FE99A87C641");
+        public static readonly Guid FOLDERID_Documents = new Guid("FDD39AD0-238F-46AF-ADB4-6C85480369C7");
         public static readonly Guid FOLDERID_Downloads = new Guid("374DE290-123F-4565-9164-39C4925E467B");
+        public static readonly Guid FOLDERID_Pictures = new Guid("33E28130-4E1E-4676-835A-98395C3BC3BB");
+        public static readonly Guid FOLDERID_ComputerFolder = new Guid("0AC0837C-BBF8-452A-850D-79D08E667CA7");
         public static readonly Guid FOLDERID_RecycleBinFolder = new Guid("B7534046-3ECB-4C18-BE4E-64CD4CB7D6AC");
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -129,6 +173,10 @@ namespace LeafTab.Interop
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -168,6 +216,13 @@ namespace LeafTab.Interop
 
         [DllImport("user32.dll")]
         public static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DestroyMenu(IntPtr hMenu);
 
         [DllImport("comctl32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -229,6 +284,13 @@ namespace LeafTab.Interop
             ref Guid riid,
             [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
 
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        public static extern int SHCreateItemFromParsingName(
+            string pszPath,
+            IntPtr pbc,
+            ref Guid riid,
+            [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
+
         [DllImport("shell32.dll")]
         public static extern int SHCreateItemWithParent(
             IntPtr pidlParent,
@@ -237,6 +299,11 @@ namespace LeafTab.Interop
             ref Guid riid,
             [MarshalAs(UnmanagedType.Interface)] out IShellItem ppv);
 
+        [DllImport("shell32.dll")]
+        public static extern int SHGetIDListFromObject(
+            [MarshalAs(UnmanagedType.IUnknown)] object punk,
+            out IntPtr ppidl);
+
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SHGetFileInfoW(
             IntPtr pszPath,
@@ -244,6 +311,26 @@ namespace LeafTab.Interop
             ref SHFILEINFOW psfi,
             uint cbFileInfo,
             uint uFlags);
+
+        [DllImport("shell32.dll")]
+        public static extern void SHGetSetSettings(
+            ref SHELLSTATE lpss,
+            uint dwMask,
+            [MarshalAs(UnmanagedType.Bool)] bool bSet);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        public static extern void SHChangeNotify(
+            int wEventId,
+            uint uFlags,
+            IntPtr dwItem1,
+            IntPtr dwItem2);
+
+        [DllImport("shell32.dll", EntryPoint = "SHChangeNotify", CharSet = CharSet.Unicode)]
+        public static extern void SHChangeNotifyPath(
+            int wEventId,
+            uint uFlags,
+            string? dwItem1,
+            string? dwItem2);
 
         [DllImport("gdi32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
