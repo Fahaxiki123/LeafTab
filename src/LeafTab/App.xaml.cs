@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Windows;
+using System.Windows.Interop;
 using LeafTab.Diagnostics;
 using LeafTab.Interop;
 using LeafTab.Views;
@@ -13,6 +14,16 @@ namespace LeafTab
         protected override async void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
+
+            DispatcherUnhandledException += (_, args) =>
+            {
+                MessageBox.Show(
+                    $"LeafTab 遇到未处理异常：\n{args.Exception.Message}",
+                    "LeafTab",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                args.Handled = true;
+            };
 
             string? selfTestOut = null;
             string? initialPath = null;
@@ -32,37 +43,20 @@ namespace LeafTab
             }
 
             bool isSelfTest = !string.IsNullOrEmpty(selfTestOut);
-
-            DispatcherUnhandledException += (_, args) =>
-            {
-                if (isSelfTest && !string.IsNullOrEmpty(selfTestOut))
-                {
-                    try
-                    {
-                        string? dir = Path.GetDirectoryName(Path.GetFullPath(selfTestOut!));
-                        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                        File.WriteAllText(selfTestOut!, "# Unhandled Exception\r\n" + args.Exception);
-                    }
-                    catch
-                    {
-                        // Ignore logging errors during shutdown
-                    }
-
-                    args.Handled = true;
-                    Shutdown(1);
-                    return;
-                }
-
-                MessageBox.Show(
-                    $"LeafTab 遇到未处理异常：\n{args.Exception.Message}",
-                    "LeafTab",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                args.Handled = true;
-            };
             var mainWindow = new MainWindow(skipSessionPersistence: isSelfTest);
             MainWindow = mainWindow;
             mainWindow.Show();
+
+            if (!isSelfTest)
+            {
+                IntPtr mainHwnd = new WindowInteropHelper(mainWindow).Handle;
+                if (mainHwnd != IntPtr.Zero && !NativeMethods.IsWindowVisible(mainHwnd))
+                {
+                    NativeMethods.ShowWindow(
+                        mainHwnd,
+                        mainWindow.WindowState == WindowState.Maximized ? 3 /* SW_SHOWMAXIMIZED */ : NativeMethods.SW_SHOW);
+                }
+            }
 
             if (!string.IsNullOrEmpty(initialPath))
             {
@@ -71,14 +65,7 @@ namespace LeafTab
                 {
                     try
                     {
-                        if (mainWindow.Tabs.Count > 1)
-                        {
-                            mainWindow.AddNewTab(pidl, activate: true);
-                        }
-                        else
-                        {
-                            mainWindow.SelectedTab?.BrowserHost.NavigateToPidl(pidl);
-                        }
+                        mainWindow.SelectedTab?.BrowserHost.NavigateToPidl(pidl);
                     }
                     finally
                     {

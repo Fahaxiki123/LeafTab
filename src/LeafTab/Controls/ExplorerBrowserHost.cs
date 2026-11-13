@@ -79,6 +79,44 @@ namespace LeafTab.Controls
     public sealed class ExplorerBrowserHost : HwndHost
     {
         private static readonly UIntPtr DirectUiSubclassId = new UIntPtr(0x4C454146); // 'LEAF'
+        private const string WhiteHostWindowClassName = "LeafTabWhiteHostWnd";
+        private static readonly object s_wndClassLock = new object();
+        private static bool s_whiteHostClassRegistered;
+        private static readonly WNDPROC s_whiteHostWndProc = WhiteHostWndProc;
+        private static int s_cachedInnerStatusBarClipPx = -1;
+
+        private static string EnsureWhiteHostWindowClass()
+        {
+            lock (s_wndClassLock)
+            {
+                if (s_whiteHostClassRegistered)
+                    return WhiteHostWindowClassName;
+
+                var wc = new WNDCLASSEXW
+                {
+                    cbSize = (uint)Marshal.SizeOf<WNDCLASSEXW>(),
+                    style = 0,
+                    lpfnWndProc = Marshal.GetFunctionPointerForDelegate(s_whiteHostWndProc),
+                    hInstance = NativeMethods.GetModuleHandleW(null),
+                    hbrBackground = NativeMethods.GetStockObject(NativeMethods.WHITE_BRUSH),
+                    lpszClassName = WhiteHostWindowClassName
+                };
+
+                ushort atom = NativeMethods.RegisterClassExW(ref wc);
+                if (atom != 0)
+                {
+                    s_whiteHostClassRegistered = true;
+                    return WhiteHostWindowClassName;
+                }
+
+                return "Static";
+            }
+        }
+
+        private static IntPtr WhiteHostWndProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam)
+        {
+            return NativeMethods.DefWindowProcW(hWnd, uMsg, wParam, lParam);
+        }
 
         private IntPtr _hostHwnd;
         private IntPtr _browseHostHwnd;
@@ -146,9 +184,11 @@ namespace LeafTab.Controls
             int initW = Math.Max(1, (int)ActualWidth);
             int initH = Math.Max(1, (int)ActualHeight);
 
+            string hostCls = EnsureWhiteHostWindowClass();
+
             _hostHwnd = NativeMethods.CreateWindowExW(
                 0,
-                "Static",
+                hostCls,
                 string.Empty,
                 NativeMethods.WS_CHILD | visibleFlag | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
                 0,
@@ -162,7 +202,7 @@ namespace LeafTab.Controls
 
             _browseHostHwnd = NativeMethods.CreateWindowExW(
                 0,
-                "Static",
+                hostCls,
                 string.Empty,
                 NativeMethods.WS_CHILD | NativeMethods.WS_VISIBLE | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
                 0,
@@ -194,6 +234,11 @@ namespace LeafTab.Controls
             NativeMethods.GetClientRect(_browseHostHwnd, out RECT rc);
             if (rc.Width <= 0) rc.Right = 800;
             if (rc.Height <= 0) rc.Bottom = 500;
+            if (s_cachedInnerStatusBarClipPx > 0)
+            {
+                rc.Bottom += s_cachedInnerStatusBarClipPx;
+                _innerStatusBarClipPx = s_cachedInnerStatusBarClipPx;
+            }
 
             var fs = new FOLDERSETTINGS
             {
@@ -236,6 +281,7 @@ namespace LeafTab.Controls
         {
             base.OnDpiChanged(oldDpi, newDpi);
             _innerStatusBarClipPx = -1;
+            s_cachedInnerStatusBarClipPx = -1;
             SyncBrowserRect();
         }
 
@@ -263,6 +309,11 @@ namespace LeafTab.Controls
                 NativeMethods.MoveWindow(_searchHostHwnd, 0, 0, rc.Width, rc.Height, true);
             }
 
+            if (_innerStatusBarClipPx < 0 && s_cachedInnerStatusBarClipPx >= 0)
+            {
+                _innerStatusBarClipPx = s_cachedInnerStatusBarClipPx;
+            }
+
             if (_innerStatusBarClipPx < 0 && !_isShowingSearchResults)
             {
                 IntPtr hdwpProbe = IntPtr.Zero;
@@ -276,6 +327,10 @@ namespace LeafTab.Controls
                 {
                     int bottomGap = hostScreen.Bottom - svScreen.Bottom;
                     _innerStatusBarClipPx = (bottomGap > 0 && bottomGap <= 56) ? bottomGap : 0;
+                    if (_innerStatusBarClipPx > 0)
+                    {
+                        s_cachedInnerStatusBarClipPx = _innerStatusBarClipPx;
+                    }
                 }
             }
 
@@ -308,6 +363,7 @@ namespace LeafTab.Controls
 
             _showPreviewPane = visible;
             _innerStatusBarClipPx = -1;
+            s_cachedInnerStatusBarClipPx = -1;
 
             if (_browser != null && !_isShowingSearchResults && currentFolderPidl != IntPtr.Zero)
             {
@@ -1118,7 +1174,7 @@ namespace LeafTab.Controls
 
             _searchHostHwnd = NativeMethods.CreateWindowExW(
                 0,
-                "Static",
+                EnsureWhiteHostWindowClass(),
                 string.Empty,
                 NativeMethods.WS_CHILD | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
                 0,
@@ -1668,12 +1724,7 @@ namespace LeafTab.Controls
         {
             if (_isDestroyed || _hostHwnd == IntPtr.Zero) return;
 
-            AttachDirectUiSubclassIfNeeded();
-            if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
-            {
-                NativeMethods.SetFocus(_subclassedDirectUiHwnd);
-                return;
-            }
+            System.Windows.Input.Keyboard.ClearFocus();
 
             IExplorerBrowser? active = ActiveBrowser;
             if (active != null)
@@ -1684,9 +1735,18 @@ namespace LeafTab.Controls
                     var sv = (IShellView)Marshal.GetObjectForIUnknown(psv);
                     try
                     {
+                        sv.UIActivate(2); // SVUIA_ACTIVATE_FOCUS
+                        AttachDirectUiSubclassIfNeeded();
+                        if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+                        {
+                            NativeMethods.SetFocus(_subclassedDirectUiHwnd);
+                            return;
+                        }
+
                         if (sv.GetWindow(out IntPtr viewHwnd) == ShellConstants.S_OK && viewHwnd != IntPtr.Zero)
                         {
                             NativeMethods.SetFocus(viewHwnd);
+                            return;
                         }
                     }
                     finally
@@ -1695,6 +1755,12 @@ namespace LeafTab.Controls
                         Marshal.Release(psv);
                     }
                 }
+            }
+
+            AttachDirectUiSubclassIfNeeded();
+            if (_subclassedDirectUiHwnd != IntPtr.Zero && NativeMethods.IsWindow(_subclassedDirectUiHwnd))
+            {
+                NativeMethods.SetFocus(_subclassedDirectUiHwnd);
             }
         }
 

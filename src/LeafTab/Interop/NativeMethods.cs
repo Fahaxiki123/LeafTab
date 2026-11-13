@@ -88,6 +88,29 @@ namespace LeafTab.Interop
         }
     }
 
+    internal delegate IntPtr WNDPROC(
+        IntPtr hWnd,
+        uint uMsg,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct WNDCLASSEXW
+    {
+        public uint cbSize;
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        public string? lpszMenuName;
+        public string lpszClassName;
+        public IntPtr hIconSm;
+    }
+
     internal delegate IntPtr SUBCLASSPROC(
         IntPtr hWnd,
         uint uMsg,
@@ -119,11 +142,18 @@ namespace LeafTab.Interop
         public const uint WM_RBUTTONUP = 0x0205;
         public const uint WM_MBUTTONDOWN = 0x0207;
         public const uint WM_MBUTTONUP = 0x0208;
+        public const uint WM_ERASEBKGND = 0x0014;
         public const uint WM_NCDESTROY = 0x0082;
+
+        public const int WHITE_BRUSH = 0;
+
+        public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+        public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
 
         public const uint SHGFI_ICON = 0x000000100;
         public const uint SHGFI_SMALLICON = 0x000000001;
         public const uint SHGFI_PIDL = 0x000000008;
+        public const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
         public const uint SHGFI_DISPLAYNAME = 0x000000200;
 
         public const uint SSF_SHOWALLOBJECTS = 0x00000001;
@@ -150,6 +180,18 @@ namespace LeafTab.Interop
         public static readonly Guid FOLDERID_Pictures = new Guid("33E28130-4E1E-4676-835A-98395C3BC3BB");
         public static readonly Guid FOLDERID_ComputerFolder = new Guid("0AC0837C-BBF8-452A-850D-79D08E667CA7");
         public static readonly Guid FOLDERID_RecycleBinFolder = new Guid("B7534046-3ECB-4C18-BE4E-64CD4CB7D6AC");
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern ushort RegisterClassExW(ref WNDCLASSEXW lpwcx);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr DefWindowProcW(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("gdi32.dll")]
+        public static extern IntPtr GetStockObject(int i);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr CreateWindowExW(
@@ -193,6 +235,10 @@ namespace LeafTab.Interop
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -307,6 +353,14 @@ namespace LeafTab.Interop
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SHGetFileInfoW(
             IntPtr pszPath,
+            uint dwFileAttributes,
+            ref SHFILEINFOW psfi,
+            uint cbFileInfo,
+            uint uFlags);
+
+        [DllImport("shell32.dll", EntryPoint = "SHGetFileInfoW", CharSet = CharSet.Unicode)]
+        public static extern IntPtr SHGetFileInfoByNameW(
+            string pszPath,
             uint dwFileAttributes,
             ref SHFILEINFOW psfi,
             uint cbFileInfo,

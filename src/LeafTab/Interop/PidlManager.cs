@@ -31,6 +31,9 @@ namespace LeafTab.Interop
     internal static class PidlManager
     {
         private static readonly Guid BHID_SFObject = new Guid("3981e224-f559-11d3-8e3a-00c04f6837d5");
+        private static readonly object s_iconCacheLock = new object();
+        private static readonly Dictionary<string, ImageSource> s_smallIconCache =
+            new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
 
         public static IntPtr CreateKnownFolderPidl(Guid knownFolderId)
         {
@@ -177,8 +180,96 @@ namespace LeafTab.Interop
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(info.ParsingName))
+            {
+                lock (s_iconCacheLock)
+                {
+                    if (s_smallIconCache.TryGetValue(info.ParsingName, out ImageSource? cached))
+                    {
+                        info.Icon = cached;
+                        return info;
+                    }
+                }
+            }
+
             info.Icon = ExtractSmallIcon(pidl);
+            if (info.Icon != null && !string.IsNullOrWhiteSpace(info.ParsingName))
+            {
+                CacheIcon(info.ParsingName, info.Icon);
+            }
             return info;
+        }
+
+        private static void CacheIcon(string key, ImageSource icon)
+        {
+            lock (s_iconCacheLock)
+            {
+                if (s_smallIconCache.Count >= 256)
+                {
+                    s_smallIconCache.Clear();
+                }
+                s_smallIconCache[key] = icon;
+            }
+        }
+
+        private static ImageSource? GetOrExtractSmallIcon(IntPtr pidl, string? cacheKey)
+        {
+            if (!string.IsNullOrWhiteSpace(cacheKey))
+            {
+                lock (s_iconCacheLock)
+                {
+                    if (s_smallIconCache.TryGetValue(cacheKey!, out ImageSource? cached))
+                        return cached;
+                }
+            }
+
+            ImageSource? extracted = ExtractSmallIcon(pidl);
+            if (extracted != null && !string.IsNullOrWhiteSpace(cacheKey))
+            {
+                CacheIcon(cacheKey!, extracted);
+            }
+            return extracted;
+        }
+
+        public static ImageSource? ExtractTypeSmallIcon(string dummyNameOrExt, bool isDirectory)
+        {
+            string cacheKey = isDirectory ? "__DIR_ICON__" : $"__EXT_{dummyNameOrExt}";
+            lock (s_iconCacheLock)
+            {
+                if (s_smallIconCache.TryGetValue(cacheKey, out ImageSource? cached))
+                    return cached;
+            }
+
+            var shfi = new SHFILEINFOW();
+            uint attrs = isDirectory ? NativeMethods.FILE_ATTRIBUTE_DIRECTORY : NativeMethods.FILE_ATTRIBUTE_NORMAL;
+            IntPtr res = NativeMethods.SHGetFileInfoByNameW(
+                isDirectory ? "folder" : dummyNameOrExt,
+                attrs,
+                ref shfi,
+                (uint)Marshal.SizeOf<SHFILEINFOW>(),
+                NativeMethods.SHGFI_USEFILEATTRIBUTES | NativeMethods.SHGFI_ICON | NativeMethods.SHGFI_SMALLICON);
+
+            if (res == IntPtr.Zero || shfi.hIcon == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(
+                    shfi.hIcon,
+                    Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions());
+                bmp.Freeze();
+                CacheIcon(cacheKey, bmp);
+                return bmp;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                NativeMethods.User32DestroyIcon(shfi.hIcon);
+            }
         }
 
         /// <summary>
@@ -209,7 +300,7 @@ namespace LeafTab.Interop
                             Title = title,
                             ParsingName = parsing,
                             PidlBytes = ToBytes(itemPidl),
-                            Icon = depth == 0 ? ExtractSmallIcon(itemPidl) : null
+                            Icon = null
                         }, itemPidl));
                     }
 
@@ -237,7 +328,7 @@ namespace LeafTab.Interop
                 {
                     if (i == startIndex && reversed[i].Node.Icon == null)
                     {
-                        reversed[i].Node.Icon = ExtractSmallIcon(reversed[i].RawPidl);
+                        reversed[i].Node.Icon = GetOrExtractSmallIcon(reversed[i].RawPidl, reversed[i].Node.ParsingName);
                     }
                     result.Add(reversed[i].Node);
                 }
@@ -314,7 +405,7 @@ namespace LeafTab.Interop
                                             Title = title,
                                             ParsingName = parsing,
                                             PidlBytes = ToBytes(fullChildPidl),
-                                            Icon = ExtractSmallIcon(fullChildPidl)
+                                            Icon = GetOrExtractSmallIcon(fullChildPidl, parsing)
                                         });
                                     }
                                 }

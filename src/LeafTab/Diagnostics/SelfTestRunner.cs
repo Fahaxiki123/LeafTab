@@ -41,7 +41,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab Stage 1 & Stage 2 Automated Diagnostic Telemetry");
+                log.AppendLine("# LeafTab Stage 1 & Stage 2 + Liquid Glass (v0.4.0) Automated Diagnostic Telemetry");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -117,6 +117,18 @@ namespace LeafTab.Diagnostics
                     {
                         PidlManager.Free(ref dlPidl);
                     }
+
+                    // Pre-warmed background '此电脑' tab pool instant switch check
+                    window.EnsurePrewarmedThisPcHostReady();
+                    await Task.Delay(350);
+                    bool poolArmed = window.HasPrewarmedHost;
+                    var prewarmSw = Stopwatch.StartNew();
+                    ExplorerTabItem instantTab = window.OpenNewThisPcTab();
+                    prewarmSw.Stop();
+                    bool directUiImmediate = instantTab.BrowserHost.DirectUiHwnd != IntPtr.Zero;
+                    log.AppendLine($"- PrewarmedThisPcTabPool: Armed={poolArmed}, SwitchLatency={prewarmSw.Elapsed.TotalMilliseconds:F2}ms, DirectUiImmediate={directUiImmediate}, ConsumedCleanly={!window.HasPrewarmedHost}");
+                    window.CloseTab(instantTab);
+                    window.DiscardPrewarmedHost();
                 }
 
                 // config.json round-trip serialization check

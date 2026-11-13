@@ -100,7 +100,7 @@ namespace LeafTab.Models
 
         public bool CanNavigateUp => BrowserHost.IsShowingSearchResults || PidlManager.CanNavigateUp(_currentPidl);
 
-        public ExplorerTabItem(IntPtr initialPidl, bool showPreviewPane = false)
+        public ExplorerTabItem(IntPtr initialPidl, bool showPreviewPane = false, ExplorerBrowserHost? prewarmedHost = null)
         {
             _currentPidl = PidlManager.Clone(initialPidl);
             if (_currentPidl == IntPtr.Zero)
@@ -109,7 +109,11 @@ namespace LeafTab.Models
             }
 
             UpdateDisplayMetadata(_currentPidl);
-            BrowserHost = new ExplorerBrowserHost(_currentPidl, showPreviewPane);
+            BrowserHost = prewarmedHost ?? new ExplorerBrowserHost(_currentPidl, showPreviewPane);
+            if (prewarmedHost != null)
+            {
+                RecordHistory(_currentPidl, _parsingName);
+            }
         }
 
         internal void SuppressNextHistoryRecord() => _suppressNextHistoryPush = true;
