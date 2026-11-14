@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using LeafTab.Shared;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using LeafTab.Interop;
@@ -138,10 +141,11 @@ namespace LeafTab.Services
                         return true;
 
                     case "code":
+                        string codeDirectory = workDir.EndsWith("\\", StringComparison.Ordinal) ? workDir + "." : workDir;
                         Process.Start(new ProcessStartInfo
                         {
                             FileName = "cmd.exe",
-                            Arguments = $"/c code \"{workDir}\"",
+                            Arguments = $"/d /c code \"{codeDirectory}\"",
                             WorkingDirectory = workDir,
                             WindowStyle = ProcessWindowStyle.Hidden,
                             CreateNoWindow = true,
@@ -198,7 +202,10 @@ namespace LeafTab.Services
                 "Microsoft", "WindowsApps", "wt.exe");
 
             if (!File.Exists(wtAppAlias))
-                return false;
+            {
+                wtAppAlias = FindOnPath("wt.exe") ?? string.Empty;
+                if (wtAppAlias.Length == 0) return false;
+            }
 
             string safeDir = workDir.EndsWith("\\", StringComparison.Ordinal)
                 ? workDir + "\\"
@@ -207,14 +214,32 @@ namespace LeafTab.Services
                 ? $"-d \"{safeDir}\""
                 : $"-d \"{safeDir}\" {extraArgs}";
 
-            Process.Start(new ProcessStartInfo
+            try
             {
-                FileName = wtAppAlias,
-                Arguments = args,
-                WorkingDirectory = workDir,
-                UseShellExecute = true
-            });
-            return true;
+                Process.Start(new ProcessStartInfo { FileName = wtAppAlias, Arguments = args, WorkingDirectory = workDir, UseShellExecute = true });
+                return true;
+            }
+            catch (Exception ex) { DiagnosticLog.Write("terminal-fallback", ex); return false; }
+        }
+
+        private static string? FindOnPath(string executable)
+        {
+            foreach (string entry in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(';'))
+            {
+                try { string path = Path.Combine(entry.Trim().Trim('"'), executable); if (File.Exists(path)) return path; }
+                catch (ArgumentException) { }
+            }
+            return null;
+        }
+
+        private static readonly SemaphoreSlim SuggestionWorkers = new SemaphoreSlim(2);
+        internal static async Task<List<AddressSuggestionItem>> BuildAddressSuggestionsAsync(string input, bool showHistory,
+            IReadOnlyList<string> recent, IReadOnlyList<string> bookmarks, CancellationToken token)
+        {
+            await Task.Delay(100, token).ConfigureAwait(false);
+            await SuggestionWorkers.WaitAsync(token).ConfigureAwait(false);
+            try { return await Task.Run(() => BuildAddressSuggestions(input, showHistory, recent, bookmarks, 12, token), token).ConfigureAwait(false); }
+            finally { SuggestionWorkers.Release(); }
         }
 
         private static void StartShellProcess(string exeName, string args, string workDir)
@@ -235,7 +260,8 @@ namespace LeafTab.Services
             bool showDefaultHistory,
             IReadOnlyList<string> recentFolders,
             IReadOnlyList<string> bookmarkPaths,
-            int maxResults = 12)
+            int maxResults = 12,
+            CancellationToken cancellationToken = default)
         {
             var results = new List<AddressSuggestionItem>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -275,6 +301,7 @@ namespace LeafTab.Services
                 {
                     ("wt", "在当前目录打开 Windows Terminal"),
                     ("powershell", "在当前目录打开 PowerShell"),
+                    ("pwsh", "在当前目录打开 PowerShell 7"),
                     ("cmd", "在当前目录打开命令提示符 (CMD)"),
                     ("code .", "在当前目录打开 VS Code")
                 };
@@ -327,46 +354,25 @@ namespace LeafTab.Services
                     var containsMatches = new List<string>();
                     try
                     {
-                        int scanned = 0;
-                        foreach (string subDir in Directory.EnumerateDirectories(parentDir))
+                        foreach (DirectoryInfo subDir in new DirectoryInfo(parentDir).EnumerateDirectories())
                         {
-                            if (++scanned > 400)
-                                break;
-
-                            string folderName = Path.GetFileName(subDir);
-                            if (string.IsNullOrEmpty(folderName))
-                                continue;
-
-                            // Hide dot/system folders unless user explicitly typed '.'
-                            if (folderName[0] == '.' && (leafPrefix.Length == 0 || leafPrefix[0] != '.'))
-                                continue;
-
-                            try
-                            {
-                                FileAttributes attr = File.GetAttributes(subDir);
-                                if ((attr & FileAttributes.System) != 0)
-                                    continue;
-                                if ((attr & FileAttributes.Hidden) != 0 && string.IsNullOrEmpty(leafPrefix))
-                                    continue;
-                            }
-                            catch
-                            {
-                                continue;
-                            }
-
-                            if (string.IsNullOrEmpty(leafPrefix) ||
-                                folderName.StartsWith(leafPrefix, StringComparison.OrdinalIgnoreCase))
-                            {
-                                prefixMatches.Add(subDir);
-                            }
-                            else if (folderName.IndexOf(leafPrefix, StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                containsMatches.Add(subDir);
-                            }
+                            cancellationToken.ThrowIfCancellationRequested();
+                            string folderName = subDir.Name;
+                            if (folderName.Length == 0 || (folderName[0] == '.' && (leafPrefix.Length == 0 || leafPrefix[0] != '.'))) continue;
+                            bool prefix = folderName.StartsWith(leafPrefix, StringComparison.OrdinalIgnoreCase);
+                            bool contains = !prefix && folderName.IndexOf(leafPrefix, StringComparison.OrdinalIgnoreCase) >= 0;
+                            if (!prefix && !contains) continue;
+                            FileAttributes attrs = subDir.Attributes; // Reuse directory enumeration metadata.
+                            if ((attrs & FileAttributes.System) != 0 || ((attrs & FileAttributes.Hidden) != 0 && leafPrefix.Length == 0)) continue;
+                            if (prefix) prefixMatches.Add(subDir.FullName);
+                            else if (containsMatches.Count < maxResults) containsMatches.Add(subDir.FullName);
+                            if (prefixMatches.Count >= maxResults) break;
                         }
                     }
-                    catch
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                     {
+                        DiagnosticLog.Write("address-completion-unavailable", ex);
                     }
 
                     prefixMatches.Sort(StringComparer.OrdinalIgnoreCase);

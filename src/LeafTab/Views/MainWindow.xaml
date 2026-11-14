@@ -24,6 +24,7 @@
     </shell:WindowChrome.WindowChrome>
 
     <Window.Resources>
+        <controls:TabCloseVisibilityConverter x:Key="TabCloseVisibility" />
         <!-- ==================== LIQUID GLASS CONTEXT MENU & MENU ITEM STYLES ==================== -->
         <Style x:Key="LiquidGlassMenuSeparatorStyle" TargetType="Separator">
             <Setter Property="Height" Value="1" />
@@ -348,13 +349,16 @@
 
                     <!-- Adaptive Zero-Scrollbar Connected Tabs + [+] Button -->
                     <controls:TabBarTrackPanel Grid.Column="1" VerticalAlignment="Stretch">
+                        <ScrollViewer x:Name="TabsScrollViewer" HorizontalScrollBarVisibility="Hidden"
+                                      VerticalScrollBarVisibility="Disabled" CanContentScroll="False"
+                                      ClipToBounds="True" ScrollChanged="TabsScrollViewer_ScrollChanged">
                         <ItemsControl x:Name="TabsItemsControl"
                                       VerticalAlignment="Stretch"
                                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
                                       PreviewMouseWheel="TabStrip_PreviewMouseWheel">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
-                                    <controls:AdaptiveTabStripPanel MaxTabWidth="192" MinTabWidth="48" />
+                                    <controls:AdaptiveTabStripPanel MaxTabWidth="192" MinTabWidth="72" />
                                 </ItemsPanelTemplate>
                             </ItemsControl.ItemsPanel>
 
@@ -460,6 +464,12 @@
                                                         ToolTip="关闭标签页 (Ctrl+W)"
                                                         Focusable="False"
                                                         Click="CloseTabButton_Click">
+                                                    <Button.Visibility>
+                                                        <MultiBinding Converter="{StaticResource TabCloseVisibility}">
+                                                            <Binding Path="IsSelected" />
+                                                            <Binding Path="ActualWidth" RelativeSource="{RelativeSource AncestorType=ContentPresenter}" />
+                                                        </MultiBinding>
+                                                    </Button.Visibility>
                                                     <Button.Template>
                                                         <ControlTemplate TargetType="Button">
                                                             <Border x:Name="CloseBd" Background="Transparent" CornerRadius="5">
@@ -523,7 +533,8 @@
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
-
+                        </ScrollViewer>
+                        <StackPanel Orientation="Horizontal">
                         <!-- [+] New Tab Button hugging the last tab -->
                         <Button x:Name="NewTabButton"
                                 Width="28"
@@ -539,6 +550,27 @@
                                   StrokeStartLineCap="Round" StrokeEndLineCap="Round"
                                   Data="M5.5,0.6 V10.4 M0.6,5.5 H10.4" />
                         </Button>
+                        <Button x:Name="TabsOverflowButton" Width="24" Height="28" Margin="0,6,4,3"
+                                VerticalAlignment="Bottom" ToolTip="标签页列表"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True" Click="TabsOverflowButton_Click">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource GlassNavIconButtonStyle}">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Items.Count, ElementName=TabsItemsControl}" Value="0">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding Items.Count, ElementName=TabsItemsControl}" Value="1">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                            <Path Width="9" Height="5" Stretch="Uniform"
+                                  Stroke="#334155" StrokeThickness="1.45"
+                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                                  Data="M0.5,0.5 L4.5,4.5 L8.5,0.5" />
+                        </Button>
+                        </StackPanel>
                     </controls:TabBarTrackPanel>
 
                     <!-- Top-Right Minimalist Rounded Window Controls -->

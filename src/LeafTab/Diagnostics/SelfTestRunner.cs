@@ -14,6 +14,8 @@ using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
+using LeafTab.Shared;
+using System.Windows.Controls;
 using LeafTab.Views;
 using Microsoft.Win32;
 
@@ -33,6 +35,7 @@ namespace LeafTab.Diagnostics
 
         public static async Task RunAndExitAsync(MainWindow window, string outputPath)
         {
+            DiagnosticLog.DirectoryPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outputPath))!, "self-test-logs");
             var log = new StringBuilder();
             var failures = new List<string>();
 
@@ -50,7 +53,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab Stage 1-3 + Liquid Glass (v0.6.0) Automated Diagnostic Telemetry");
+                log.AppendLine("# LeafTab v0.6.1 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -72,6 +75,7 @@ namespace LeafTab.Diagnostics
                 }
 
                 bool projNavOk = await TestNavigateFolderAsync(window, projectDir, $"当前项目目录 {projectDir}", log);
+                AssertCheck(projNavOk && window.SelectedTab != null, "ProjectNavigation");
                 if (projNavOk && window.SelectedTab != null)
                 {
                     await ProbeDirectoryGesturesAsync(window.SelectedTab.BrowserHost, FOLDERVIEWMODE.FVM_DETAILS, "详细信息视图 (FVM_DETAILS)", log);
@@ -88,6 +92,7 @@ namespace LeafTab.Diagnostics
                     var crumbs = PidlManager.BuildBreadcrumbChain(window.SelectedTab.CurrentPidl);
                     string crumbText = string.Join(" > ", crumbs.Select(c => c.Title));
                     log.AppendLine($"- BreadcrumbChain: [{crumbText}] (Count={crumbs.Count})");
+                    AssertCheck(crumbs.Count > 0, "BreadcrumbChain");
 
                     bool canBackBefore = window.SelectedTab.CanNavigateBack;
                     window.SelectedTab.NavigateHistoryStep(-1);
@@ -96,6 +101,7 @@ namespace LeafTab.Diagnostics
                     window.SelectedTab.NavigateHistoryStep(+1);
                     await Task.Delay(350);
                     log.AppendLine($"- HistoryStack Back/Forward: CanBackBefore={canBackBefore}, CanFwdAfterBack={canFwdAfterBack}, RestoredTitle='{window.SelectedTab.Title}'");
+                    AssertCheck(canBackBefore && canFwdAfterBack, "HistoryBackForward");
 
                     // Async directory search into IResultsFolder
                     var searchSw = Stopwatch.StartNew();
@@ -109,6 +115,7 @@ namespace LeafTab.Diagnostics
                     window.SelectedTab.BrowserHost.ExitSearchMode();
                     await Task.Delay(150);
                     log.AppendLine($"- AsyncSearch '*.cs': MatchedCount={foundCs}, Elapsed={searchSw.ElapsedMilliseconds}ms, EnteredSearchMode={inSearch}, ExitedCleanly={!window.SelectedTab.BrowserHost.IsShowingSearchResults}, Sample=[{string.Join(", ", searchSample)}]");
+                    AssertCheck(inSearch && !window.SelectedTab.BrowserHost.IsShowingSearchResults && (!Directory.Exists(Path.Combine(projectDir, "src", "LeafTab")) || foundCs > 0), "AsyncSearchResults");
 
                     // Reopen closed tab (Ctrl+Shift+T)
                     (IntPtr dlPidl, _) = await PidlManager.TryParseAddressAsync("下载", CancellationToken.None);
@@ -121,6 +128,7 @@ namespace LeafTab.Diagnostics
                         bool reopened = window.ReopenLastClosedTab();
                         await Task.Delay(250);
                         log.AppendLine($"- ReopenClosedTab (Ctrl+Shift+T): Closed='{closedTitle}', Reopened={reopened}, ActiveTitle='{window.SelectedTab?.Title}'");
+                        AssertCheck(reopened && window.SelectedTab?.Title == closedTitle, "ReopenClosedTab");
                     }
                     finally
                     {
@@ -599,6 +607,69 @@ namespace LeafTab.Diagnostics
                 foreach (ResourceSnapshot s in snapshots)
                 {
                     log.AppendLine($"- [{s.Label}] Tabs={s.TabCount}, WorkingSet={s.WorkingSetMb:F1} MB, PrivateBytes={s.PrivateBytesMb:F1} MB, GDI={s.GdiObjects}, USER={s.UserObjects}");
+                }
+
+                // Dedicated native selection fixture: no user documents are modified.
+                string selectionDir = Path.Combine(Path.GetTempPath(), "LeafTab-selection-" + Guid.NewGuid().ToString("N"));
+                ExplorerTabItem? selectionTab = null;
+                try
+                {
+                    Directory.CreateDirectory(selectionDir);
+                    for (int i = 0; i < 1000; i++) File.WriteAllText(Path.Combine(selectionDir, $"item-{i:D4}.txt"), string.Empty);
+                    selectionTab = window.AddNewTab(IntPtr.Zero, activate: true, animateOpen: false);
+                    bool selectionNavigation = await TestNavigateFolderAsync(window, selectionDir, "全选测试目录", log);
+                    if (selectionNavigation && window.SelectedTab != null)
+                    {
+                        var host = window.SelectedTab.BrowserHost;
+                        for (int i = 0; i < 50 && host.GetItemCounts().TotalItems != 1000; i++) await Task.Delay(100);
+                        var timer = Stopwatch.StartNew();
+                        host.SelectAllItems();
+                        for (int i = 0; i < 100 && host.GetItemCounts().SelectedItems != 1000; i++) await Task.Delay(50);
+                        timer.Stop();
+                        bool allSelected = host.GetItemCounts().SelectedItems == 1000;
+                        log.AppendLine($"- NativeSelectAll1000: Selected={host.GetItemCounts().SelectedItems}, ElapsedMs={timer.ElapsedMilliseconds}");
+                        AssertCheck(allSelected, "NativeSelectAll1000");
+                    }
+                    else AssertCheck(false, "NativeSelectAllNavigation");
+                }
+                finally
+                {
+                    // Release the native folder view before deleting its fixture, including on failure.
+                    try { if (selectionTab != null) window.CloseTab(selectionTab); }
+                    finally
+                    {
+                        for (int attempt = 0; Directory.Exists(selectionDir); attempt++)
+                        {
+                            try { Directory.Delete(selectionDir, recursive: true); }
+                            catch (IOException) when (attempt < 5) { await Task.Delay(100); }
+                        }
+                        log.AppendLine("- NativeSelectAllFixtureCleaned: " + !Directory.Exists(selectionDir));
+                    }
+                }
+
+                double oldWidth = window.Width;
+                window.Width = 720;
+                var overflowTabs = new List<ExplorerTabItem>();
+                IntPtr overflowPidl = PidlManager.CreateThisPcPidl();
+                try
+                {
+                    for (int i = 0; i < 30; i++) overflowTabs.Add(window.AddNewTab(overflowPidl, false, false, deferHostMount: true));
+                    window.ActivateTab(overflowTabs[overflowTabs.Count - 1]);
+                    await Task.Delay(200);
+                    window.UpdateLayout();
+                    var scroll = (ScrollViewer)window.FindName("TabsScrollViewer");
+                    var items = (ItemsControl)window.FindName("TabsItemsControl");
+                    var last = (FrameworkElement)items.ItemContainerGenerator.ContainerFromItem(overflowTabs[overflowTabs.Count - 1]);
+                    Point position = last.TranslatePoint(new Point(0, 0), scroll);
+                    bool inside = position.X >= -1 && position.X + last.ActualWidth <= scroll.ActualWidth + 1;
+                    AssertCheck(scroll.ScrollableWidth > 0 && scroll.ClipToBounds && inside, "NarrowWindowTabOverflow");
+                    log.AppendLine($"- NarrowWindowTabOverflow: Inside={inside}, Viewport={scroll.ActualWidth:F1}, LastTabX={position.X:F1}, Width={last.ActualWidth:F1}");
+                }
+                finally
+                {
+                    PidlManager.Free(ref overflowPidl);
+                    foreach (var tab in overflowTabs) window.CloseTab(tab);
+                    window.Width = oldWidth;
                 }
 
                 log.AppendLine();

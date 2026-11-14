@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
+using LeafTab.Shared;
 
 namespace LeafTab.Setup
 {
@@ -27,7 +28,7 @@ namespace LeafTab.Setup
 
     internal static class SetupEngine
     {
-        public const string AppVersion = "0.6.0";
+        public const string AppVersion = "0.6.1";
         public const string PayloadResourceName = "LeafTab.Payload.gz";
         public const string UninstallRegistryKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\LeafTab";
         public const string ShortcutFileName = "LeafTab（一叶）.lnk";
@@ -193,14 +194,8 @@ namespace LeafTab.Setup
                 progress?.Invoke(68, "正在配置系统关联与右键菜单…");
                 await Task.Run(() =>
                 {
-                    if (!opts.IsSilent && opts.RegisterUninstaller && !opts.SetDefaultExplorer)
-                    {
-                        using RegistryKey? dirShell = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Directory\shell");
-                        if (string.Equals(dirShell?.GetValue(null) as string, "LeafTabOpen", StringComparison.OrdinalIgnoreCase))
-                        {
-                            RunProcessHiddenAndWait(targetExePath, "--unregister-shell", timeoutMs: 6000);
-                        }
-                    }
+                    // Apply each checkbox independently, including silent upgrades.
+                    RemoveDisabledAssociations(targetExePath, opts.SetDefaultExplorer, opts.AddContextMenu);
 
                     if (opts.SetDefaultExplorer || opts.AddContextMenu)
                     {
@@ -268,110 +263,75 @@ namespace LeafTab.Setup
                     }
                 }
 
+                TryDeleteFile(targetExePath + ".previous");
                 return (true, "安装成功", targetExePath);
             }
             catch (Exception ex)
             {
+                DiagnosticLog.Write("install-failed", ex);
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(targetExePath) && File.Exists(targetExePath + ".previous"))
+                        File.Replace(targetExePath + ".previous", targetExePath, null, ignoreMetadataErrors: true);
+                }
+                catch (Exception restoreError) { DiagnosticLog.Write("install-rollback-failed", restoreError); }
                 return (false, ex.Message, targetExePath);
             }
         }
 
         public static async Task<(bool Ok, string Message)> ExecuteUninstallAsync(
-            SetupOptions opts,
-            Action<int, string>? progress = null)
+            SetupOptions opts, Action<int, string>? progress = null)
         {
             try
             {
-                string installDir = Path.GetFullPath(
-                    string.IsNullOrWhiteSpace(opts.InstallDir)
-                        ? GetDefaultInstallDirectory()
-                        : opts.InstallDir.Trim());
-
+                string installDir = Path.GetFullPath(string.IsNullOrWhiteSpace(opts.InstallDir) ? GetDefaultInstallDirectory() : opts.InstallDir.Trim());
                 string targetExePath = Path.Combine(installDir, "LeafTab.exe");
                 string uninstallExePath = Path.Combine(installDir, UninstallerExeName);
                 string selfExe = Assembly.GetExecutingAssembly().Location;
+                string? registeredDirectory = GetRegisteredInstallDirectory();
+                bool ownsSharedData = registeredDirectory == null || PathsEqual(registeredDirectory, installDir);
 
-                progress?.Invoke(20, "正在恢复 Windows 默认资源管理器关联并退出后台进程…");
+                progress?.Invoke(20, "正在退出此安装位置的程序并恢复关联…");
                 await Task.Run(() =>
                 {
-                    if (File.Exists(targetExePath))
-                    {
-                        RunProcessHiddenAndWait(targetExePath, "--unregister-shell", timeoutMs: 7000);
-                    }
-                    else if (opts.RegisterUninstaller)
-                    {
-                        FallbackCleanOrphanedShellRegistry(targetExePath);
-                    }
-
                     StopRunningLeafTabProcesses(targetExePath, stopAllIfTakingOver: false);
+                    FallbackCleanOrphanedShellRegistry(targetExePath);
+                });
+                progress?.Invoke(55, "正在移除程序文件…");
+                await Task.Run(() =>
+                {
+                    for (int attempt = 0; attempt < 6 && File.Exists(targetExePath); attempt++)
+                    {
+                        try { File.Delete(targetExePath); }
+                        catch (IOException) { Thread.Sleep(250); }
+                    }
+                    if (File.Exists(targetExePath)) throw new IOException("程序仍被占用，卸载未完成。已保留卸载入口，请关闭程序后重试。");
                 });
 
-                progress?.Invoke(60, "正在移除快捷方式与系统应用记录…");
+                progress?.Invoke(80, "正在清理此安装位置的快捷方式和配置…");
                 await Task.Run(() =>
                 {
                     if (opts.CreateShortcuts)
                     {
-                        TryDeleteFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), ShortcutFileName));
-                        TryDeleteFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), ShortcutFileName));
+                        DeleteOwnedShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), ShortcutFileName), targetExePath);
+                        DeleteOwnedShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), ShortcutFileName), targetExePath);
                     }
-
-                    if (opts.RegisterUninstaller)
-                    {
-                        try
-                        {
-                            Registry.CurrentUser.DeleteSubKeyTree(UninstallRegistryKeyPath, throwOnMissingSubKey: false);
-                        }
-                        catch
-                        {
-                        }
-                    }
-                });
-
-                progress?.Invoke(85, "正在清理程序文件…");
-                await Task.Run(() =>
-                {
-                    for (int attempt = 0; attempt < 6; attempt++)
-                    {
-                        if (!File.Exists(targetExePath))
-                            break;
-                        try
-                        {
-                            File.Delete(targetExePath);
-                            break;
-                        }
-                        catch
-                        {
-                            Thread.Sleep(250);
-                        }
-                    }
-
-                    if (opts.RemoveUserDataOnUninstall)
-                    {
-                        string appDataDir = Path.Combine(
-                            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                            "LeafTab");
-                        try
-                        {
-                            if (Directory.Exists(appDataDir))
-                                Directory.Delete(appDataDir, recursive: true);
-                        }
-                        catch
-                        {
-                        }
-                    }
-
+                    if (opts.RemoveUserDataOnUninstall) RemoveKnownUserData(installDir, includeSharedData: ownsSharedData);
+                    if (opts.RegisterUninstaller && PathsEqual(GetRegisteredInstallDirectory() ?? string.Empty, installDir))
+                        Registry.CurrentUser.DeleteSubKeyTree(UninstallRegistryKeyPath, throwOnMissingSubKey: false);
+                    TryDeleteFile(targetExePath + ".previous");
                     if (!PathsEqual(selfExe, uninstallExePath))
                     {
                         TryDeleteFile(uninstallExePath);
                         TryRemoveDirectoryIfEmpty(installDir);
                     }
                 });
-
-                progress?.Invoke(100, "LeafTab 已干净卸载，系统文件夹关联已恢复默认。");
+                progress?.Invoke(100, "此安装位置已卸载，其他程序的关联和配置已保留。");
                 return (true, "卸载成功");
             }
             catch (Exception ex)
             {
+                DiagnosticLog.Write("uninstall-failed", ex);
                 return (false, ex.Message);
             }
         }
@@ -430,86 +390,47 @@ namespace LeafTab.Setup
                 }
             }
 
-            if (File.Exists(destinationExePath))
+            using (Stream? digestStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("LeafTab.Payload.sha256"))
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var payload = File.OpenRead(tempPath))
             {
-                File.Delete(destinationExePath);
+                if (digestStream == null) throw new InvalidDataException("安装包缺少校验信息。");
+                using var reader = new StreamReader(digestStream);
+                string expected = reader.ReadToEnd().Trim();
+                string actual = BitConverter.ToString(sha.ComputeHash(payload)).Replace("-", "").ToLowerInvariant();
+                if (!string.Equals(actual, expected, StringComparison.Ordinal)) throw new InvalidDataException("主程序校验失败，已保留原版本。");
             }
-            File.Move(tempPath, destinationExePath);
+            if (File.Exists(destinationExePath))
+                File.Replace(tempPath, destinationExePath, destinationExePath + ".previous", ignoreMetadataErrors: true);
+            else
+                File.Move(tempPath, destinationExePath);
         }
 
         private static void StopRunningLeafTabProcesses(string targetExePath, bool stopAllIfTakingOver)
+            => StopRunningLeafTabProcesses(targetExePath, stopAllIfTakingOver, Process.GetProcessesByName("LeafTab"));
+
+        internal static void StopRunningLeafTabProcesses(string targetExePath, bool stopAllIfTakingOver, Process[] processes)
         {
-            try
+            using var currentProcess = Process.GetCurrentProcess();
+            int sessionId = currentProcess.SessionId;
+            foreach (Process process in processes)
             {
-                if (File.Exists(targetExePath))
+                using (process)
                 {
-                    RunProcessHiddenAndWait(targetExePath, "--quit", timeoutMs: 2000);
-                }
-                else if (stopAllIfTakingOver)
-                {
-                    foreach (Process p in Process.GetProcessesByName("LeafTab"))
-                    {
-                        try
-                        {
-                            string? modPath = p.MainModule?.FileName;
-                            if (!string.IsNullOrWhiteSpace(modPath) && File.Exists(modPath))
-                            {
-                                RunProcessHiddenAndWait(modPath!, "--quit", timeoutMs: 2000);
-                                break;
-                            }
-                        }
-                        catch
-                        {
-                        }
-                        finally
-                        {
-                            p.Dispose();
-                        }
-                    }
-                }
-            }
-            catch
-            {
-            }
-
-            Thread.Sleep(250);
-
-            try
-            {
-                foreach (Process proc in Process.GetProcessesByName("LeafTab"))
-                {
+                    string? path;
                     try
                     {
-                        string? modPath = null;
-                        try
-                        {
-                            modPath = proc.MainModule?.FileName;
-                        }
-                        catch
-                        {
-                        }
-
-                        if (stopAllIfTakingOver ||
-                            (!string.IsNullOrWhiteSpace(modPath) && PathsEqual(modPath!, targetExePath)))
-                        {
-                            if (!proc.HasExited)
-                            {
-                                proc.Kill();
-                                proc.WaitForExit(1500);
-                            }
-                        }
+                        if (process.HasExited || process.SessionId != sessionId) continue;
+                        path = process.MainModule?.FileName;
                     }
-                    catch
-                    {
-                    }
-                    finally
-                    {
-                        proc.Dispose();
-                    }
+                    catch (Exception ex) { DiagnosticLog.Write("process-inspection-skipped", ex); continue; }
+                    // The session-wide primary can be an unregistered portable copy. Run each
+                    // copy's own quit client so older mutex/pipe naming schemes also release COM.
+                    if (!stopAllIfTakingOver && !ShellAssociationRecovery.PathsEqual(path, targetExePath)) continue;
+                    if (process.HasExited) continue;
+                    if (File.Exists(path)) RunProcessHiddenAndWait(path!, "--quit", 3000);
+                    if (!process.WaitForExit(4000)) throw new IOException("LeafTab 仍在运行。请从菜单彻底退出后重试，安装器没有强制终止进程。");
                 }
-            }
-            catch
-            {
             }
         }
 
@@ -535,76 +456,61 @@ namespace LeafTab.Setup
             key.SetValue("EstimatedSize", estimatedKb, RegistryValueKind.DWord);
         }
 
-        private static void FallbackCleanOrphanedShellRegistry(string expectedExePath)
+        internal static void RemoveDisabledAssociations(string exe, bool defaultExplorer, bool contextMenu,
+            string classes = ShellAssociationRecovery.ClassesRoot, string backup = ShellAssociationRecovery.BackupRoot)
         {
+            if (!defaultExplorer) ShellAssociationRecovery.RestoreDefault(exe, classes, backup);
+            if (!contextMenu) ShellAssociationRecovery.RestoreContextMenu(exe, classes);
+        }
+
+        internal static void FallbackCleanOrphanedShellRegistry(string expectedExePath,
+            string classesRoot = ShellAssociationRecovery.ClassesRoot, string backupRoot = ShellAssociationRecovery.BackupRoot)
+        {
+            ShellAssociationRecovery.RestoreDefault(expectedExePath, classesRoot, backupRoot);
+            ShellAssociationRecovery.RestoreContextMenu(expectedExePath, classesRoot);
+            if (ShellAssociationRecovery.HasReferencesToExecutable(expectedExePath, classesRoot))
+                throw new InvalidOperationException("存在经用户修改、仍引用此程序的关联，已保留程序和配置。请先调整该关联再卸载。");
+            if (string.Equals(classesRoot, ShellAssociationRecovery.ClassesRoot, StringComparison.OrdinalIgnoreCase))
+                SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        internal static void RemoveKnownUserData(string installDir, string? userDirectory = null, bool includeSharedData = true)
+        {
+            string userDir = userDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LeafTab");
+            foreach (string directory in includeSharedData ? new[] { installDir, userDir } : new[] { installDir })
+            {
+                string absolute = Path.GetFullPath(directory);
+                if (string.Equals(absolute.TrimEnd('\\'), Path.GetPathRoot(absolute)?.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("拒绝清理磁盘根目录。");
+                for (var parent = new DirectoryInfo(absolute); parent != null; parent = parent.Parent)
+                    if (parent.Exists && (parent.Attributes & FileAttributes.ReparsePoint) != 0)
+                        throw new IOException("配置目录包含链接，已保留数据。");
+                foreach (string name in new[] { "config.json", "config.json.bak", "config.json.tmp", "config.json.migrated.bak" })
+                {
+                    string file = Path.Combine(absolute, name);
+                    if (!File.Exists(file)) continue;
+                    if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new IOException("配置文件是链接，已保留数据。");
+                    File.Delete(file);
+                }
+                TryRemoveDirectoryIfEmpty(absolute);
+            }
+        }
+
+        private static void DeleteOwnedShortcut(string path, string expectedExe)
+        {
+            if (!File.Exists(path)) return;
+            object? instance = Activator.CreateInstance(Type.GetTypeFromCLSID(s_clsidShellLink)!);
             try
             {
-                // Only clean if LeafTabManaged="1" is present in HKCU\Software\Classes
-                foreach (string parent in new[] { @"Directory\shell", @"Drive\shell", @"Folder\shell" })
+                if (instance is IShellLinkW link && instance is IPersistFile file)
                 {
-                    using RegistryKey? shellKey = Registry.CurrentUser.OpenSubKey($@"Software\Classes\{parent}", writable: true);
-                    if (shellKey != null)
-                    {
-                        using RegistryKey? ltVerb = shellKey.OpenSubKey("LeafTabOpen");
-                        if (ltVerb != null && string.Equals(ltVerb.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                        {
-                            if (string.Equals(shellKey.GetValue(null) as string, "LeafTabOpen", StringComparison.OrdinalIgnoreCase))
-                            {
-                                shellKey.DeleteValue("", throwOnMissingValue: false);
-                            }
-                            shellKey.DeleteSubKeyTree("LeafTabOpen", throwOnMissingSubKey: false);
-                        }
-
-                        foreach (string verb in new[] { "open", "explore", "opennewwindow" })
-                        {
-                            using RegistryKey? vKey = shellKey.OpenSubKey(verb);
-                            if (vKey != null && string.Equals(vKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                            {
-                                shellKey.DeleteSubKeyTree(verb, throwOnMissingSubKey: false);
-                            }
-                        }
-                    }
+                    file.Load(path, 0);
+                    var target = new StringBuilder(32768);
+                    link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
+                    if (PathsEqual(target.ToString(), expectedExe)) File.Delete(path);
                 }
-
-                foreach (string ctxParent in new[] { @"Directory\shell", @"Directory\Background\shell", @"Drive\shell" })
-                {
-                    using RegistryKey? shellKey = Registry.CurrentUser.OpenSubKey($@"Software\Classes\{ctxParent}", writable: true);
-                    using RegistryKey? ctxKey = shellKey?.OpenSubKey("OpenInLeafTab");
-                    if (ctxKey != null && string.Equals(ctxKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                    {
-                        shellKey!.DeleteSubKeyTree("OpenInLeafTab", throwOnMissingSubKey: false);
-                    }
-                }
-
-                foreach (string clsid in new[]
-                {
-                    "{8E4C7A29-3D51-4F82-9B14-6A5E20C91D73}",
-                    "{8E4C7A29-3D51-4F82-9B14-6A5E20C91D74}",
-                    "{52205fd8-5dfb-447d-801a-d0b52f2e83e1}"
-                })
-                {
-                    using RegistryKey? cKey = Registry.CurrentUser.OpenSubKey($@"Software\Classes\CLSID\{clsid}");
-                    if (cKey != null && string.Equals(cKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                    {
-                        Registry.CurrentUser.DeleteSubKeyTree($@"Software\Classes\CLSID\{clsid}", throwOnMissingSubKey: false);
-                    }
-                }
-
-                using (RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", writable: true))
-                {
-                    string? runVal = runKey?.GetValue("LeafTab") as string;
-                    if (!string.IsNullOrWhiteSpace(runVal) &&
-                        runVal!.IndexOf("LeafTab.exe", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        runKey!.DeleteValue("LeafTab", throwOnMissingValue: false);
-                    }
-                }
-
-                SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero);
             }
-            catch
-            {
-            }
+            finally { if (instance != null && Marshal.IsComObject(instance)) Marshal.ReleaseComObject(instance); }
         }
 
         private static void CreateShortcutAt(string lnkPath, string targetExePath)
@@ -741,7 +647,11 @@ namespace LeafTab.Setup
                 CreateNoWindow = true,
                 UseShellExecute = false
             });
-            p?.WaitForExit(timeoutMs);
+            if (p == null) throw new InvalidOperationException("无法启动安装辅助进程。");
+            if (!p.WaitForExit(timeoutMs))
+                throw new TimeoutException("安装辅助进程响应超时，未继续后续操作。请关闭相关窗口后重试。");
+            if (p.ExitCode != 0)
+                throw new InvalidOperationException($"安装辅助进程失败（退出码 {p.ExitCode}）。");
         }
 
         private static void TryDeleteFile(string path)

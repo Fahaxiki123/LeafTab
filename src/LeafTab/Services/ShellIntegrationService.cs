@@ -7,6 +7,7 @@ using System.Text;
 using System.Windows;
 using LeafTab.Interop;
 using Microsoft.Win32;
+using LeafTab.Shared;
 
 namespace LeafTab.Services
 {
@@ -44,13 +45,13 @@ namespace LeafTab.Services
             Assembly.GetExecutingAssembly().Location;
 
         public static bool IsContextMenuEnabled() =>
-            IsContextMenuEnabledCore(DefaultClassesRoot);
+            IsContextMenuEnabledCore(DefaultClassesRoot, GetCurrentExecutablePath());
 
         public static (bool Ok, string Message) SetContextMenuEnabled(bool enable) =>
             SetContextMenuEnabledCore(enable, GetCurrentExecutablePath(), DefaultClassesRoot, notifyShell: true);
 
         public static bool IsDefaultExplorerEnabled() =>
-            IsDefaultExplorerEnabledCore(DefaultClassesRoot);
+            IsDefaultExplorerEnabledCore(DefaultClassesRoot, GetCurrentExecutablePath());
 
         public static (bool Ok, string Message) SetDefaultExplorerEnabled(bool enable) =>
             SetDefaultExplorerEnabledCore(enable, GetCurrentExecutablePath(), DefaultClassesRoot, DefaultBackupRoot, notifyShell: true);
@@ -61,10 +62,11 @@ namespace LeafTab.Services
         public static (bool Ok, string Message) SetContextMenuEnabledForExe(bool enable, string targetExePath) =>
             SetContextMenuEnabledCore(enable, targetExePath, DefaultClassesRoot, notifyShell: true);
 
-        public static void UnregisterAllOwned()
+        public static bool UnregisterAllOwned()
         {
-            SetDefaultExplorerEnabledCore(false, GetCurrentExecutablePath(), DefaultClassesRoot, DefaultBackupRoot, notifyShell: false);
-            SetContextMenuEnabledCore(false, GetCurrentExecutablePath(), DefaultClassesRoot, notifyShell: true);
+            var defaults = SetDefaultExplorerEnabledCore(false, GetCurrentExecutablePath(), DefaultClassesRoot, DefaultBackupRoot, notifyShell: false);
+            var context = SetContextMenuEnabledCore(false, GetCurrentExecutablePath(), DefaultClassesRoot, notifyShell: true);
+            return defaults.Ok && context.Ok && !ShellAssociationRecovery.HasReferencesToExecutable(GetCurrentExecutablePath());
         }
 
         public static void RepairRegisteredPathsIfMoved()
@@ -84,7 +86,9 @@ namespace LeafTab.Services
 
         // ==================== CORE REGISTRY OPERATIONS (HKCU ONLY, ZERO ADMIN) ====================
 
-        internal static bool IsContextMenuEnabledCore(string classesRoot)
+        // Without an expected path, detect repair candidates (including moved executables).
+        // UI queries supply the current path so another copy is never shown as owned.
+        internal static bool IsContextMenuEnabledCore(string classesRoot, string? expectedExePath = null)
         {
             try
             {
@@ -97,7 +101,10 @@ namespace LeafTab.Services
 
                 using RegistryKey? cmdKey = key.OpenSubKey("command");
                 string? cmd = cmdKey?.GetValue(null) as string;
-                return !string.IsNullOrWhiteSpace(cmd);
+                return !string.IsNullOrWhiteSpace(cmd) &&
+                       (expectedExePath == null ||
+                        (ShellAssociationRecovery.IsExpectedCommand(cmd, expectedExePath, "\"%V \"") &&
+                         string.IsNullOrEmpty(cmdKey?.GetValue("DelegateExecute") as string)));
             }
             catch
             {
@@ -139,14 +146,7 @@ namespace LeafTab.Services
                 }
                 else
                 {
-                    foreach (string parentRel in s_contextMenuTargets)
-                    {
-                        string verbSubPath = $@"{classesRoot}\{parentRel}\{ContextMenuVerbKeyName}";
-                        if (IsSubKeyOwnedByLeafTab(verbSubPath))
-                        {
-                            Registry.CurrentUser.DeleteSubKeyTree(verbSubPath, throwOnMissingSubKey: false);
-                        }
-                    }
+                    ShellAssociationRecovery.RestoreContextMenu(exePath, classesRoot);
 
                     if (notifyShell)
                         NotifyShellAssociationsChanged();
@@ -156,11 +156,12 @@ namespace LeafTab.Services
             }
             catch (Exception ex)
             {
+                DiagnosticLog.Write("shell-registration-failed", ex);
                 return (false, $"更新右键菜单失败：{ex.Message}");
             }
         }
 
-        internal static bool IsDefaultExplorerEnabledCore(string classesRoot)
+        internal static bool IsDefaultExplorerEnabledCore(string classesRoot, string? expectedExePath = null)
         {
             try
             {
@@ -173,8 +174,12 @@ namespace LeafTab.Services
                     return false;
 
                 using RegistryKey? verbKey = dirShell.OpenSubKey(DefaultVerbKeyName);
+                using RegistryKey? command = verbKey?.OpenSubKey("command");
                 return verbKey != null &&
-                       string.Equals(verbKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal);
+                       string.Equals(verbKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal) &&
+                       (expectedExePath == null ||
+                        (ShellAssociationRecovery.IsExpectedCommand(command?.GetValue(null) as string, expectedExePath, "\"%V \"") &&
+                         string.Equals(command?.GetValue("DelegateExecute") as string, LeafTabExecuteClsidString, StringComparison.OrdinalIgnoreCase)));
             }
             catch
             {
@@ -284,66 +289,14 @@ namespace LeafTab.Services
                 }
                 else
                 {
-                    if (string.Equals(classesRoot, DefaultClassesRoot, StringComparison.OrdinalIgnoreCase))
-                    {
-                        SetAutoRunBackgroundWarmup(enable: false, exePath);
-                    }
-
-                    RestoreExplicitVerbCommandFromBackup(
-                        $@"{classesRoot}\Directory\shell",
-                        "open",
-                        $@"{backupRoot}\DirectoryOpenCmd");
-                    RestoreShellDefaultVerbFromBackup(
-                        $@"{classesRoot}\Directory\shell",
-                        $@"{backupRoot}\DirectoryShell");
-
-                    RestoreExplicitVerbCommandFromBackup(
-                        $@"{classesRoot}\Drive\shell",
-                        "open",
-                        $@"{backupRoot}\DriveOpenCmd");
-                    RestoreShellDefaultVerbFromBackup(
-                        $@"{classesRoot}\Drive\shell",
-                        $@"{backupRoot}\DriveShell");
-
-                    RestoreExplicitVerbCommandFromBackup(
-                        $@"{classesRoot}\Folder\shell",
-                        "open",
-                        $@"{backupRoot}\FolderOpenCmd");
-                    RestoreExplicitVerbCommandFromBackup(
-                        $@"{classesRoot}\Folder\shell",
-                        "explore",
-                        $@"{backupRoot}\FolderExploreCmd");
-                    RestoreExplicitVerbCommandFromBackup(
-                        $@"{classesRoot}\Folder\shell",
-                        "opennewwindow",
-                        $@"{backupRoot}\FolderNewWinCmd");
-                    RestoreShellDefaultVerbFromBackup(
-                        $@"{classesRoot}\Folder\shell",
-                        $@"{backupRoot}\FolderShell");
-
-                    RestoreWinExplorerClsidFromBackup(
-                        $@"{classesRoot}\CLSID\{WinExplorerClsidKeyName}",
-                        $@"{backupRoot}\WinExplorerClsid");
-
-                    foreach (string ownClsidStr in new[] { LeafTabExecuteClsidString, LeafTabNewWindowExecuteClsidString })
-                    {
-                        string ownClsidPath = $@"{classesRoot}\CLSID\{ownClsidStr}";
-                        if (IsSubKeyOwnedByLeafTab(ownClsidPath))
-                        {
-                            Registry.CurrentUser.DeleteSubKeyTree(ownClsidPath, throwOnMissingSubKey: false);
-                        }
-                    }
-
-                    TryDeleteKeyIfEmpty(backupRoot);
-
-                    if (notifyShell)
-                        NotifyShellAssociationsChanged();
-
-                    return (true, "已恢复系统默认 Windows 资源管理器");
+                    ShellAssociationRecovery.RestoreDefault(exePath, classesRoot, backupRoot);
+                    if (notifyShell) NotifyShellAssociationsChanged();
+                    return (true, "已恢复仍属于此安装位置的资源管理器关联；其他程序的修改已保留");
                 }
             }
             catch (Exception ex)
             {
+                DiagnosticLog.Write("shell-registration-failed", ex);
                 return (false, $"切换默认资源管理器失败：{ex.Message}");
             }
         }
@@ -361,14 +314,19 @@ namespace LeafTab.Services
             {
                 using RegistryKey? cmdKey = Registry.CurrentUser.OpenSubKey($@"{classesRoot}\Directory\shell\{ContextMenuVerbKeyName}\command");
                 string? curCmd = cmdKey?.GetValue(null) as string;
-                string effectiveExe = ResolveEffectiveExeForRepair(curCmd, currentExePath);
-                string expectedFolderCmd = $"\"{effectiveExe}\" \"%V \"";
-
-                if (!string.Equals(curCmd, expectedFolderCmd, StringComparison.OrdinalIgnoreCase))
+                string? contextOwner = ShellAssociationRecovery.CommandExecutable(curCmd);
+                if (contextOwner != null && string.Equals(Path.GetFileName(contextOwner), Path.GetFileName(currentExePath), StringComparison.OrdinalIgnoreCase) &&
+                    ShellAssociationRecovery.IsExpectedCommand(curCmd, contextOwner, "\"%V \"") &&
+                    string.IsNullOrEmpty(cmdKey?.GetValue("DelegateExecute") as string))
                 {
-                    var res = SetContextMenuEnabledCore(true, effectiveExe, classesRoot, notifyShell: false);
-                    if (res.Ok)
-                        repaired = true;
+                    string effectiveExe = ResolveEffectiveExeForRepair(curCmd, currentExePath);
+                    string expectedFolderCmd = $"\"{effectiveExe}\" \"%V \"";
+                    if (!string.Equals(curCmd, expectedFolderCmd, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var res = SetContextMenuEnabledCore(true, effectiveExe, classesRoot, notifyShell: false);
+                        if (res.Ok)
+                            repaired = true;
+                    }
                 }
             }
 
@@ -386,6 +344,13 @@ namespace LeafTab.Services
                 string? curFolderDel = folderOpenCmdKey?.GetValue("DelegateExecute") as string;
                 string? curNewWinDel = folderNewWinCmdKey?.GetValue("DelegateExecute") as string;
 
+                string? registeredExe = ShellAssociationRecovery.CommandExecutable(curVerbCmd);
+                if (registeredExe == null || !string.Equals(Path.GetFileName(registeredExe), Path.GetFileName(currentExePath), StringComparison.OrdinalIgnoreCase) ||
+                    !ShellAssociationRecovery.CanRepairDefault(classesRoot, registeredExe, currentExePath))
+                {
+                    DiagnosticLog.Write("shell-repair-preserved-modified-association");
+                    return repaired;
+                }
                 string effectiveExe = ResolveEffectiveExeForRepair(curVerbCmd, currentExePath);
                 string expectedFolderCmd = $"\"{effectiveExe}\" \"%V \"";
                 string expectedComCmd = $"\"{effectiveExe}\" --com-server";
@@ -425,9 +390,7 @@ namespace LeafTab.Services
             string? registeredExe = ExtractLeadingQuotedExe(existingCmdLine);
             if (!string.IsNullOrWhiteSpace(registeredExe) &&
                 !string.Equals(registeredExe, currentExePath, StringComparison.OrdinalIgnoreCase) &&
-                File.Exists(registeredExe) &&
-                !QuickLaunchAndInstallService.IsVolatileLaunchLocation(registeredExe) &&
-                QuickLaunchAndInstallService.IsVolatileLaunchLocation(currentExePath))
+                File.Exists(registeredExe))
             {
                 // Preserve existing fixed installation path if user temporarily ran a downloaded copy from Downloads/Temp
                 return registeredExe!;
@@ -463,7 +426,7 @@ namespace LeafTab.Services
                 {
                     runKey.SetValue(AutoRunValueName, $"\"{exePath}\" --background", RegistryValueKind.String);
                 }
-                else
+                else if (ShellAssociationRecovery.IsExpectedCommand(runKey.GetValue(AutoRunValueName) as string, exePath, "--background"))
                 {
                     runKey.DeleteValue(AutoRunValueName, throwOnMissingValue: false);
                 }
@@ -498,8 +461,8 @@ namespace LeafTab.Services
                     {
                         cmdExisted = true;
                         string? curDel = existingCmd.GetValue("DelegateExecute") as string;
-                        if (IsLeafTabDelegateClsid(curDel) ||
-                            string.Equals(existingCmd.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
+                        if (IsLeafTabDelegateClsid(curDel) &&
+                            ShellAssociationRecovery.CommandExecutable(existingCmd.GetValue("") as string) != null)
                         {
                             alreadyOwned = true;
                         }
@@ -527,57 +490,6 @@ namespace LeafTab.Services
             }
         }
 
-        private static void RestoreExplicitVerbCommandFromBackup(
-            string shellKeyPath,
-            string verbName,
-            string backupSlotPath)
-        {
-            string verbKeyPath = $@"{shellKeyPath}\{verbName}";
-            string cmdKeyPath = $@"{verbKeyPath}\command";
-
-            using (RegistryKey? cmd = Registry.CurrentUser.OpenSubKey(cmdKeyPath))
-            {
-                if (cmd == null)
-                {
-                    Registry.CurrentUser.DeleteSubKeyTree(backupSlotPath, throwOnMissingSubKey: false);
-                    return;
-                }
-
-                string? curDel = cmd.GetValue("DelegateExecute") as string;
-                if (!IsLeafTabDelegateClsid(curDel) &&
-                    !string.Equals(cmd.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                {
-                    // Another file manager modified this verb; respect ownership and leave untouched
-                    return;
-                }
-            }
-
-            bool verbExistedPrior = false;
-            using (RegistryKey? bak = Registry.CurrentUser.OpenSubKey(backupSlotPath))
-            {
-                if (bak != null && Convert.ToInt32(bak.GetValue("Captured", 0)) == 1)
-                {
-                    verbExistedPrior = Convert.ToInt32(bak.GetValue("VerbExisted", 0)) == 1;
-                    if (verbExistedPrior)
-                    {
-                        RestoreCommandSubKeyBackup(cmdKeyPath, bak, "Cmd");
-                    }
-                }
-            }
-
-            if (!verbExistedPrior)
-            {
-                Registry.CurrentUser.DeleteSubKeyTree(verbKeyPath, throwOnMissingSubKey: false);
-            }
-            else
-            {
-                TryDeleteKeyIfEmpty(verbKeyPath);
-            }
-
-            Registry.CurrentUser.DeleteSubKeyTree(backupSlotPath, throwOnMissingSubKey: false);
-            TryDeleteKeyIfEmpty(shellKeyPath);
-        }
-
         private static void ApplyShellDefaultVerbWithBackup(
             string shellKeyPath,
             string backupSlotPath,
@@ -596,8 +508,7 @@ namespace LeafTab.Services
                     keyExisted = true;
                     object? rawDef = existing.GetValue(null, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
                     string? defStr = rawDef as string;
-                    if (string.Equals(defStr, DefaultVerbKeyName, StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(existing.GetValue("LeafTabDefaultOwner") as string, "1", StringComparison.Ordinal))
+                    if (string.Equals(defStr, DefaultVerbKeyName, StringComparison.OrdinalIgnoreCase))
                     {
                         alreadyLeafTabOwned = true;
                     }
@@ -633,67 +544,6 @@ namespace LeafTab.Services
                 using RegistryKey cmdKey = verbKey.CreateSubKey("command");
                 cmdKey.SetValue(null, folderCmdVal, RegistryValueKind.String);
                 cmdKey.SetValue("DelegateExecute", LeafTabExecuteClsidString, RegistryValueKind.String);
-            }
-        }
-
-        private static void RestoreShellDefaultVerbFromBackup(string shellKeyPath, string backupSlotPath)
-        {
-            bool keyExistedPrior = true;
-            bool hadPriorDefault = false;
-            string priorDefault = string.Empty;
-            bool hasBackup = false;
-
-            using (RegistryKey? bak = Registry.CurrentUser.OpenSubKey(backupSlotPath))
-            {
-                if (bak != null && Convert.ToInt32(bak.GetValue("Captured", 0)) == 1)
-                {
-                    hasBackup = true;
-                    keyExistedPrior = Convert.ToInt32(bak.GetValue("KeyExisted", 1)) == 1;
-                    hadPriorDefault = Convert.ToInt32(bak.GetValue("HadDefault", 0)) == 1;
-                    priorDefault = (bak.GetValue("PriorDefault") as string) ?? string.Empty;
-                }
-            }
-
-            string verbSubKeyPath = $@"{shellKeyPath}\{DefaultVerbKeyName}";
-            if (IsSubKeyOwnedByLeafTab(verbSubKeyPath))
-            {
-                Registry.CurrentUser.DeleteSubKeyTree(verbSubKeyPath, throwOnMissingSubKey: false);
-            }
-
-            bool restoredOwnership = false;
-            using (RegistryKey? shellKey = Registry.CurrentUser.OpenSubKey(shellKeyPath, writable: true))
-            {
-                if (shellKey != null)
-                {
-                    string? curDef = shellKey.GetValue(null) as string;
-                    // Ownership verification: NEVER overwrite if another file manager took over (Default) after LeafTab!
-                    bool ownedByUs = string.Equals(curDef, DefaultVerbKeyName, StringComparison.OrdinalIgnoreCase);
-
-                    if (ownedByUs)
-                    {
-                        if (hasBackup && hadPriorDefault)
-                        {
-                            shellKey.SetValue(null, priorDefault, RegistryValueKind.String);
-                        }
-                        else
-                        {
-                            shellKey.DeleteValue(string.Empty, throwOnMissingValue: false);
-                        }
-                        restoredOwnership = true;
-                    }
-
-                    shellKey.DeleteValue("LeafTabDefaultOwner", throwOnMissingValue: false);
-                }
-            }
-
-            if (hasBackup && restoredOwnership)
-            {
-                Registry.CurrentUser.DeleteSubKeyTree(backupSlotPath, throwOnMissingSubKey: false);
-            }
-
-            if (!keyExistedPrior)
-            {
-                TryDeleteKeyIfEmpty(shellKeyPath);
             }
         }
 
@@ -754,6 +604,8 @@ namespace LeafTab.Services
             if (cmd == null)
             {
                 bak.SetValue(prefix + "_Existed", 0, RegistryValueKind.DWord);
+                bak.SetValue(prefix + "_HadDef", 0, RegistryValueKind.DWord);
+                bak.SetValue(prefix + "_HadDel", 0, RegistryValueKind.DWord);
                 return;
             }
 
@@ -761,99 +613,12 @@ namespace LeafTab.Services
             object? rawDef = cmd.GetValue(null, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
             bak.SetValue(prefix + "_HadDef", rawDef != null ? 1 : 0, RegistryValueKind.DWord);
             bak.SetValue(prefix + "_Def", (rawDef as string) ?? string.Empty, RegistryValueKind.String);
+            if (rawDef != null) bak.SetValue(prefix + "_DefKind", (int)cmd.GetValueKind(""));
 
             object? rawDel = cmd.GetValue("DelegateExecute", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
             bak.SetValue(prefix + "_HadDel", rawDel != null ? 1 : 0, RegistryValueKind.DWord);
             bak.SetValue(prefix + "_Del", (rawDel as string) ?? string.Empty, RegistryValueKind.String);
-        }
-
-        private static void RestoreWinExplorerClsidFromBackup(string clsidKeyPath, string backupSlotPath)
-        {
-            using RegistryKey? clsidKey = Registry.CurrentUser.OpenSubKey(clsidKeyPath, writable: true);
-            if (clsidKey == null)
-            {
-                Registry.CurrentUser.DeleteSubKeyTree(backupSlotPath, throwOnMissingSubKey: false);
-                return;
-            }
-
-            // Ownership check before touching CLSID\{52205fd8-...}
-            bool rootOwned = string.Equals(clsidKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal);
-            if (!rootOwned)
-                return;
-
-            bool keyExistedPrior = false;
-            using (RegistryKey? bak = Registry.CurrentUser.OpenSubKey(backupSlotPath))
-            {
-                if (bak != null && Convert.ToInt32(bak.GetValue("Captured", 0)) == 1)
-                {
-                    keyExistedPrior = Convert.ToInt32(bak.GetValue("KeyExisted", 0)) == 1;
-                    if (keyExistedPrior)
-                    {
-                        RestoreCommandSubKeyBackup(clsidKeyPath + @"\shell\open\command", bak, "Open");
-                        RestoreCommandSubKeyBackup(clsidKeyPath + @"\shell\opennewwindow\command", bak, "NewWin");
-                    }
-                }
-            }
-
-            if (!keyExistedPrior)
-            {
-                clsidKey.Close();
-                Registry.CurrentUser.DeleteSubKeyTree(clsidKeyPath, throwOnMissingSubKey: false);
-            }
-            else
-            {
-                clsidKey.DeleteValue("LeafTabManaged", throwOnMissingValue: false);
-            }
-
-            Registry.CurrentUser.DeleteSubKeyTree(backupSlotPath, throwOnMissingSubKey: false);
-        }
-
-        private static void RestoreCommandSubKeyBackup(string cmdKeyPath, RegistryKey bak, string prefix)
-        {
-            using RegistryKey? cmd = Registry.CurrentUser.OpenSubKey(cmdKeyPath, writable: true);
-            if (cmd == null)
-                return;
-
-            string? curDel = cmd.GetValue("DelegateExecute") as string;
-            if (!IsLeafTabDelegateClsid(curDel) &&
-                !string.Equals(cmd.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-            {
-                return;
-            }
-
-            bool existed = Convert.ToInt32(bak.GetValue(prefix + "_Existed", 0)) == 1;
-            if (!existed)
-            {
-                cmd.Close();
-                Registry.CurrentUser.DeleteSubKeyTree(cmdKeyPath, throwOnMissingSubKey: false);
-                return;
-            }
-
-            if (Convert.ToInt32(bak.GetValue(prefix + "_HadDef", 0)) == 1)
-                cmd.SetValue(null, (bak.GetValue(prefix + "_Def") as string) ?? string.Empty, RegistryValueKind.String);
-            else
-                cmd.DeleteValue(string.Empty, throwOnMissingValue: false);
-
-            if (Convert.ToInt32(bak.GetValue(prefix + "_HadDel", 0)) == 1)
-                cmd.SetValue("DelegateExecute", (bak.GetValue(prefix + "_Del") as string) ?? string.Empty, RegistryValueKind.String);
-            else
-                cmd.DeleteValue("DelegateExecute", throwOnMissingValue: false);
-
-            cmd.DeleteValue("LeafTabManaged", throwOnMissingValue: false);
-        }
-
-        private static bool IsSubKeyOwnedByLeafTab(string subKeyPath)
-        {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(subKeyPath);
-            if (key == null)
-                return false;
-
-            if (string.Equals(key.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal))
-                return true;
-
-            using RegistryKey? cmd = key.OpenSubKey("command");
-            string? cmdVal = cmd?.GetValue(null) as string;
-            return cmdVal != null && cmdVal.IndexOf("LeafTab.exe", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (rawDel != null) bak.SetValue(prefix + "_DelKind", (int)cmd.GetValueKind("DelegateExecute"));
         }
 
         private static void TryDeleteKeyIfEmpty(string subKeyPath)
@@ -1128,6 +893,11 @@ namespace LeafTab.Services
             }
         }
 
+        private static void ReleaseLocalCom(object value)
+        {
+            if (Marshal.IsComObject(value)) Marshal.ReleaseComObject(value);
+        }
+
         private static bool IsSystemAppletInvocation(IShellItemArray? selection, string? parameters)
         {
             if (!string.IsNullOrWhiteSpace(parameters))
@@ -1146,23 +916,27 @@ namespace LeafTab.Services
             if (selection.GetItemAt(0, out IShellItem? item) != ShellConstants.S_OK || item == null)
                 return false;
 
-            string? parsing = PidlManager.GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
-            if (string.IsNullOrWhiteSpace(parsing))
-                return false;
+            try
+            {
+                string? parsing = PidlManager.GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
+                if (string.IsNullOrWhiteSpace(parsing))
+                    return false;
 
-            string s = parsing!;
-            return s.IndexOf("26EE0668-A00A-44D7-9371-BEB064C98683", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel Category
-                   s.IndexOf("21EC2020-3AEA-1069-A2DD-08002B30309D", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel All Items
-                   s.IndexOf("5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel
-                   s.IndexOf("7007ACC7-3202-11D1-AAD2-00805FC1270E", StringComparison.OrdinalIgnoreCase) >= 0 || // Network Connections
-                   s.IndexOf("992CFFA0-F557-101A-88EC-00DD010CCC48", StringComparison.OrdinalIgnoreCase) >= 0 || // Network Connections
-                   s.IndexOf("A8A91A66-3A7D-4424-8D24-04E180695C7A", StringComparison.OrdinalIgnoreCase) >= 0 || // Devices and Printers
-                   s.IndexOf("2227A280-3AEA-1069-A2DE-08002B30309D", StringComparison.OrdinalIgnoreCase) >= 0 || // Printers
-                   s.IndexOf("D20EA4E1-3957-11D2-A40B-0C5020524153", StringComparison.OrdinalIgnoreCase) >= 0 || // Administrative Tools
-                   s.IndexOf("ED7BA470-8E54-465E-825C-99712043E01C", StringComparison.OrdinalIgnoreCase) >= 0 || // All Tasks (GodMode)
-                   s.IndexOf("BD84B380-8CA2-1069-AB1D-08000948F534", StringComparison.OrdinalIgnoreCase) >= 0 || // Fonts
-                   s.IndexOf("0DF44EAA-FF21-4412-828E-260A8728E7F1", StringComparison.OrdinalIgnoreCase) >= 0 || // Taskbar Settings
-                   s.StartsWith("ms-settings:", StringComparison.OrdinalIgnoreCase);
+                string s = parsing!;
+                return s.IndexOf("26EE0668-A00A-44D7-9371-BEB064C98683", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel Category
+                       s.IndexOf("21EC2020-3AEA-1069-A2DD-08002B30309D", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel All Items
+                       s.IndexOf("5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0", StringComparison.OrdinalIgnoreCase) >= 0 || // Control Panel
+                       s.IndexOf("7007ACC7-3202-11D1-AAD2-00805FC1270E", StringComparison.OrdinalIgnoreCase) >= 0 || // Network Connections
+                       s.IndexOf("992CFFA0-F557-101A-88EC-00DD010CCC48", StringComparison.OrdinalIgnoreCase) >= 0 || // Network Connections
+                       s.IndexOf("A8A91A66-3A7D-4424-8D24-04E180695C7A", StringComparison.OrdinalIgnoreCase) >= 0 || // Devices and Printers
+                       s.IndexOf("2227A280-3AEA-1069-A2DE-08002B30309D", StringComparison.OrdinalIgnoreCase) >= 0 || // Printers
+                       s.IndexOf("D20EA4E1-3957-11D2-A40B-0C5020524153", StringComparison.OrdinalIgnoreCase) >= 0 || // Administrative Tools
+                       s.IndexOf("ED7BA470-8E54-465E-825C-99712043E01C", StringComparison.OrdinalIgnoreCase) >= 0 || // All Tasks (GodMode)
+                       s.IndexOf("BD84B380-8CA2-1069-AB1D-08000948F534", StringComparison.OrdinalIgnoreCase) >= 0 || // Fonts
+                       s.IndexOf("0DF44EAA-FF21-4412-828E-260A8728E7F1", StringComparison.OrdinalIgnoreCase) >= 0 || // Taskbar Settings
+                       s.StartsWith("ms-settings:", StringComparison.OrdinalIgnoreCase);
+            }
+            finally { ReleaseLocalCom(item); }
         }
 
         private int ForwardToNativeExecuteFolder()
@@ -1239,6 +1013,7 @@ namespace LeafTab.Services
                     finally
                     {
                         PidlManager.Free(ref itemPidl);
+                        ReleaseLocalCom(firstItem);
                     }
                 }
 
@@ -1246,6 +1021,7 @@ namespace LeafTab.Services
             }
             finally
             {
+                ReleaseLocalCom(sb);
                 Marshal.Release(psbPtr);
             }
         }
@@ -1291,9 +1067,10 @@ namespace LeafTab.Services
                 s_cachedIsExplorer = isExp;
                 return isExp;
             }
-            catch
+            catch (Exception ex)
             {
-                return true;
+                DiagnosticLog.Write("shell-process-identification-failed", ex);
+                return false;
             }
         }
 
@@ -1308,34 +1085,38 @@ namespace LeafTab.Services
                 {
                     if (_selection.GetItemAt(i, out IShellItem? item) == ShellConstants.S_OK && item != null)
                     {
-                        string? parsing = PidlManager.GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
-                        string? display = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
-                        string? fsPath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
-
-                        // Redirect Windows File Explorer launcher CLSID {52205fd8-5dfb-447d-801a-d0b52f2e83e1} cleanly to "此电脑"
-                        if (PidlManager.IsExplorerLauncherTarget(parsing) || PidlManager.IsExplorerLauncherTarget(display))
-                        {
-                            req.Targets.Add(new LaunchTargetItem("此电脑"));
-                            continue;
-                        }
-
-                        IntPtr pidl = IntPtr.Zero;
                         try
                         {
-                            if (NativeMethods.SHGetIDListFromObject(item, out pidl) == ShellConstants.S_OK && pidl != IntPtr.Zero)
-                            {
-                                byte[] pidlBytes = PidlManager.ToBytes(pidl);
-                                string targetStr = !string.IsNullOrWhiteSpace(fsPath)
-                                    ? fsPath!
-                                    : (!string.IsNullOrWhiteSpace(parsing) ? parsing! : "此电脑");
+                            string? parsing = PidlManager.GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
+                            string? display = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
+                            string? fsPath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
 
-                                req.Targets.Add(new LaunchTargetItem(targetStr, selectItemName: null, pidlBytes: pidlBytes));
+                            // Redirect Windows File Explorer launcher CLSID {52205fd8-5dfb-447d-801a-d0b52f2e83e1} cleanly to "此电脑"
+                            if (PidlManager.IsExplorerLauncherTarget(parsing) || PidlManager.IsExplorerLauncherTarget(display))
+                            {
+                                req.Targets.Add(new LaunchTargetItem("此电脑"));
+                                continue;
+                            }
+
+                            IntPtr pidl = IntPtr.Zero;
+                            try
+                            {
+                                if (NativeMethods.SHGetIDListFromObject(item, out pidl) == ShellConstants.S_OK && pidl != IntPtr.Zero)
+                                {
+                                    byte[] pidlBytes = PidlManager.ToBytes(pidl);
+                                    string targetStr = !string.IsNullOrWhiteSpace(fsPath)
+                                        ? fsPath!
+                                        : (!string.IsNullOrWhiteSpace(parsing) ? parsing! : "此电脑");
+
+                                    req.Targets.Add(new LaunchTargetItem(targetStr, selectItemName: null, pidlBytes: pidlBytes));
+                                }
+                            }
+                            finally
+                            {
+                                PidlManager.Free(ref pidl);
                             }
                         }
-                        finally
-                        {
-                            PidlManager.Free(ref pidl);
-                        }
+                        finally { ReleaseLocalCom(item); }
                     }
                 }
             }

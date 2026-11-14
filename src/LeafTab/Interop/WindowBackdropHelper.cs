@@ -176,14 +176,18 @@ namespace LeafTab.Interop
                 long xy = lParam.ToInt64();
                 int screenX = (short)(xy & 0xFFFF);
                 int screenY = (short)((xy >> 16) & 0xFFFF);
-                Point dipPt = window.PointFromScreen(new Point(screenX, screenY));
-                Point winScreenDip = new Point(window.Left + dipPt.X, window.Top + dipPt.Y);
-                SystemCommands.ShowSystemMenu(window, winScreenDip);
+                ShowSystemMenuAtScreenPoint(window, new Point(screenX, screenY));
                 handled = true;
             }
 
             return IntPtr.Zero;
         }
+
+        internal static Point ScreenPointToMenuPoint(Window window, Point screenPoint) =>
+            PresentationSource.FromVisual(window)?.CompositionTarget?.TransformFromDevice.Transform(screenPoint) ?? screenPoint;
+
+        internal static void ShowSystemMenuAtScreenPoint(Window window, Point screenPoint) =>
+            SystemCommands.ShowSystemMenu(window, ScreenPointToMenuPoint(window, screenPoint));
 
         private static bool IsSystemTransparencyEnabled()
         {

@@ -107,10 +107,10 @@ namespace LeafTab.Interop
 
         public static IntPtr FromBytes(byte[]? data)
         {
-            if (data == null || data.Length < 2)
+            if (!IsValidPidlBytes(data))
                 return IntPtr.Zero;
 
-            IntPtr temp = Marshal.AllocHGlobal(data.Length);
+            IntPtr temp = Marshal.AllocHGlobal(data!.Length);
             try
             {
                 Marshal.Copy(data, 0, temp, data.Length);
@@ -120,6 +120,20 @@ namespace LeafTab.Interop
             {
                 Marshal.FreeHGlobal(temp);
             }
+        }
+
+        internal static bool IsValidPidlBytes(byte[]? data)
+        {
+            if (data == null || data.Length < 2 || data.Length > 65536) return false;
+            int offset = 0;
+            while (offset + 2 <= data.Length)
+            {
+                int size = data[offset] | (data[offset + 1] << 8);
+                if (size == 0) return offset + 2 == data.Length;
+                if (size < 2 || size > data.Length - offset - 2) return false;
+                offset += size;
+            }
+            return false;
         }
 
         public static bool CanNavigateUp(IntPtr pidl)
@@ -470,7 +484,9 @@ namespace LeafTab.Interop
             if (mask != 0)
             {
                 NativeMethods.SHGetSetSettings(ref state, mask, true);
-                NativeMethods.SHChangeNotify(NativeMethods.SHCNE_ASSOCCHANGED, NativeMethods.SHCNF_IDLIST, IntPtr.Zero, IntPtr.Zero);
+                // This changes ShellState, not file associations or the global icon cache.
+                _ = Task.Run(() => NativeMethods.SendMessageTimeoutW(new IntPtr(0xffff), 0x001A,
+                    IntPtr.Zero, "ShellState", 0x0002, 100, out _));
             }
         }
 

@@ -62,12 +62,13 @@ namespace LeafTab.Controls
                 return new Size(totalInset, 0.0);
             }
 
+            double viewport = Math.Min(availableSize.Width, TabBarTrackPanel.GetAvailableTabsWidth(this));
             double unitWidth = MaxTabWidth;
-            if (!double.IsInfinity(availableSize.Width))
+            if (!double.IsInfinity(viewport))
             {
-                double availForTabs = Math.Max(0.0, availableSize.Width - totalInset);
+                double availForTabs = Math.Max(0.0, viewport - totalInset);
                 double rawUnit = availForTabs / totalWeight;
-                unitWidth = Math.Min(MaxTabWidth, Math.Max(26.0, rawUnit));
+                unitWidth = Math.Max(MinTabWidth, Math.Min(MaxTabWidth, rawUnit));
             }
 
             double occupiedTabsWidth = 0.0;
@@ -90,10 +91,6 @@ namespace LeafTab.Controls
             }
 
             double desiredWidth = occupiedTabsWidth + totalInset;
-            if (!double.IsInfinity(availableSize.Width))
-            {
-                desiredWidth = Math.Min(availableSize.Width, desiredWidth);
-            }
 
             return new Size(
                 desiredWidth,
@@ -122,7 +119,7 @@ namespace LeafTab.Controls
                 return finalSize;
 
             double availForTabs = Math.Max(0.0, finalSize.Width - totalInset);
-            double unitWidth = Math.Min(MaxTabWidth, Math.Max(26.0, availForTabs / totalWeight));
+            double unitWidth = Math.Max(MinTabWidth, Math.Min(MaxTabWidth, availForTabs / totalWeight));
 
             double x = EarClearanceDip;
             for (int i = 0; i < count; i++)
@@ -157,6 +154,16 @@ namespace LeafTab.Controls
     /// </summary>
     public sealed class TabBarTrackPanel : Panel
     {
+        // The scroll content is measured with infinite width. Inherit the current track
+        // budget instead of feeding its previous viewport back into the next measure.
+        internal static readonly DependencyProperty AvailableTabsWidthProperty =
+            DependencyProperty.RegisterAttached("AvailableTabsWidth", typeof(double), typeof(TabBarTrackPanel),
+                new FrameworkPropertyMetadata(double.PositiveInfinity,
+                    FrameworkPropertyMetadataOptions.Inherits | FrameworkPropertyMetadataOptions.AffectsMeasure));
+
+        internal static double GetAvailableTabsWidth(DependencyObject element) =>
+            (double)element.GetValue(AvailableTabsWidthProperty);
+
         protected override Size MeasureOverride(Size availableSize)
         {
             if (InternalChildren.Count == 0)
@@ -178,6 +185,7 @@ namespace LeafTab.Controls
                 ? double.PositiveInfinity
                 : Math.Max(0.0, availableSize.Width - plusWidth - 4.0);
 
+            tabsControl.SetValue(AvailableTabsWidthProperty, maxTabsWidth);
             tabsControl.Measure(new Size(maxTabsWidth, availableSize.Height));
 
             double totalW = tabsControl.DesiredSize.Width + plusWidth;

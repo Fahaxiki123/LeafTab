@@ -230,7 +230,7 @@ namespace LeafTab.Interop
         int OnNavigationPending(IntPtr pidlFolder);
 
         [PreserveSig]
-        int OnViewCreated([MarshalAs(UnmanagedType.Interface)] IShellView? psv);
+        int OnViewCreated(IntPtr psv);
 
         [PreserveSig]
         int OnNavigationComplete(IntPtr pidlFolder);

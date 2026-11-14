@@ -17,6 +17,7 @@ using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
+using LeafTab.Shared;
 
 namespace LeafTab.Views
 {
@@ -40,9 +41,10 @@ namespace LeafTab.Views
         }
 
         private readonly ObservableCollection<ExplorerTabItem> _tabs = new ObservableCollection<ExplorerTabItem>();
-        private readonly ObservableCollection<BookmarkItemViewModel> _bookmarks = new ObservableCollection<BookmarkItemViewModel>();
+        private readonly ObservableCollection<BookmarkItemViewModel> _bookmarks;
+        private readonly AppConfigStore? _sharedStore;
         private readonly Stack<ClosedTabSnapshot> _closedTabs = new Stack<ClosedTabSnapshot>();
-        private readonly List<string> _recentFolders = new List<string>();
+        private readonly List<string> _recentFolders;
 
         private ExplorerTabItem? _selectedTab;
         private readonly bool _skipSessionPersistence;
@@ -65,7 +67,7 @@ namespace LeafTab.Views
         private bool _suppressAddressSuggestUpdate;
 
         // Debounced background session auto-save timer (protects open tabs & bookmarks against unexpected exit)
-        private readonly DispatcherTimer _sessionSaveDebounceTimer;
+
 
         // Lightweight periodic UI/selection sync timer
         private readonly DispatcherTimer _statusRefreshTimer;
@@ -79,6 +81,7 @@ namespace LeafTab.Views
 
         private HwndSource? _windowHwndSource;
         private CancellationTokenSource? _addressParseCts;
+        private CancellationTokenSource? _addressSuggestCts;
         private int _addressNavRequestId;
         private readonly TaskCompletionSource<bool> _loadedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly bool _deferInitialFallbackTab;
@@ -107,7 +110,15 @@ namespace LeafTab.Views
         }
 
         public MainWindow(bool skipSessionPersistence, bool deferInitialFallbackTab = false)
+            : this(skipSessionPersistence, deferInitialFallbackTab, null) { }
+
+        internal MainWindow(AppConfigStore store) : this(false, true, store) { }
+
+        private MainWindow(bool skipSessionPersistence, bool deferInitialFallbackTab, AppConfigStore? store)
         {
+            _sharedStore = skipSessionPersistence ? null : store ?? AppConfigStore.Current;
+            _bookmarks = _sharedStore?.Bookmarks ?? new ObservableCollection<BookmarkItemViewModel>();
+            _recentFolders = _sharedStore?.RecentFolders ?? new List<string>();
             _skipSessionPersistence = skipSessionPersistence;
             _deferInitialFallbackTab = deferInitialFallbackTab;
             _enableAutoPrewarm = !skipSessionPersistence;
@@ -129,19 +140,6 @@ namespace LeafTab.Views
             };
             _searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
 
-            _sessionSaveDebounceTimer = new DispatcherTimer(DispatcherPriority.Background)
-            {
-                Interval = TimeSpan.FromMilliseconds(1800)
-            };
-            _sessionSaveDebounceTimer.Tick += (_, _) =>
-            {
-                _sessionSaveDebounceTimer.Stop();
-                if (!_isClosingWindow)
-                {
-                    SaveConfigurationSnapshot();
-                }
-            };
-
             _statusRefreshTimer = new DispatcherTimer(DispatcherPriority.Background)
             {
                 Interval = TimeSpan.FromMilliseconds(350)
@@ -149,6 +147,7 @@ namespace LeafTab.Views
             _statusRefreshTimer.Tick += (_, _) => UpdateCommandBarAndStatus(computeBytes: true);
 
             LoadConfigurationAndWindowPlacement();
+            if (_sharedStore != null) _sharedStore.Changed += SharedConfigurationChanged;
 
             SourceInitialized += MainWindow_SourceInitialized;
             Loaded += MainWindow_Loaded;
@@ -200,7 +199,7 @@ namespace LeafTab.Views
             if (_skipSessionPersistence)
                 return;
 
-            _config = AppConfigService.Load();
+            _config = _sharedStore!.Settings;
             _showBookmarkBar = _config.ShowBookmarkBar;
             _showPreviewPane = _config.ShowPreviewPane;
             _enableWarmStandby = _config.EnableWarmStandby;
@@ -208,30 +207,6 @@ namespace LeafTab.Views
             BookmarkBarBorder.Visibility = _showBookmarkBar ? Visibility.Visible : Visibility.Collapsed;
             CommandBarSurface.BorderThickness = _showBookmarkBar ? new Thickness(0) : new Thickness(0, 0, 0, 1);
             UpdatePreviewButtonVisual();
-
-            _recentFolders.Clear();
-            if (_config.RecentFolders != null)
-            {
-                foreach (string rf in _config.RecentFolders)
-                {
-                    if (!string.IsNullOrWhiteSpace(rf) &&
-                        !string.Equals(rf, "此电脑", StringComparison.OrdinalIgnoreCase) &&
-                        _recentFolders.Count < MaxRecentFolders)
-                    {
-                        _recentFolders.Add(rf.Trim());
-                    }
-                }
-            }
-
-            _bookmarks.Clear();
-            foreach (BookmarkConfigItem bm in _config.Bookmarks)
-            {
-                if (!string.IsNullOrWhiteSpace(bm.TargetPath))
-                {
-                    // Defer SHGetFileInfoW icon extraction until after window show for instantaneous startup
-                    _bookmarks.Add(AppConfigService.CreateBookmarkViewModelFast(bm.Title, bm.TargetPath));
-                }
-            }
 
             if (_config.WindowWidth >= MinWidth && _config.WindowHeight >= MinHeight)
             {
@@ -262,86 +237,32 @@ namespace LeafTab.Views
 
         private void SaveConfigurationSnapshot()
         {
-            if (_skipSessionPersistence)
-                return;
-
-            var cfg = new AppConfig
-            {
-                Version = 1,
-                IsMaximized = WindowState == WindowState.Maximized,
-                ShowBookmarkBar = _showBookmarkBar,
-                BookmarksInitialized = true,
-                ShowPreviewPane = _showPreviewPane,
-                EnableWarmStandby = _enableWarmStandby,
-                SelectedTabIndex = 0
-            };
-
+            if (_sharedStore == null) return;
+            _sharedStore.UpdatePreferences(_showBookmarkBar, _showPreviewPane, _enableWarmStandby);
             Rect bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
-            if (bounds.Width >= MinWidth && bounds.Height >= MinHeight)
-            {
-                cfg.WindowLeft = bounds.Left;
-                cfg.WindowTop = bounds.Top;
-                cfg.WindowWidth = bounds.Width;
-                cfg.WindowHeight = bounds.Height;
-            }
-
-            foreach (BookmarkItemViewModel bm in _bookmarks)
-            {
-                cfg.Bookmarks.Add(new BookmarkConfigItem
-                {
-                    Title = bm.Title,
-                    TargetPath = bm.TargetPath
-                });
-            }
-
-            foreach (string rf in _recentFolders)
-            {
-                if (!string.IsNullOrWhiteSpace(rf))
-                {
-                    cfg.RecentFolders.Add(rf);
-                }
-            }
-
-            if (AppConfigService.Save(cfg))
-            {
-                App.CurrentApp?.BroadcastSharedConfigSaved(this, cfg);
-            }
+            _sharedStore.UpdatePlacement(bounds, WindowState == WindowState.Maximized);
+            if (!_sharedStore.Flush() && !_isClosingWindow)
+                SetTransientStatus("配置保存失败，当前修改仍保留在内存中。", 5000);
         }
 
-        internal void ApplySharedConfigFromPeer(AppConfig cfg)
+        private void SharedConfigurationChanged(object? sender, EventArgs e)
         {
-            if (_isClosingWindow || cfg == null)
-                return;
-
+            if (_isClosingWindow || _sharedStore == null) return;
+            var cfg = _sharedStore.Settings;
             _enableWarmStandby = cfg.EnableWarmStandby;
-
             if (_showBookmarkBar != cfg.ShowBookmarkBar)
             {
                 _showBookmarkBar = cfg.ShowBookmarkBar;
                 BookmarkBarBorder.Visibility = _showBookmarkBar ? Visibility.Visible : Visibility.Collapsed;
+                CommandBarSurface.BorderThickness = _showBookmarkBar ? new Thickness(0) : new Thickness(0, 0, 0, 1);
                 SyncGlassRegion();
                 _selectedTab?.BrowserHost.SyncBrowserRect();
             }
-
-            _recentFolders.Clear();
-            if (cfg.RecentFolders != null)
+            if (_showPreviewPane != cfg.ShowPreviewPane)
             {
-                foreach (string rf in cfg.RecentFolders)
-                {
-                    if (!string.IsNullOrWhiteSpace(rf) && _recentFolders.Count < MaxRecentFolders)
-                    {
-                        _recentFolders.Add(rf);
-                    }
-                }
-            }
-
-            _bookmarks.Clear();
-            foreach (BookmarkConfigItem bm in cfg.Bookmarks)
-            {
-                if (!string.IsNullOrWhiteSpace(bm.TargetPath))
-                {
-                    _bookmarks.Add(AppConfigService.CreateBookmarkViewModelFast(bm.Title, bm.TargetPath));
-                }
+                _showPreviewPane = cfg.ShowPreviewPane;
+                foreach (var tab in _tabs) tab.BrowserHost.SetPreviewPaneVisible(_showPreviewPane, tab.CurrentPidl, () => tab.SuppressNextHistoryRecord());
+                UpdatePreviewButtonVisual();
             }
             HydrateBookmarkIconsDeferred();
             UpdateBookmarkStarVisual();
@@ -379,8 +300,8 @@ namespace LeafTab.Views
             if (_skipSessionPersistence || _isClosingWindow || !_isLoadedCompleted)
                 return;
 
-            _sessionSaveDebounceTimer.Stop();
-            _sessionSaveDebounceTimer.Start();
+            _sharedStore?.UpdatePreferences(_showBookmarkBar, _showPreviewPane, _enableWarmStandby);
+            _sharedStore?.ScheduleSave();
         }
 
         // ==================== PARTITIONED LIQUID GLASS BACKDROP & WINDOW CHROME ====================
@@ -474,23 +395,23 @@ namespace LeafTab.Views
         {
             if (!_isGlassActive)
             {
-                TabTitleBarSurface.Background = new SolidColorBrush(
+                TabTitleBarSurface.Background = UiBrushes.Get(
                     isWindowActive ? Color.FromRgb(0xE2, 0xEC, 0xF7) : Color.FromRgb(0xEB, 0xF0, 0xF7));
-                NavBarSurface.Background = new SolidColorBrush(Color.FromRgb(0xFA, 0xFC, 0xFF));
-                CommandBarSurface.Background = new SolidColorBrush(Color.FromRgb(0xF6, 0xFA, 0xFF));
-                BookmarkBarBorder.Background = new SolidColorBrush(Color.FromRgb(0xF6, 0xFA, 0xFF));
-                BottomStatusBar.Background = new SolidColorBrush(Color.FromRgb(0xF1, 0xF6, 0xFC));
+                NavBarSurface.Background = UiBrushes.Get(Color.FromRgb(0xFA, 0xFC, 0xFF));
+                CommandBarSurface.Background = UiBrushes.Get(Color.FromRgb(0xF6, 0xFA, 0xFF));
+                BookmarkBarBorder.Background = UiBrushes.Get(Color.FromRgb(0xF6, 0xFA, 0xFF));
+                BottomStatusBar.Background = UiBrushes.Get(Color.FromRgb(0xF1, 0xF6, 0xFC));
                 return;
             }
 
-            TabTitleBarSurface.Background = new SolidColorBrush(
+            TabTitleBarSurface.Background = UiBrushes.Get(
                 isWindowActive
                     ? Color.FromArgb(0x96, 0xDE, 0xE8, 0xF5)
                     : Color.FromArgb(0xDC, 0xEA, 0xEF, 0xF7));
-            NavBarSurface.Background = new SolidColorBrush(Color.FromArgb(0xE8, 0xFA, 0xFC, 0xFF));
-            CommandBarSurface.Background = new SolidColorBrush(Color.FromArgb(0xEC, 0xF5, 0xF9, 0xFF));
-            BookmarkBarBorder.Background = new SolidColorBrush(Color.FromArgb(0xEE, 0xF5, 0xF9, 0xFF));
-            BottomStatusBar.Background = new SolidColorBrush(Color.FromArgb(0xDC, 0xEF, 0xF5, 0xFC));
+            NavBarSurface.Background = UiBrushes.Get(Color.FromArgb(0xE8, 0xFA, 0xFC, 0xFF));
+            CommandBarSurface.Background = UiBrushes.Get(Color.FromArgb(0xEC, 0xF5, 0xF9, 0xFF));
+            BookmarkBarBorder.Background = UiBrushes.Get(Color.FromArgb(0xEE, 0xF5, 0xF9, 0xFF));
+            BottomStatusBar.Background = UiBrushes.Get(Color.FromArgb(0xDC, 0xEF, 0xF5, 0xFC));
         }
 
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -974,6 +895,7 @@ namespace LeafTab.Views
             }
 
             _selectedTab = tab;
+            EnsureActiveTabVisible();
 
             foreach (ExplorerTabItem item in _tabs)
             {
@@ -1451,7 +1373,7 @@ namespace LeafTab.Views
                 }
                 if (vk == 0x20) // Alt+Space
                 {
-                    SystemCommands.ShowSystemMenu(this, new Point(Left + 14, Top + TabStripHeightDip));
+                    WindowBackdropHelper.ShowSystemMenuAtScreenPoint(this, PointToScreen(new Point(14, TabStripHeightDip)));
                     handled = true;
                     return;
                 }
@@ -1739,7 +1661,10 @@ namespace LeafTab.Views
             if (_tabs.Count <= 1)
                 return;
 
-            SwitchRelativeTab(e.Delta > 0 ? -1 : +1);
+            if (TabsScrollViewer.ScrollableWidth > 0)
+                TabsScrollViewer.ScrollToHorizontalOffset(TabsScrollViewer.HorizontalOffset - e.Delta);
+            else
+                SwitchRelativeTab(e.Delta > 0 ? -1 : +1);
             e.Handled = true;
         }
 
@@ -1893,7 +1818,7 @@ namespace LeafTab.Views
                 {
                     Content = $"“{tab.SearchQuery}”在 {tab.Title} 中的搜索结果",
                     Style = segStyle,
-                    Foreground = new SolidColorBrush(Color.FromRgb(0x00, 0x62, 0xCC)),
+                    Foreground = UiBrushes.Get(Color.FromRgb(0x00, 0x62, 0xCC)),
                     FontWeight = FontWeights.Medium,
                     ToolTip = "点击退出搜索并返回原目录"
                 };
@@ -1919,7 +1844,7 @@ namespace LeafTab.Views
                     Tag = node,
                     Style = segStyle,
                     FontWeight = isLast ? FontWeights.SemiBold : FontWeights.Normal,
-                    Foreground = new SolidColorBrush(
+                    Foreground = UiBrushes.Get(
                         isLast ? Color.FromRgb(0x0F, 0x17, 0x2A) : Color.FromRgb(0x33, 0x41, 0x55)),
                     ToolTip = node.ParsingName
                 };
@@ -1940,7 +1865,7 @@ namespace LeafTab.Views
                         Width = 4.8,
                         Height = 7.8,
                         Stretch = Stretch.Uniform,
-                        Stroke = new SolidColorBrush(Color.FromRgb(0x94, 0xA3, 0xB8)),
+                        Stroke = UiBrushes.Get(Color.FromRgb(0x94, 0xA3, 0xB8)),
                         StrokeThickness = 1.25,
                         StrokeStartLineCap = PenLineCap.Round,
                         StrokeEndLineCap = PenLineCap.Round,
@@ -2143,7 +2068,7 @@ namespace LeafTab.Views
             BreadcrumbContainerGrid.Visibility = Visibility.Collapsed;
             AddressEditGrid.Visibility = Visibility.Visible;
             AddressBoxBorder.Background = Brushes.White;
-            AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
+            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
             AddressBoxBorder.BorderThickness = new Thickness(1.4);
 
             AddressTextBox.Focus();
@@ -2157,15 +2082,16 @@ namespace LeafTab.Views
 
         public void ExitAddressEditMode()
         {
+            _addressSuggestCts?.Cancel();
             AddressSuggestPopup.IsOpen = false;
             AddressEditGrid.Visibility = Visibility.Collapsed;
             BreadcrumbContainerGrid.Visibility = Visibility.Visible;
-            AddressBoxBorder.Background = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
-            AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
+            AddressBoxBorder.Background = UiBrushes.Get(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
+            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
             AddressBoxBorder.BorderThickness = new Thickness(1);
         }
 
-        private void RefreshAddressSuggestions(bool showDefaultHistory)
+        private async void RefreshAddressSuggestions(bool showDefaultHistory)
         {
             if (AddressEditGrid.Visibility != Visibility.Visible || _isClosingWindow)
             {
@@ -2182,16 +2108,22 @@ namespace LeafTab.Views
                 }
             }
 
-            List<AddressSuggestionItem> suggestions = QuickLaunchAndInstallService.BuildAddressSuggestions(
-                AddressTextBox.Text,
-                showDefaultHistory,
-                _recentFolders,
-                bookmarkPaths,
-                maxResults: 12);
-
-            AddressSuggestListBox.ItemsSource = suggestions;
-            AddressSuggestListBox.SelectedIndex = -1;
-            AddressSuggestPopup.IsOpen = suggestions.Count > 0 && IsActive;
+            _addressSuggestCts?.Cancel();
+            _addressSuggestCts?.Dispose();
+            _addressSuggestCts = new CancellationTokenSource();
+            CancellationToken token = _addressSuggestCts.Token;
+            string text = AddressTextBox.Text;
+            try
+            {
+                var suggestions = await QuickLaunchAndInstallService.BuildAddressSuggestionsAsync(
+                    text, showDefaultHistory, _recentFolders.ToArray(), bookmarkPaths, token);
+                if (token.IsCancellationRequested || _isClosingWindow || AddressEditGrid.Visibility != Visibility.Visible) return;
+                AddressSuggestListBox.ItemsSource = suggestions;
+                AddressSuggestListBox.SelectedIndex = -1;
+                AddressSuggestPopup.IsOpen = suggestions.Count > 0 && IsActive;
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { DiagnosticLog.Write("address-completion-failed", ex); }
         }
 
         private void SetAddressTextFromSuggestion(string text)
@@ -2314,7 +2246,7 @@ namespace LeafTab.Views
         private void AddressTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
             AddressBoxBorder.Background = Brushes.White;
-            AddressBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
+            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
             AddressTextBox.SelectAll();
         }
 
@@ -2456,14 +2388,14 @@ namespace LeafTab.Views
         private void SearchTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
             SearchBoxBorder.Background = Brushes.White;
-            SearchBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
+            SearchBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
             SearchBoxBorder.BorderThickness = new Thickness(1.4);
         }
 
         private void SearchTextBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
-            SearchBoxBorder.Background = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
-            SearchBoxBorder.BorderBrush = new SolidColorBrush(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
+            SearchBoxBorder.Background = UiBrushes.Get(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
+            SearchBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
             SearchBoxBorder.BorderThickness = new Thickness(1);
         }
 
@@ -3020,6 +2952,12 @@ namespace LeafTab.Views
 
                         if (choice == MessageBoxResult.Yes)
                         {
+                            SaveConfigurationSnapshot();
+                            if ((_sharedStore != null && !_sharedStore.Flush()) || !AppConfigService.PrepareInstalledConfig())
+                            {
+                                SetTransientStatus("配置迁移未完成，已保留当前程序和书签，请稍后重试。", 5000);
+                                return;
+                            }
                             if (!QuickLaunchAndInstallService.InstallToFixedLocation(
                                     currentExe,
                                     out string installedExe,
@@ -3117,16 +3055,16 @@ namespace LeafTab.Views
         {
             if (_showPreviewPane)
             {
-                PreviewPaneButton.Background = new SolidColorBrush(Color.FromArgb(0x22, 0x00, 0x7A, 0xFF));
-                PreviewPaneButton.BorderBrush = new SolidColorBrush(Color.FromArgb(0x48, 0x00, 0x7A, 0xFF));
-                PreviewPaneText.Foreground = new SolidColorBrush(Color.FromRgb(0x00, 0x62, 0xCC));
+                PreviewPaneButton.Background = UiBrushes.Get(Color.FromArgb(0x22, 0x00, 0x7A, 0xFF));
+                PreviewPaneButton.BorderBrush = UiBrushes.Get(Color.FromArgb(0x48, 0x00, 0x7A, 0xFF));
+                PreviewPaneText.Foreground = UiBrushes.Get(Color.FromRgb(0x00, 0x62, 0xCC));
                 PreviewPaneText.FontWeight = FontWeights.Medium;
             }
             else
             {
                 PreviewPaneButton.Background = Brushes.Transparent;
                 PreviewPaneButton.BorderBrush = Brushes.Transparent;
-                PreviewPaneText.Foreground = new SolidColorBrush(Color.FromRgb(0x1E, 0x29, 0x3B));
+                PreviewPaneText.Foreground = UiBrushes.Get(Color.FromRgb(0x1E, 0x29, 0x3B));
                 PreviewPaneText.FontWeight = FontWeights.Normal;
             }
         }
@@ -3168,9 +3106,9 @@ namespace LeafTab.Views
                            style == ExplorerViewStyle.MediumIcons ||
                            style == ExplorerViewStyle.Tiles;
 
-            Brush activeStroke = new SolidColorBrush(Color.FromRgb(0x00, 0x7A, 0xFF));
-            Brush inactiveStroke = new SolidColorBrush(Color.FromRgb(0x64, 0x74, 0x8B));
-            Brush activeBg = new SolidColorBrush(Color.FromArgb(0x22, 0x00, 0x7A, 0xFF));
+            Brush activeStroke = UiBrushes.Get(Color.FromRgb(0x00, 0x7A, 0xFF));
+            Brush inactiveStroke = UiBrushes.Get(Color.FromRgb(0x64, 0x74, 0x8B));
+            Brush activeBg = UiBrushes.Get(Color.FromArgb(0x22, 0x00, 0x7A, 0xFF));
 
             DetailsQuickGlyph.Stroke = isIcons ? inactiveStroke : activeStroke;
             IconsQuickGlyph.Stroke = isIcons ? activeStroke : inactiveStroke;
@@ -3214,13 +3152,13 @@ namespace LeafTab.Views
 
             if (_isCurrentFolderStarred)
             {
-                BookmarkStarGlyph.Stroke = new SolidColorBrush(Color.FromRgb(0x00, 0x7A, 0xFF));
-                BookmarkStarGlyph.Fill = new SolidColorBrush(Color.FromRgb(0x00, 0x7A, 0xFF));
+                BookmarkStarGlyph.Stroke = UiBrushes.Get(Color.FromRgb(0x00, 0x7A, 0xFF));
+                BookmarkStarGlyph.Fill = UiBrushes.Get(Color.FromRgb(0x00, 0x7A, 0xFF));
                 BookmarkStarButton.ToolTip = "从书签栏移除此文件夹 (Ctrl+D)";
             }
             else
             {
-                BookmarkStarGlyph.Stroke = new SolidColorBrush(Color.FromRgb(0x64, 0x74, 0x8B));
+                BookmarkStarGlyph.Stroke = UiBrushes.Get(Color.FromRgb(0x64, 0x74, 0x8B));
                 BookmarkStarGlyph.Fill = Brushes.Transparent;
                 BookmarkStarButton.ToolTip = "收藏此文件夹到书签栏 (Ctrl+D)";
             }
@@ -3442,16 +3380,19 @@ namespace LeafTab.Views
             }
         }
 
+        private static uint _clipboardSequence = uint.MaxValue;
+        private static bool _clipboardHasFiles;
         private static bool CanPasteFromClipboardSafe()
         {
+            uint current = NativeMethods.GetClipboardSequenceNumber();
+            if (current != 0 && current == _clipboardSequence) return _clipboardHasFiles;
             try
             {
-                return Clipboard.ContainsFileDropList() || Clipboard.ContainsData("Shell IDList Array");
+                _clipboardHasFiles = Clipboard.ContainsFileDropList() || Clipboard.ContainsData("Shell IDList Array");
+                _clipboardSequence = current;
+                return _clipboardHasFiles;
             }
-            catch
-            {
-                return false;
-            }
+            catch { _clipboardSequence = uint.MaxValue; return false; }
         }
 
         public void PrepareForForceExit() => _forceExitProcess = true;
@@ -3483,7 +3424,6 @@ namespace LeafTab.Views
 
         private void EnterWarmStandby()
         {
-            _sessionSaveDebounceTimer.Stop();
             SaveConfigurationSnapshot();
 
             _statusRefreshTimer.Stop();
@@ -3512,8 +3452,8 @@ namespace LeafTab.Views
 
         private void MainWindow_Closed(object? sender, EventArgs e)
         {
+            if (_sharedStore != null) _sharedStore.Changed -= SharedConfigurationChanged;
             AddressSuggestPopup.IsOpen = false;
-            _sessionSaveDebounceTimer.Stop();
             SaveConfigurationSnapshot();
 
             _isClosingWindow = true;
@@ -3523,6 +3463,8 @@ namespace LeafTab.Views
 
             _addressParseCts?.Cancel();
             _addressParseCts?.Dispose();
+            _addressSuggestCts?.Cancel();
+            _addressSuggestCts?.Dispose();
 
             _windowHwndSource?.RemoveHook(MainWindowWndProc);
             _windowHwndSource = null;

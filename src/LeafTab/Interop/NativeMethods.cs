@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace LeafTab.Interop
 {
@@ -226,6 +227,10 @@ namespace LeafTab.Interop
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint serverProcessId);
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr CreateWindowExW(
             int dwExStyle,
@@ -319,6 +324,13 @@ namespace LeafTab.Interop
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SendMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetClipboardSequenceNumber();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint msg, IntPtr wParam,
+            string lParam, uint flags, uint timeout, out IntPtr result);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -476,10 +488,6 @@ namespace LeafTab.Interop
             uint uFlags,
             string? dwItem1,
             string? dwItem2);
-
-        [DllImport("gdi32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool DestroyIcon(IntPtr hIcon);
 
         [DllImport("user32.dll", EntryPoint = "DestroyIcon")]
         [return: MarshalAs(UnmanagedType.Bool)]

@@ -14,7 +14,7 @@
     <ApplicationIcon>Assets\LeafTab.ico</ApplicationIcon>
     <AssemblyName>LeafTab</AssemblyName>
     <RootNamespace>LeafTab</RootNamespace>
-    <Version>0.6.0</Version>
+    <Version>0.6.1</Version>
     <AssemblyTitle>LeafTab（一叶）多标签资源管理器</AssemblyTitle>
     <Product>LeafTab（一叶）</Product>
     <Company>LeafTab</Company>
@@ -28,4 +28,7 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
+  </ItemGroup>
 </Project>

@@ -1,3 +1,4 @@
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
@@ -8,6 +9,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LeafTab.Setup", "src\LeafTa
 	ProjectSection(ProjectDependencies) = postProject
 		{8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101} = {8B6F84D2-3E41-4A9D-9C28-71E2F5A8D101}
 	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LeafTab.RegressionTests", "tests\LeafTab.RegressionTests\LeafTab.RegressionTests.csproj", "{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -23,8 +28,15 @@ Global
 		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Debug|x64.Build.0 = Debug|x64
 		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Release|x64.ActiveCfg = Release|x64
 		{9C4A18B7-5F2E-4D19-8A63-19B7E4C2A602}.Release|x64.Build.0 = Release|x64
+		{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC}.Debug|x64.ActiveCfg = Debug|x64
+		{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC}.Debug|x64.Build.0 = Debug|x64
+		{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC}.Release|x64.ActiveCfg = Release|x64
+		{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{5B4FC27D-E94E-4960-ADFD-04DAAAADF5DC} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

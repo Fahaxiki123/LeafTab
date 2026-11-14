@@ -83,7 +83,6 @@ namespace LeafTab.Controls
         private static readonly object s_wndClassLock = new object();
         private static bool s_whiteHostClassRegistered;
         private static readonly WNDPROC s_whiteHostWndProc = WhiteHostWndProc;
-        private static int s_cachedInnerStatusBarClipPx = -1;
 
         private static string EnsureWhiteHostWindowClass()
         {
@@ -267,11 +266,7 @@ namespace LeafTab.Controls
             NativeMethods.GetClientRect(_browseHostHwnd, out RECT rc);
             if (rc.Width <= 0) rc.Right = 800;
             if (rc.Height <= 0) rc.Bottom = 500;
-            if (s_cachedInnerStatusBarClipPx > 0)
-            {
-                rc.Bottom += s_cachedInnerStatusBarClipPx;
-                _innerStatusBarClipPx = s_cachedInnerStatusBarClipPx;
-            }
+
 
             var fs = new FOLDERSETTINGS
             {
@@ -314,7 +309,6 @@ namespace LeafTab.Controls
         {
             base.OnDpiChanged(oldDpi, newDpi);
             _innerStatusBarClipPx = -1;
-            s_cachedInnerStatusBarClipPx = -1;
             SyncBrowserRect();
         }
 
@@ -342,11 +336,6 @@ namespace LeafTab.Controls
                 NativeMethods.MoveWindow(_searchHostHwnd, 0, 0, rc.Width, rc.Height, true);
             }
 
-            if (_innerStatusBarClipPx < 0 && s_cachedInnerStatusBarClipPx >= 0)
-            {
-                _innerStatusBarClipPx = s_cachedInnerStatusBarClipPx;
-            }
-
             if (_innerStatusBarClipPx < 0 && !_isShowingSearchResults)
             {
                 IntPtr hdwpProbe = IntPtr.Zero;
@@ -360,10 +349,6 @@ namespace LeafTab.Controls
                 {
                     int bottomGap = hostScreen.Bottom - svScreen.Bottom;
                     _innerStatusBarClipPx = (bottomGap > 0 && bottomGap <= 56) ? bottomGap : 0;
-                    if (_innerStatusBarClipPx > 0)
-                    {
-                        s_cachedInnerStatusBarClipPx = _innerStatusBarClipPx;
-                    }
                 }
             }
 
@@ -396,7 +381,6 @@ namespace LeafTab.Controls
 
             _showPreviewPane = visible;
             _innerStatusBarClipPx = -1;
-            s_cachedInnerStatusBarClipPx = -1;
 
             if (_browser != null && !_isShowingSearchResults && currentFolderPidl != IntPtr.Zero)
             {
@@ -710,13 +694,23 @@ namespace LeafTab.Controls
             }
         }
 
-        public void SelectAllItems()
+        public async void SelectAllItems()
         {
             IExplorerBrowser? active = ActiveBrowser;
             if (_isDestroyed || active == null)
                 return;
 
+            int generation = _viewGeneration;
             FocusNativeView();
+            // DefView's native Edit/Select All command performs one bulk selection.
+            IntPtr viewWindow = GetShellViewWindowHandleFor(active);
+            if (viewWindow != IntPtr.Zero)
+            {
+                NativeMethods.SendMessageW(viewWindow, 0x0111, new IntPtr(0x7021), IntPtr.Zero);
+                InvalidateSelectionCache();
+                var selected = GetItemCounts();
+                if (selected.TotalItems == selected.SelectedItems) return;
+            }
             Guid iidFv = ShellConstants.IID_IFolderView;
             if (active.GetCurrentView(ref iidFv, out IntPtr pfv) != ShellConstants.S_OK || pfv == IntPtr.Zero)
                 return;
@@ -728,7 +722,9 @@ namespace LeafTab.Controls
                 {
                     for (int i = 0; i < total; i++)
                     {
+                        if (_isDestroyed || generation != _viewGeneration || !ReferenceEquals(active, ActiveBrowser)) return;
                         fv.SelectItem(i, ShellConstants.SVSI_SELECT);
+                        if ((i + 1) % 64 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
                     }
                     InvalidateSelectionCache();
                 }
@@ -2005,6 +2001,7 @@ namespace LeafTab.Controls
 
         private void OnNativeViewCreated()
         {
+            _innerStatusBarClipPx = -1;
             if (_isDestroyed) return;
             _viewGeneration++;
             InvalidateSelectionCache();
@@ -2611,7 +2608,7 @@ namespace LeafTab.Controls
 
             public int OnNavigationPending(IntPtr pidlFolder) => ShellConstants.S_OK;
 
-            public int OnViewCreated(IShellView? psv)
+            public int OnViewCreated(IntPtr psv)
             {
                 if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
                     owner.OnNativeViewCreated();
@@ -2677,7 +2674,7 @@ namespace LeafTab.Controls
                 return E_ABORT;
             }
 
-            public int OnViewCreated(IShellView? psv)
+            public int OnViewCreated(IntPtr psv)
             {
                 if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
                     owner.OnNativeViewCreated();

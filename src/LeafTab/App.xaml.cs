@@ -65,13 +65,17 @@ namespace LeafTab
 
             if (req.IsUnregisterShell)
             {
-                ShellIntegrationService.UnregisterAllOwned();
-                using var quitClient = new SingleInstanceService();
-                if (!quitClient.TryAcquirePrimaryInstance())
+                bool restored = ShellIntegrationService.UnregisterAllOwned();
+                if (restored)
                 {
-                    quitClient.TryForwardToPrimary(new LaunchActionRequest { IsQuitProcess = true }, timeoutMs: 1200);
+                    using var quitClient = new SingleInstanceService();
+                    if (!quitClient.TryAcquirePrimaryInstance())
+                    {
+                        quitClient.TryForwardToPrimary(new LaunchActionRequest { IsQuitProcess = true }, timeoutMs: 1500,
+                            expectedExecutablePath: ShellIntegrationService.GetCurrentExecutablePath());
+                    }
                 }
-                Environment.Exit(0);
+                Environment.Exit(restored ? 0 : 1);
                 return;
             }
 
@@ -174,6 +178,12 @@ namespace LeafTab
                 deferInitialFallbackTab: deferFallbackTab);
             RegisterWindow(mainWindow);
             MainWindow = mainWindow;
+            if (req.IsUiPreview)
+            {
+                mainWindow.Title = "LeafTab · 验证副本";
+                mainWindow.Width = 720;
+                mainWindow.Height = 620;
+            }
 
             if (isSilentWarmup && earlyBufferedRequests.Count == 0)
             {
@@ -252,7 +262,7 @@ namespace LeafTab
                 });
             }
 
-            if (_isSelfTest)
+            if (_isSelfTest && !req.IsUiPreview)
             {
                 await SelfTestRunner.RunAndExitAsync(mainWindow, req.SelfTestReportPath!);
             }
@@ -518,17 +528,6 @@ namespace LeafTab
             double minY = SystemParameters.VirtualScreenTop;
             double maxY = Math.Max(minY, SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight - Math.Min(height, 220));
             return Math.Max(minY, Math.Min(y, maxY));
-        }
-
-        internal void BroadcastSharedConfigSaved(MainWindow sender, AppConfig savedConfig)
-        {
-            foreach (MainWindow w in _windows)
-            {
-                if (!ReferenceEquals(w, sender) && !w.IsClosingOrClosed)
-                {
-                    w.ApplySharedConfigFromPeer(savedConfig);
-                }
-            }
         }
 
         internal void ForceExitAllWindows()

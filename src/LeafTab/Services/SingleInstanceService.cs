@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.Cryptography;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using LeafTab.Shared;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -28,6 +31,7 @@ namespace LeafTab.Services
     public sealed class LaunchActionRequest
     {
         public bool IsSelfTest { get; set; }
+        public bool IsUiPreview { get; set; }
         public string? SelfTestReportPath { get; set; }
         public bool IsRegisterDefaultExplorer { get; set; }
         public bool IsRegisterContextMenu { get; set; }
@@ -57,6 +61,13 @@ namespace LeafTab.Services
                     continue;
 
                 string trimmed = rawArg.Trim();
+
+                if (string.Equals(trimmed, "--self-test-ui", StringComparison.OrdinalIgnoreCase))
+                {
+                    req.IsSelfTest = true;
+                    req.IsUiPreview = true;
+                    continue;
+                }
 
                 if (string.Equals(trimmed, "--self-test", StringComparison.OrdinalIgnoreCase))
                 {
@@ -264,7 +275,7 @@ namespace LeafTab.Services
 
     internal sealed class SingleInstanceService : IDisposable
     {
-        private const string ProtocolHeader = "LEAFTAB_IPC_V1";
+
         private readonly string _mutexName;
         private readonly string _pipeName;
         private Mutex? _mutex;
@@ -272,9 +283,12 @@ namespace LeafTab.Services
         private CancellationTokenSource? _listenCts;
         private bool _disposed;
 
-        public SingleInstanceService()
+        public SingleInstanceService() : this(WindowsIdentity.GetCurrent().User!.Value + ":" + System.Diagnostics.Process.GetCurrentProcess().SessionId)
         {
-            string userKey = $"{Environment.UserDomainName}\\{Environment.UserName}";
+        }
+
+        internal SingleInstanceService(string userKey)
+        {
             string hashHex = ComputeShortSha256Hex(userKey);
             _mutexName = $"Local\\LeafTab.SingleInstance.{hashHex}";
             _pipeName = $"LeafTab.SingleInstance.Pipe.{hashHex}";
@@ -313,7 +327,7 @@ namespace LeafTab.Services
             }
         }
 
-        public bool TryForwardToPrimary(LaunchActionRequest request, int timeoutMs = 2500)
+        public bool TryForwardToPrimary(LaunchActionRequest request, int timeoutMs = 2500, string? expectedExecutablePath = null)
         {
             // Grant the primary LeafTab process permission to bring itself to the foreground
             NativeMethods.AllowSetForegroundWindow(NativeMethods.ASFW_ANY);
@@ -327,42 +341,16 @@ namespace LeafTab.Services
                     using var client = new NamedPipeClientStream(".", _pipeName, PipeDirection.Out, PipeOptions.Asynchronous);
                     client.Connect(Math.Min(remaining, 500));
 
-                    using var writer = new StreamWriter(client, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+                    if (expectedExecutablePath != null)
                     {
-                        AutoFlush = false
-                    };
-
-                    writer.WriteLine(ProtocolHeader);
-                    if (request.OpenInNewWindow)
-                    {
-                        writer.WriteLine("OPEN_NEW_WINDOW");
+                        if (!NativeMethods.GetNamedPipeServerProcessId(client.SafePipeHandle, out uint serverPid)) return false;
+                        using var serverProcess = System.Diagnostics.Process.GetProcessById(checked((int)serverPid));
+                        if (!ShellAssociationRecovery.PathsEqual(serverProcess.MainModule?.FileName, expectedExecutablePath)) return false;
                     }
 
-                    if (request.IsQuitProcess)
-                    {
-                        writer.WriteLine("QUIT_PROCESS");
-                    }
-                    else if (request.IsBackgroundWarmup && request.Targets.Count == 0)
-                    {
-                        writer.WriteLine("BACKGROUND_NOOP");
-                    }
-                    else if (request.Targets.Count == 0)
-                    {
-                        writer.WriteLine("ACTIVATE_NEW_TAB");
-                    }
-                    else
-                    {
-                        foreach (LaunchTargetItem item in request.Targets)
-                        {
-                            string b64Folder = Convert.ToBase64String(Encoding.UTF8.GetBytes(item.FolderOrAlias));
-                            string b64Select = item.SelectItemName != null
-                                ? Convert.ToBase64String(Encoding.UTF8.GetBytes(item.SelectItemName))
-                                : string.Empty;
-                            writer.WriteLine($"TARGET|{b64Folder}|{b64Select}");
-                        }
-                    }
-
-                    writer.Flush();
+                    byte[] payload = LaunchRequestCodec.Encode(request);
+                    Task write = client.WriteAsync(payload, 0, payload.Length);
+                    if (!write.Wait(remaining)) return false;
                     return true;
                 }
                 catch
@@ -394,14 +382,15 @@ namespace LeafTab.Services
                             PipeDirection.In,
                             NamedPipeServerStream.MaxAllowedServerInstances,
                             PipeTransmissionMode.Byte,
-                            PipeOptions.Asynchronous);
+                            PipeOptions.Asynchronous,
+                            4096, 4096, CreateCurrentUserPipeSecurity());
 
                         await server.WaitForConnectionAsync(token).ConfigureAwait(false);
                         NamedPipeServerStream connectedServer = server;
                         server = null;
 
                         // Read payload concurrently so the next server instance starts listening immediately
-                        _ = ReadClientPayloadAsync(connectedServer, onReceived);
+                        _ = ReadClientPayloadAsync(connectedServer, onReceived, token);
                     }
                     catch (OperationCanceledException)
                     {
@@ -421,66 +410,28 @@ namespace LeafTab.Services
             }, token);
         }
 
-        private static async Task ReadClientPayloadAsync(NamedPipeServerStream stream, Action<LaunchActionRequest> onReceived)
+        internal static PipeSecurity CreateCurrentUserPipeSecurity()
+        {
+            var security = new PipeSecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
+            return security;
+        }
+
+        private static async Task ReadClientPayloadAsync(NamedPipeServerStream stream, Action<LaunchActionRequest> onReceived, CancellationToken token)
         {
             try
             {
                 using (stream)
-                using (var reader = new StreamReader(stream, Encoding.UTF8))
                 {
-                    string? header = await reader.ReadLineAsync().ConfigureAwait(false);
-                    if (!string.Equals(header, ProtocolHeader, StringComparison.Ordinal))
-                        return;
-
-                    var incoming = new LaunchActionRequest();
-                    bool ignoreDispatch = false;
-                    while (true)
-                    {
-                        string? line = await reader.ReadLineAsync().ConfigureAwait(false);
-                        if (line == null)
-                            break;
-
-                        if (string.Equals(line, "QUIT_PROCESS", StringComparison.Ordinal))
-                        {
-                            incoming.IsQuitProcess = true;
-                        }
-                        else if (string.Equals(line, "OPEN_NEW_WINDOW", StringComparison.Ordinal))
-                        {
-                            incoming.OpenInNewWindow = true;
-                        }
-                        else if (string.Equals(line, "BACKGROUND_NOOP", StringComparison.Ordinal))
-                        {
-                            ignoreDispatch = true;
-                        }
-                        else if (line.StartsWith("TARGET|", StringComparison.Ordinal))
-                        {
-                            string[] parts = line.Split('|');
-                            if (parts.Length >= 2)
-                            {
-                                string folder = Encoding.UTF8.GetString(Convert.FromBase64String(parts[1]));
-                                string? select = (parts.Length >= 3 && !string.IsNullOrEmpty(parts[2]))
-                                    ? Encoding.UTF8.GetString(Convert.FromBase64String(parts[2]))
-                                    : null;
-                                if (!string.IsNullOrWhiteSpace(folder))
-                                {
-                                    incoming.Targets.Add(new LaunchTargetItem(folder, select));
-                                }
-                            }
-                        }
-                    }
-
-                    if (ignoreDispatch && !incoming.IsQuitProcess && incoming.Targets.Count == 0)
-                        return;
-
-                    Application.Current?.Dispatcher?.BeginInvoke(new Action(() =>
-                    {
-                        onReceived(incoming);
-                    }));
+                    byte[] payload = await LaunchRequestCodec.ReadBoundedAsync(stream, 3000, token).ConfigureAwait(false);
+                    var incoming = LaunchRequestCodec.Decode(payload);
+                    if (incoming != null && !token.IsCancellationRequested)
+                        Application.Current?.Dispatcher?.BeginInvoke(new Action(() => onReceived(incoming)));
                 }
             }
-            catch
-            {
-            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { DiagnosticLog.Write("ipc-request-rejected", ex); }
         }
 
         private static string ComputeShortSha256Hex(string input)
