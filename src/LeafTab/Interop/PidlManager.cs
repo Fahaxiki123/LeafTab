@@ -34,6 +34,8 @@ namespace LeafTab.Interop
         private static readonly object s_iconCacheLock = new object();
         private static readonly Dictionary<string, ImageSource> s_smallIconCache =
             new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, (ImageSource? Icon, string TypeName)> s_largeTypeCache =
+            new Dictionary<string, (ImageSource? Icon, string TypeName)>(StringComparer.OrdinalIgnoreCase);
 
         public static IntPtr CreateKnownFolderPidl(Guid knownFolderId)
         {
@@ -284,6 +286,136 @@ namespace LeafTab.Interop
             {
                 NativeMethods.User32DestroyIcon(shfi.hIcon);
             }
+        }
+
+        public static (ImageSource? Icon, string TypeName) GetLargeIconAndTypeName(string fullPathOrName, bool isDirectory)
+        {
+            string input = fullPathOrName ?? string.Empty;
+            string ext = string.Empty;
+            if (!isDirectory && !string.IsNullOrWhiteSpace(input))
+            {
+                try
+                {
+                    ext = Path.GetExtension(input);
+                }
+                catch
+                {
+                    ext = string.Empty;
+                }
+            }
+
+            bool isDriveRoot = isDirectory &&
+                               input.Length >= 2 &&
+                               input[1] == ':' &&
+                               (input.Length == 2 || (input.Length == 3 && (input[2] == '\\' || input[2] == '/')));
+
+            bool perInstanceIcon = !isDirectory &&
+                                   (string.Equals(ext, ".exe", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(ext, ".ico", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(ext, ".lnk", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(ext, ".cur", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(ext, ".ani", StringComparison.OrdinalIgnoreCase)) &&
+                                   File.Exists(input);
+
+            string cacheKey;
+            if (isDriveRoot)
+            {
+                string driveNorm = input.Length == 2 ? input + "\\" : input.Substring(0, 2) + "\\";
+                cacheKey = "__DRV_LARGE_" + driveNorm.ToUpperInvariant();
+                input = driveNorm;
+            }
+            else if (perInstanceIcon)
+            {
+                cacheKey = "__INST_LARGE_" + input;
+            }
+            else if (isDirectory)
+            {
+                cacheKey = "__DIR_LARGE__";
+            }
+            else
+            {
+                cacheKey = string.IsNullOrEmpty(ext)
+                    ? "__EXT_LARGE_NONE__"
+                    : "__EXT_LARGE_" + ext.ToUpperInvariant();
+            }
+
+            lock (s_iconCacheLock)
+            {
+                if (s_largeTypeCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+            }
+
+            var shfi = new SHFILEINFOW();
+            uint flags = NativeMethods.SHGFI_ICON | NativeMethods.SHGFI_LARGEICON | NativeMethods.SHGFI_TYPENAME;
+            string queryPath;
+            uint attrs = 0;
+
+            if (isDriveRoot || perInstanceIcon)
+            {
+                queryPath = input;
+            }
+            else
+            {
+                flags |= NativeMethods.SHGFI_USEFILEATTRIBUTES;
+                attrs = isDirectory ? NativeMethods.FILE_ATTRIBUTE_DIRECTORY : NativeMethods.FILE_ATTRIBUTE_NORMAL;
+                queryPath = isDirectory
+                    ? "folder"
+                    : (string.IsNullOrEmpty(ext) ? "file" : "file" + ext);
+            }
+
+            IntPtr res = NativeMethods.SHGetFileInfoByNameW(
+                queryPath,
+                attrs,
+                ref shfi,
+                (uint)Marshal.SizeOf<SHFILEINFOW>(),
+                flags);
+
+            ImageSource? icon = null;
+            try
+            {
+                if (res != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
+                {
+                    BitmapSource bmp = Imaging.CreateBitmapSourceFromHIcon(
+                        shfi.hIcon,
+                        Int32Rect.Empty,
+                        BitmapSizeOptions.FromEmptyOptions());
+                    bmp.Freeze();
+                    icon = bmp;
+                }
+            }
+            catch
+            {
+                icon = null;
+            }
+            finally
+            {
+                if (shfi.hIcon != IntPtr.Zero)
+                {
+                    NativeMethods.User32DestroyIcon(shfi.hIcon);
+                }
+            }
+
+            string fallbackType = isDirectory
+                ? "文件夹"
+                : (string.IsNullOrEmpty(ext)
+                    ? "文件"
+                    : $"{ext.TrimStart('.').ToUpperInvariant()} 文件");
+
+            string typeName = (res != IntPtr.Zero && !string.IsNullOrWhiteSpace(shfi.szTypeName))
+                ? shfi.szTypeName.Trim()
+                : fallbackType;
+
+            var entry = (icon, typeName);
+            lock (s_iconCacheLock)
+            {
+                if (s_largeTypeCache.Count >= 128)
+                {
+                    s_largeTypeCache.Clear();
+                }
+                s_largeTypeCache[cacheKey] = entry;
+            }
+
+            return entry;
         }
 
         /// <summary>

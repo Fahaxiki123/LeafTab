@@ -184,11 +184,13 @@ namespace LeafTab.Interop
         public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
         public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
 
+        public const uint SHGFI_LARGEICON = 0x000000000;
         public const uint SHGFI_ICON = 0x000000100;
         public const uint SHGFI_SMALLICON = 0x000000001;
         public const uint SHGFI_PIDL = 0x000000008;
         public const uint SHGFI_USEFILEATTRIBUTES = 0x000000010;
         public const uint SHGFI_DISPLAYNAME = 0x000000200;
+        public const uint SHGFI_TYPENAME = 0x000000400;
 
         public const uint SSF_SHOWALLOBJECTS = 0x00000001;
         public const uint SSF_SHOWEXTENSIONS = 0x00000002;

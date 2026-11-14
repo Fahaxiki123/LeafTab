@@ -1,3 +1,22 @@
+# LeafTab 0.6.2 交互细节、内置预览侧栏与安装包精简验证（2026-11-14）
+
+- 四项改进及内置预览方案全部落地并验证：
+  1. 顶部 `预览` 按钮改为控制 LeafTab 内置轻量 WPF 预览侧栏（支持可拖动分割线与状态持久化）：自动渲染 `.md`/`.markdown` 富文档并支持 `渲染`/`源码` 切换；以无锁方式读取 `UTF-8`/`ANSI(GBK)` 文本、代码与配置（上限 96 KB）；安全解码常见图片展示缩略图与分辨率（上限 32 MB）；其余文件夹、驱动器与二进制文件展示图标、类型与大小卡片及 `用默认程序打开` 入口；同时明确关闭底部无第三方的 Shell 原生 `EP_PreviewPane`。
+  2. 点击面包屑地址栏空白区由 `BreadcrumbContainerGrid` 统一截获（`BreadcrumbScrollViewer` 设为 `Focusable="False"` 并过滤 `ButtonBase` 子控件），立即进入编辑态、同步 Win32/WPF 焦点并全选完整路径；点击文件区时自动退出地址编辑态。
+  3. 主窗口与任务栏标题对齐 Windows 原生资源管理器（仅显示当前文件夹名称，移除末尾 ` - LeafTab` 后缀）。
+  4. 精简分发形态为单一图形化一键安装包 `LeafTab-v0.6.2-Setup-x64.exe`（移除独立单文件绿色便携版发布物），并更新默认资源管理器提示语，明确卸载时自动恢复系统默认。
+- `scripts/verify.ps1` 与安装包构建完整通过（于临时目录 `LeafTab-v062-preview-*` 隔离编译运行后已清理，源码目录无 `bin/obj`）：.NET SDK Release/x64 构建 **0 警告、0 错误**。
+- **40 个独立回归用例全部通过**（`RESULT: 40 passed, 0 failed`），包括默认接管提示语、版本一致性、面包屑空白点击命中过滤，以及 4 项内置文件预览侧栏测试（Markdown 无锁富文本渲染、96 KB `UTF-8`/`ANSI(GBK)` 截断解码、PNG 尺寸无锁读取、二进制信息卡回退）。
+- 原生 `--self-test` 全部断言通过（`## RESULT: PASS`）：
+  - `[此电脑]`：`WindowTitle='此电脑'`。
+  - `WindowTitleMatchesFolderOnly`：窗口标题与标签标题完全一致且无 ` - LeafTab` 后缀。
+  - `AddressBarBlankClickSelectsAll`：`Handled=True`，`AddressTextBox.SelectedText` 与当前完整路径一致。
+  - `PreviewPaneToggleSameFolder`：在当前目录选中 `README.md` 打开预览后，`Kind='Markdown'`，`SHELLDLL_DefView` 宽度由 `1250` 收缩至 `819` 像素，关预览后恢复 `1250` 像素，且保持选中状态（`KeptSelection=True`）。
+  - `NativeSelectAll1000`：1,000 个测试文件全选通过（记录耗时 **255 ms**，仅代表本次本机运行）；`NarrowWindowTabOverflow` 通过（72.0 DIP，裁剪开启）。
+- 当前安装包 `LeafTab-v0.6.2-Setup-x64.exe`（274,432 字节 / 268.0 KB）SHA-256：`10BE21468E32DAF5E90516DBBB77DC69823AC422C1B6E909B3630D2564773554`，位于 `artifacts/latest`。
+
+---
+
 # LeafTab 0.6.1 验收收尾验证（2026-11-14）
 
 - 对照 Gemini 提出的 6 项问题核实并修复：安装接管遗漏便携实例、标签展开时新建按钮跳位、菜单勾选未区分程序路径、右键菜单异常阻断默认关联自愈、注销关联未退出后台实例、标签下拉图标及自检临时目录残留。

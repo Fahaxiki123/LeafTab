@@ -147,6 +147,9 @@ namespace LeafTab.Controls
         private int _cachedFocusedItem = -2;
         private ulong _cachedSelectedBytes;
         private bool _cachedHasSizedSelection;
+        private string? _cachedSingleSelectedPath;
+        private string? _cachedSingleSelectedDisplayName;
+        private bool _cachedSingleSelectedIsFolder;
 
         // Async directory search state
         private IntPtr _preSearchFolderPidl;
@@ -255,7 +258,7 @@ namespace LeafTab.Controls
             Type? comType = Type.GetTypeFromCLSID(ShellConstants.CLSID_ExplorerBrowser, throwOnError: true);
             _browser = (IExplorerBrowser)Activator.CreateInstance(comType!)!;
 
-            _paneSite = new ExplorerPaneVisibilitySite(this);
+            _paneSite ??= new ExplorerPaneVisibilitySite();
             if (_browser is IObjectWithSite withSite)
             {
                 withSite.SetSite(_paneSite);
@@ -374,19 +377,56 @@ namespace LeafTab.Controls
             }
         }
 
-        public void SetPreviewPaneVisible(bool visible, IntPtr currentFolderPidl, Action? beforeRebrowse = null)
+        public void SetPreviewPaneVisible(bool visible)
         {
-            if (_isDestroyed || _showPreviewPane == visible)
+            if (_isDestroyed)
                 return;
 
             _showPreviewPane = visible;
-            _innerStatusBarClipPx = -1;
+        }
 
-            if (_browser != null && !_isShowingSearchResults && currentFolderPidl != IntPtr.Zero)
+        private void DestroyPrimaryBrowserOnly()
+        {
+            DetachDirectUiSubclass();
+
+            if (_eventSink != null)
             {
-                beforeRebrowse?.Invoke();
-                _browser.BrowseToIDList(currentFolderPidl, ShellConstants.SBSP_ABSOLUTE | ShellConstants.SBSP_SAMEBROWSER);
+                _eventSink.Detach();
+                _eventSink = null;
             }
+
+            if (_browser != null)
+            {
+                try
+                {
+                    if (_adviseCookie != 0)
+                    {
+                        _browser.Unadvise(_adviseCookie);
+                        _adviseCookie = 0;
+                    }
+                    if (_browser is IObjectWithSite withSite)
+                    {
+                        withSite.SetSite(null);
+                    }
+                    _browser.Destroy();
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    Marshal.FinalReleaseComObject(_browser);
+                    _browser = null;
+                }
+            }
+        }
+
+        internal int GetShellViewWidthPx()
+        {
+            IntPtr svHwnd = GetShellViewWindowHandleFor(ActiveBrowser);
+            if (svHwnd != IntPtr.Zero && NativeMethods.GetWindowRect(svHwnd, out RECT rc))
+                return rc.Width;
+            return 0;
         }
 
         public bool NavigateToPidl(IntPtr pidl)
@@ -460,7 +500,13 @@ namespace LeafTab.Controls
             _cachedTotalItems = -1;
             _cachedSelectedItems = -1;
             _cachedFocusedItem = -2;
+            _cachedSingleSelectedPath = null;
+            _cachedSingleSelectedDisplayName = null;
+            _cachedSingleSelectedIsFolder = false;
         }
+
+        internal (string? FileSystemPath, string? DisplayName, bool IsFolder) GetCachedSingleSelection() =>
+            (_cachedSingleSelectedPath, _cachedSingleSelectedDisplayName, _cachedSingleSelectedIsFolder);
 
         public (int TotalItems, int SelectedItems) GetItemCounts()
         {
@@ -490,11 +536,23 @@ namespace LeafTab.Controls
                     if (!computeBytes)
                         return new SelectionStatusInfo(total, selected, _cachedSelectedBytes, _cachedHasSizedSelection);
 
-                    if (total == _cachedTotalItems && selected == _cachedSelectedItems && focused == _cachedFocusedItem)
+                    bool missingSingleMeta = selected == 1 &&
+                                             _cachedSingleSelectedPath == null &&
+                                             _cachedSingleSelectedDisplayName == null;
+
+                    if (total == _cachedTotalItems &&
+                        selected == _cachedSelectedItems &&
+                        focused == _cachedFocusedItem &&
+                        !missingSingleMeta)
+                    {
                         return new SelectionStatusInfo(total, selected, _cachedSelectedBytes, _cachedHasSizedSelection);
+                    }
 
                     ulong sumBytes = 0;
                     bool hasSized = false;
+                    string? singlePath = null;
+                    string? singleDisplayName = null;
+                    bool singleIsFolder = false;
 
                     if (selected > 0 && selected <= 400 &&
                         fv2.GetSelection(false, out IShellItemArray? selectionArray) == ShellConstants.S_OK &&
@@ -516,6 +574,14 @@ namespace LeafTab.Controls
                                             bool isPureFolder = attrHr >= 0 &&
                                                                 (attrs & ShellConstants.SFGAO_FOLDER) != 0 &&
                                                                 (attrs & ShellConstants.SFGAO_STREAM) == 0;
+
+                                            if (selected == 1 && i == 0)
+                                            {
+                                                singleIsFolder = isPureFolder;
+                                                singlePath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
+                                                singleDisplayName = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY)
+                                                                    ?? PidlManager.GetShellItemString(item, SIGDN.SIGDN_PARENTRELATIVEEDITING);
+                                            }
 
                                             if (!isPureFolder && item is IShellItem2 item2 &&
                                                 item2.GetUInt64(ref sizeKey, out ulong fileSize) == ShellConstants.S_OK)
@@ -543,6 +609,9 @@ namespace LeafTab.Controls
                     _cachedFocusedItem = focused;
                     _cachedSelectedBytes = sumBytes;
                     _cachedHasSizedSelection = hasSized;
+                    _cachedSingleSelectedPath = singlePath;
+                    _cachedSingleSelectedDisplayName = singleDisplayName;
+                    _cachedSingleSelectedIsFolder = singleIsFolder;
 
                     return new SelectionStatusInfo(total, selected, sumBytes, hasSized);
                 }
@@ -2485,42 +2554,11 @@ namespace LeafTab.Controls
             PidlManager.Free(ref _pendingInitialPidl);
 
             DestroySearchBrowserOnly();
-
-            if (_eventSink != null)
-            {
-                _eventSink.Detach();
-                _eventSink = null;
-            }
+            DestroyPrimaryBrowserOnly();
 
             if (_paneSite != null)
             {
-                _paneSite.Detach();
                 _paneSite = null;
-            }
-
-            if (_browser != null)
-            {
-                try
-                {
-                    if (_adviseCookie != 0)
-                    {
-                        _browser.Unadvise(_adviseCookie);
-                        _adviseCookie = 0;
-                    }
-                    if (_browser is IObjectWithSite withSite)
-                    {
-                        withSite.SetSite(null);
-                    }
-                    _browser.Destroy();
-                }
-                catch
-                {
-                }
-                finally
-                {
-                    Marshal.FinalReleaseComObject(_browser);
-                    _browser = null;
-                }
             }
 
             if (_browseHostHwnd != IntPtr.Zero)
@@ -2547,14 +2585,6 @@ namespace LeafTab.Controls
 
             private static readonly Guid SID_ExplorerPaneVisibility = new Guid("e07010ec-bc17-44c0-97b0-46c7c95b9edc");
             private static readonly Guid EP_NavPane = new Guid("cb316b22-25f7-42b8-8a09-540d23a43c2f");
-            private static readonly Guid EP_PreviewPane = new Guid("893c63d1-45c8-4d17-be19-223be71be365");
-
-            private WeakReference<ExplorerBrowserHost>? _ownerRef;
-
-            public ExplorerPaneVisibilitySite(ExplorerBrowserHost owner) =>
-                _ownerRef = new WeakReference<ExplorerBrowserHost>(owner);
-
-            public void Detach() => _ownerRef = null;
 
             public int QueryService(ref Guid guidService, ref Guid riid, out IntPtr ppvObject)
             {
@@ -2583,15 +2613,7 @@ namespace LeafTab.Controls
                     return ShellConstants.S_OK;
                 }
 
-                if (ep == EP_PreviewPane)
-                {
-                    bool previewOn = _ownerRef != null &&
-                                     _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner) &&
-                                     owner.ShowPreviewPane;
-                    peps = previewOn ? (EPS_DEFAULT_ON | EPS_FORCE) : (EPS_DEFAULT_OFF | EPS_FORCE);
-                    return ShellConstants.S_OK;
-                }
-
+                // Always keep Windows Shell's built-in preview pane disabled; LeafTab renders its own WPF preview sidebar.
                 peps = EPS_DEFAULT_OFF | EPS_FORCE;
                 return ShellConstants.S_OK;
             }

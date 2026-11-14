@@ -5,10 +5,14 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using LeafTab.Controls;
 using LeafTab.Services;
 using Microsoft.CSharp;
@@ -157,6 +161,127 @@ namespace LeafTab.RegressionTests
                     File.WriteAllText(Path.Combine(portable, "quit"), "");
                     installed.WaitForExit(2000); downloaded.WaitForExit(2000);
                 }
+            });
+            Test("Default explorer status message reflects installer automatic recovery", () => RegistrySandbox((classes, backup) =>
+            {
+                var res = ShellIntegrationService.SetDefaultExplorerEnabledCore(true, Exe, classes, backup, false);
+                Check(res.Ok && !res.Message.Contains("删除程序前") && res.Message.Contains("卸载"), res.Message);
+            }));
+            Test("Setup version metadata matches main executable version", () =>
+            {
+                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.2");
+                Check(typeof(LeafTab.App).Assembly.GetName().Version == new Version(0, 6, 2, 0));
+            });
+            Test("Breadcrumb blank hit filter distinguishes blank chrome from interactive buttons", () =>
+            {
+                var rootBorder = new Border();
+                var grid = new Grid();
+                rootBorder.Child = grid;
+                var rootBtnPath = new System.Windows.Shapes.Path();
+                var rootBtn = new Button { Content = rootBtnPath };
+                var sepPath = new System.Windows.Shapes.Path();
+                var crumbText = new TextBlock { Text = "Demo" };
+                var crumbBtn = new Button { Content = crumbText };
+                var itemsPanel = new StackPanel();
+                itemsPanel.Children.Add(crumbBtn);
+                var scroll = new ScrollViewer { Content = itemsPanel };
+                grid.Children.Add(rootBtn);
+                grid.Children.Add(sepPath);
+                grid.Children.Add(scroll);
+
+                Check(LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(scroll, rootBorder));
+                Check(LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(itemsPanel, rootBorder));
+                Check(LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(grid, rootBorder));
+                Check(LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(sepPath, rootBorder));
+                Check(LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(rootBorder, rootBorder));
+                Check(!LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(crumbText, rootBorder));
+                Check(!LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(crumbBtn, rootBorder));
+                Check(!LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(rootBtnPath, rootBorder));
+                Check(!LeafTab.Views.MainWindow.ShouldEnterAddressEditFromBreadcrumbClick(rootBtn, rootBorder));
+            });
+            Test("Built-in preview renders Markdown richly without locking the file", () =>
+            {
+                string dir = MakeDirectory("preview-md");
+                string mdPath = Path.Combine(dir, "00_项目上下文.md");
+                string mdContent =
+                    "---\nowner: LeafTab\n---\n\n" +
+                    "# 项目概览\n\n" +
+                    "这是 **加粗**、*斜体*、`内联代码` 与 [链接](https://github.com/Fahaxiki123/LeafTab)。\n\n" +
+                    "- [x] 完成任务\n" +
+                    "- [ ] 待办事项\n\n" +
+                    "| 模块 | 状态 |\n| --- | --- |\n| 预览 | 就绪 |\n\n" +
+                    "```json\n{\n  \"ok\": true\n}\n```\n";
+                File.WriteAllText(mdPath, mdContent, new UTF8Encoding(false));
+
+                FilePreviewData data = FilePreviewService.LoadPreviewAsync(mdPath, "00_项目上下文", false, "Markdown 源文件", CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                Check(data.Kind == FilePreviewKind.Markdown, $"Expected Markdown, got {data.Kind}");
+                Check(!data.IsTruncated);
+                Check(data.TextContent.Contains("# 项目概览"));
+
+                FlowDocument doc = FilePreviewService.BuildMarkdownDocument(data.TextContent);
+                Check(doc.Blocks.OfType<Paragraph>().Any(), "Missing rendered heading/paragraphs.");
+                Check(doc.Blocks.OfType<Table>().Any(), "Missing rendered Markdown table.");
+                Check(doc.Blocks.OfType<Section>().Count() >= 2, "Missing frontmatter or code block section.");
+
+                File.Delete(mdPath);
+                Check(!File.Exists(mdPath), "Preview held a file lock after completion.");
+            });
+            Test("Built-in preview truncates oversized UTF-8 safely and decodes ANSI/GBK text", () =>
+            {
+                string dir = MakeDirectory("preview-enc");
+                string bigUtf8 = Path.Combine(dir, "large.json");
+                string repeated = new string('中', 40000); // 120,000 UTF-8 bytes (> 96 KB, cuts mid-3-byte char!)
+                File.WriteAllText(bigUtf8, repeated, new UTF8Encoding(false));
+
+                FilePreviewData utfData = FilePreviewService.LoadPreviewAsync(bigUtf8, "large.json", false, "JSON 文件", CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                Check(utfData.Kind == FilePreviewKind.Text, $"Expected Text, got {utfData.Kind}");
+                Check(utfData.IsTruncated, "Expected large file to be truncated at 96 KB.");
+                Check(utfData.EncodingName == "UTF-8", $"Expected UTF-8, got {utfData.EncodingName}");
+                Check(utfData.TextContent.IndexOf('\uFFFD') < 0, "Truncation split produced replacement characters.");
+
+                string ansiTxt = Path.Combine(dir, "ansi_note.txt");
+                string sample = "中文预览配置测试内容";
+                Encoding ansi = Encoding.Default;
+                File.WriteAllBytes(ansiTxt, ansi.GetBytes(sample));
+                FilePreviewData ansiData = FilePreviewService.LoadPreviewAsync(ansiTxt, "ansi_note.txt", false, "文本文档", CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                Check(ansiData.Kind == FilePreviewKind.Text);
+                Check(ansiData.TextContent == sample, $"Decoded '{ansiData.TextContent}' != '{sample}'");
+            });
+            Test("Built-in preview decodes PNG dimensions without holding a file handle", () =>
+            {
+                string dir = MakeDirectory("preview-img");
+                string imgPath = Path.Combine(dir, "sample.png");
+                var wb = new WriteableBitmap(32, 24, 96, 96, PixelFormats.Bgra32, null);
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(wb));
+                using (var fs = File.Create(imgPath))
+                {
+                    encoder.Save(fs);
+                }
+
+                FilePreviewData data = FilePreviewService.LoadPreviewAsync(imgPath, "sample.png", false, "PNG 图像", CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                Check(data.Kind == FilePreviewKind.Image, $"Expected Image, got {data.Kind}");
+                Check(data.ImagePixelWidth == 32 && data.ImagePixelHeight == 24, $"Unexpected size {data.ImagePixelWidth}x{data.ImagePixelHeight}");
+                Check(data.Image != null && data.Image.IsFrozen, "Image must be frozen for safe UI binding.");
+
+                File.Delete(imgPath);
+                Check(!File.Exists(imgPath), "Image preview held a file lock after completion.");
+            });
+            Test("Built-in preview falls back to metadata card for binary payloads", () =>
+            {
+                string dir = MakeDirectory("preview-bin");
+                string binPath = Path.Combine(dir, "archive.unknown");
+                File.WriteAllBytes(binPath, new byte[] { 0x50, 0x4B, 0x00, 0x00, 0x12, 0x34, 0x00, 0x7F });
+
+                FilePreviewData data = FilePreviewService.LoadPreviewAsync(binPath, "archive.unknown", false, "未知文件", CancellationToken.None)
+                    .GetAwaiter().GetResult();
+                Check(data.Kind == FilePreviewKind.MetadataCard, $"Expected MetadataCard, got {data.Kind}");
+                Check(data.CanOpenWithDefaultApp);
+                Check(data.MetadataRows.Any(r => r.Label == "路径" && r.Value == binPath));
             });
         }
 

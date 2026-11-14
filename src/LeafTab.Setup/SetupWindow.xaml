@@ -256,7 +256,7 @@
                                 Padding="7,2"
                                 Margin="9,2,0,0"
                                 VerticalAlignment="Center">
-                            <TextBlock Text="v0.6.1 · x64"
+                            <TextBlock Text="v0.6.2 · x64"
                                        FontSize="11.5"
                                        FontWeight="SemiBold"
                                        Foreground="#15803D" />

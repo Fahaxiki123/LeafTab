@@ -285,7 +285,7 @@ namespace LeafTab.Services
                     if (notifyShell)
                         NotifyShellAssociationsChanged();
 
-                    return (true, "已设为默认资源管理器（全面接管文件夹、此电脑、任务栏入口与 Win+E；删除程序前请先在此取消勾选）");
+                    return (true, "已设为默认资源管理器（已接管文件夹、此电脑、任务栏入口与 Win+E；卸载软件时将自动恢复系统默认）");
                 }
                 else
                 {

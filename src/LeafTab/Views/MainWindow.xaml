@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         xmlns:controls="clr-namespace:LeafTab.Controls"
-        Title="LeafTab"
+        Title="此电脑"
         Width="1160"
         Height="740"
         MinWidth="720"
@@ -662,13 +662,14 @@
                             BorderThickness="1"
                             CornerRadius="9.5"
                             Padding="7,0,5,0"
+                            MouseLeftButtonDown="BreadcrumbBlank_MouseLeftButtonDown"
                             MouseEnter="AddressBoxBorder_MouseEnter"
                             MouseLeave="AddressBoxBorder_MouseLeave">
                         <Grid>
                             <!-- Mode A: Interactive Breadcrumbs with Smooth Slide/Fade Transform -->
                             <Grid x:Name="BreadcrumbContainerGrid"
                                   Background="Transparent"
-                                  MouseLeftButtonDown="BreadcrumbBlank_MouseLeftButtonDown">
+                                  PreviewMouseLeftButtonDown="BreadcrumbBlank_MouseLeftButtonDown">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
@@ -694,11 +695,11 @@
                                 <!-- Dynamic Breadcrumb Nodes -->
                                 <ScrollViewer x:Name="BreadcrumbScrollViewer"
                                               Grid.Column="1"
+                                              Focusable="False"
                                               HorizontalScrollBarVisibility="Hidden"
                                               VerticalScrollBarVisibility="Disabled"
-                                              VerticalAlignment="Center"
-                                              Background="Transparent"
-                                              MouseLeftButtonDown="BreadcrumbBlank_MouseLeftButtonDown">
+                                              VerticalAlignment="Stretch"
+                                              Background="Transparent">
                                     <StackPanel x:Name="BreadcrumbItemsPanel"
                                                 Orientation="Horizontal"
                                                 VerticalAlignment="Center">
@@ -1141,10 +1142,260 @@
                 </Grid>
             </Border>
 
-            <!-- ==================== ROW 4: PURE OPAQUE #FFFFFF NATIVE FILE VIEW SURFACE ==================== -->
-            <Grid x:Name="BrowserStackGrid"
+            <!-- ==================== ROW 4: NATIVE FILE VIEW + BUILT-IN LIGHTWEIGHT PREVIEW SIDEBAR ==================== -->
+            <Grid x:Name="ContentSurfaceGrid"
                   Grid.Row="4"
-                  Background="#FFFFFF" />
+                  Background="#FFFFFF">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition x:Name="BrowserPaneColumn" Width="*" MinWidth="320" />
+                    <ColumnDefinition x:Name="PreviewSplitterColumn" Width="0" />
+                    <ColumnDefinition x:Name="PreviewPaneColumn" Width="0" />
+                </Grid.ColumnDefinitions>
+
+                <Grid x:Name="BrowserStackGrid"
+                      Grid.Column="0"
+                      Background="#FFFFFF" />
+
+                <GridSplitter x:Name="PreviewGridSplitter"
+                              Grid.Column="1"
+                              Width="5"
+                              HorizontalAlignment="Stretch"
+                              VerticalAlignment="Stretch"
+                              ResizeDirection="Columns"
+                              ResizeBehavior="PreviousAndNext"
+                              Background="Transparent"
+                              Cursor="SizeWE"
+                              Visibility="Collapsed"
+                              DragCompleted="PreviewGridSplitter_DragCompleted" />
+
+                <Border x:Name="PreviewSidebarBorder"
+                        Grid.Column="2"
+                        Background="#FFFFFF"
+                        BorderBrush="#E2E8F0"
+                        BorderThickness="1,0,0,0"
+                        Visibility="Collapsed">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <!-- Preview Sidebar Header -->
+                        <Border Grid.Row="0"
+                                Background="#F8FAFC"
+                                BorderBrush="#E2E8F0"
+                                BorderThickness="0,0,0,1"
+                                Padding="12,8,8,8">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <Image x:Name="PreviewHeaderIcon"
+                                       Grid.Column="0"
+                                       Width="20" Height="20"
+                                       Margin="0,0,9,0"
+                                       VerticalAlignment="Center"
+                                       RenderOptions.BitmapScalingMode="HighQuality" />
+
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,6,0">
+                                    <TextBlock x:Name="PreviewHeaderTitle"
+                                               Text="预览"
+                                               FontSize="12.5"
+                                               FontWeight="SemiBold"
+                                               Foreground="#0F172A"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="PreviewHeaderSubtitle"
+                                               Text="选择一个项目查看预览"
+                                               FontSize="11"
+                                               Foreground="#64748B"
+                                               Margin="0,1,0,0"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+
+                                <Button x:Name="PreviewRawToggleButton"
+                                        Grid.Column="2"
+                                        Height="24"
+                                        Padding="8,0"
+                                        Margin="0,0,4,0"
+                                        FontSize="11.5"
+                                        Content="源码"
+                                        ToolTip="切换 Markdown 渲染 / 原始文本"
+                                        Style="{StaticResource GlassBreadcrumbSegmentButtonStyle}"
+                                        Visibility="Collapsed"
+                                        Click="PreviewRawToggleButton_Click" />
+
+                                <Button x:Name="PreviewCloseButton"
+                                        Grid.Column="3"
+                                        Width="24" Height="24"
+                                        Padding="0"
+                                        ToolTip="关闭预览窗格"
+                                        Style="{StaticResource GlassBreadcrumbSegmentButtonStyle}"
+                                        Click="PreviewCloseButton_Click">
+                                    <Path Width="9" Height="9" Stretch="Uniform"
+                                          Stroke="#475569" StrokeThickness="1.5"
+                                          StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                          Data="M1,1 L8,8 M8,1 L1,8" />
+                                </Button>
+                            </Grid>
+                        </Border>
+
+                        <!-- Optional Notice / Truncation Banner -->
+                        <Border x:Name="PreviewNoticeBanner"
+                                Grid.Row="1"
+                                Background="#FFFBEB"
+                                BorderBrush="#FDE68A"
+                                BorderThickness="0,0,0,1"
+                                Padding="12,5"
+                                Visibility="Collapsed">
+                            <TextBlock x:Name="PreviewNoticeText"
+                                       Text=""
+                                       FontSize="11"
+                                       Foreground="#92400E"
+                                       TextWrapping="Wrap" />
+                        </Border>
+
+                        <!-- Preview Content Host -->
+                        <Grid Grid.Row="2" Background="#FFFFFF">
+                            <!-- Empty / Multi-Selection State -->
+                            <StackPanel x:Name="PreviewEmptyPanel"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center"
+                                        Margin="24">
+                                <Border Width="44" Height="44"
+                                        CornerRadius="12"
+                                        Background="#F1F5F9"
+                                        HorizontalAlignment="Center"
+                                        Margin="0,0,0,12">
+                                    <Path Width="20" Height="16" Stretch="Uniform"
+                                          Stroke="#64748B" StrokeThickness="1.5" StrokeLineJoin="Round"
+                                          Data="M1.5,2.5 A1.5,1.5 0 0 1 3,1 H15 A1.5,1.5 0 0 1 16.5,2.5 V11.5 A1.5,1.5 0 0 1 15,13 H3 A1.5,1.5 0 0 1 1.5,11.5 Z M11.5,1 V13" />
+                                </Border>
+                                <TextBlock x:Name="PreviewEmptyText"
+                                           Text="选择一个文件以预览内容"
+                                           FontSize="12.5"
+                                           Foreground="#64748B"
+                                           TextAlignment="Center"
+                                           TextWrapping="Wrap" />
+                            </StackPanel>
+
+                            <!-- Rich Markdown FlowDocument View -->
+                            <FlowDocumentScrollViewer x:Name="PreviewDocumentViewer"
+                                                      IsToolBarVisible="False"
+                                                      IsSelectionEnabled="True"
+                                                      VerticalScrollBarVisibility="Auto"
+                                                      HorizontalScrollBarVisibility="Disabled"
+                                                      Background="#FFFFFF"
+                                                      Visibility="Collapsed" />
+
+                            <!-- Plain Text / Code / Raw Markdown View -->
+                            <TextBox x:Name="PreviewTextBox"
+                                     IsReadOnly="True"
+                                     IsReadOnlyCaretVisible="False"
+                                     BorderThickness="0"
+                                     Background="#FFFFFF"
+                                     Foreground="#1E293B"
+                                     FontFamily="Cascadia Mono, Consolas, Microsoft YaHei UI"
+                                     FontSize="12.5"
+                                     Padding="14,12"
+                                     TextWrapping="Wrap"
+                                     AcceptsReturn="True"
+                                     VerticalScrollBarVisibility="Auto"
+                                     HorizontalScrollBarVisibility="Disabled"
+                                     Visibility="Collapsed" />
+
+                            <!-- Image Preview Surface -->
+                            <Grid x:Name="PreviewImagePanel"
+                                  Background="#F8FAFC"
+                                  Visibility="Collapsed">
+                                <Border Margin="14"
+                                        Padding="6"
+                                        CornerRadius="8"
+                                        Background="#FFFFFF"
+                                        BorderBrush="#E2E8F0"
+                                        BorderThickness="1"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center">
+                                    <Image x:Name="PreviewImageControl"
+                                           Stretch="Uniform"
+                                           RenderOptions.BitmapScalingMode="HighQuality" />
+                                </Border>
+                            </Grid>
+
+                            <!-- Metadata Card (Folders, Drives, Binaries, Office/PDF, etc.) -->
+                            <ScrollViewer x:Name="PreviewMetadataScroll"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled"
+                                          Visibility="Collapsed">
+                                <StackPanel Margin="18,22,18,20">
+                                    <Border Width="64" Height="64"
+                                            CornerRadius="14"
+                                            Background="#F8FAFC"
+                                            BorderBrush="#E2E8F0"
+                                            BorderThickness="1"
+                                            HorizontalAlignment="Center"
+                                            Margin="0,0,0,12">
+                                        <Image x:Name="PreviewCardIcon"
+                                               Width="44" Height="44"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center"
+                                               RenderOptions.BitmapScalingMode="HighQuality" />
+                                    </Border>
+
+                                    <TextBlock x:Name="PreviewCardTitle"
+                                               Text=""
+                                               FontSize="14"
+                                               FontWeight="SemiBold"
+                                               Foreground="#0F172A"
+                                               TextAlignment="Center"
+                                               TextWrapping="Wrap"
+                                               Margin="0,0,0,3" />
+                                    <TextBlock x:Name="PreviewCardType"
+                                               Text=""
+                                               FontSize="11.5"
+                                               Foreground="#64748B"
+                                               TextAlignment="Center"
+                                               TextWrapping="Wrap"
+                                               Margin="0,0,0,16" />
+
+                                    <Border Background="#F8FAFC"
+                                            BorderBrush="#E2E8F0"
+                                            BorderThickness="1"
+                                            CornerRadius="8"
+                                            Padding="12,10">
+                                        <StackPanel x:Name="PreviewMetadataRowsPanel" />
+                                    </Border>
+
+                                    <TextBlock x:Name="PreviewCardNote"
+                                               Text=""
+                                               FontSize="11.5"
+                                               Foreground="#64748B"
+                                               TextWrapping="Wrap"
+                                               Margin="2,12,2,0"
+                                               Visibility="Collapsed" />
+
+                                    <Button x:Name="PreviewOpenDefaultButton"
+                                            Content="用默认程序打开"
+                                            Height="32"
+                                            Margin="0,14,0,0"
+                                            Padding="14,0"
+                                            HorizontalAlignment="Center"
+                                            Background="#EEF5FF"
+                                            BorderBrush="#BFD8FA"
+                                            Foreground="#0062CC"
+                                            Style="{StaticResource GlassGhostCommandButtonStyle}"
+                                            Visibility="Collapsed"
+                                            Click="PreviewOpenDefaultButton_Click" />
+                                </StackPanel>
+                            </ScrollViewer>
+                        </Grid>
+                    </Grid>
+                </Border>
+            </Grid>
 
             <!-- ==================== ROW 5: CLOUD-MIST LIQUID GLASS FOOTER STATUS BAR ==================== -->
             <Border x:Name="BottomStatusBar"

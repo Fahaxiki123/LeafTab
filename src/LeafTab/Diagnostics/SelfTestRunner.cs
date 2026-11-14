@@ -53,7 +53,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab v0.6.1 Native Regression Diagnostics");
+                log.AppendLine("# LeafTab v0.6.2 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -69,7 +69,8 @@ namespace LeafTab.Diagnostics
                 {
                     await WaitForDirectUiAsync(tab1.BrowserHost, 2500);
                     List<string> thisPcItems = tab1.BrowserHost.GetDisplayedItemNames(30);
-                    log.AppendLine($"- [此电脑] Title='{tab1.Title}', ItemCount={thisPcItems.Count}, Items=[{string.Join(", ", thisPcItems)}]");
+                    log.AppendLine($"- [此电脑] Title='{tab1.Title}', WindowTitle='{window.Title}', ItemCount={thisPcItems.Count}, Items=[{string.Join(", ", thisPcItems)}]");
+                    AssertCheck(string.Equals(window.Title, "此电脑", StringComparison.Ordinal), "ThisPcWindowTitle");
 
                     await ProbeThisPcGesturesAsync(tab1.BrowserHost, log);
                 }
@@ -89,6 +90,102 @@ namespace LeafTab.Diagnostics
 
                 if (window.SelectedTab != null)
                 {
+                    bool titleMatchesFolderOnly = string.Equals(window.Title, window.SelectedTab.Title, StringComparison.Ordinal) &&
+                                                  !window.Title.EndsWith(" - LeafTab", StringComparison.OrdinalIgnoreCase);
+                    log.AppendLine($"- WindowTitleMatchesFolderOnly: WindowTitle='{window.Title}', TabTitle='{window.SelectedTab.Title}', Matched={titleMatchesFolderOnly}");
+                    AssertCheck(titleMatchesFolderOnly, "WindowTitleMatchesFolderOnly");
+
+                    var crumbScroll = (ScrollViewer)window.FindName("BreadcrumbScrollViewer");
+                    var addrEditGrid = (Grid)window.FindName("AddressEditGrid");
+                    var addrTextBox = (TextBox)window.FindName("AddressTextBox");
+                    window.ExitAddressEditMode();
+                    var previewEvt = new System.Windows.Input.MouseButtonEventArgs(
+                        System.Windows.Input.Mouse.PrimaryDevice,
+                        Environment.TickCount,
+                        System.Windows.Input.MouseButton.Left)
+                    {
+                        RoutedEvent = System.Windows.Input.Mouse.PreviewMouseDownEvent,
+                        Source = crumbScroll
+                    };
+                    crumbScroll.RaiseEvent(previewEvt);
+                    if (!previewEvt.Handled)
+                    {
+                        var bubbleEvt = new System.Windows.Input.MouseButtonEventArgs(
+                            System.Windows.Input.Mouse.PrimaryDevice,
+                            Environment.TickCount,
+                            System.Windows.Input.MouseButton.Left)
+                        {
+                            RoutedEvent = System.Windows.Input.Mouse.MouseDownEvent,
+                            Source = crumbScroll
+                        };
+                        crumbScroll.RaiseEvent(bubbleEvt);
+                    }
+                    bool addressSelectedOnBlankClick = addrEditGrid.Visibility == Visibility.Visible &&
+                                                       string.Equals(addrTextBox.SelectedText, window.SelectedTab.AddressText, StringComparison.Ordinal) &&
+                                                       !string.IsNullOrEmpty(addrTextBox.SelectedText);
+                    window.ExitAddressEditMode();
+                    log.AppendLine($"- AddressBarBlankClickSelectsAll: Handled={previewEvt.Handled}, SelectedText='{addrTextBox.SelectedText}', Matched={addressSelectedOnBlankClick}");
+                    AssertCheck(addressSelectedOnBlankClick, "AddressBarBlankClickSelectsAll");
+
+                    // Verify toggling built-in WPF preview sidebar on the same open folder resizes SHELLDLL_DefView, renders selected file content, and keeps selection
+                    string? previewTarget = File.Exists(Path.Combine(projectDir, "README.md"))
+                        ? "README.md"
+                        : (File.Exists(Path.Combine(projectDir, "LeafTab.sln")) ? "LeafTab.sln" : null);
+                    string expectedPreviewKind = string.Equals(previewTarget, "README.md", StringComparison.OrdinalIgnoreCase)
+                        ? "Markdown"
+                        : "Text";
+                    if (previewTarget != null)
+                    {
+                        await window.SelectedTab.BrowserHost.SelectChildItemWhenReadyAsync(previewTarget);
+                    }
+                    for (int wait = 0; wait < 20 && window.SelectedTab.BrowserHost.GetShellViewWidthPx() <= 300; wait++)
+                    {
+                        await Task.Delay(50);
+                    }
+                    int widthBefore = window.SelectedTab.BrowserHost.GetShellViewWidthPx();
+
+                    window.TogglePreviewPane();
+                    for (int wait = 0; wait < 50; wait++)
+                    {
+                        int curW = window.SelectedTab.BrowserHost.GetShellViewWidthPx();
+                        if (window.IsPreviewPaneOpen &&
+                            window.SelectedTab.BrowserHost.DirectUiHwnd != IntPtr.Zero &&
+                            curW > 100 &&
+                            curW <= widthBefore - 150 &&
+                            (previewTarget == null || string.Equals(window.CurrentPreviewKindName, expectedPreviewKind, StringComparison.Ordinal)))
+                        {
+                            break;
+                        }
+                        await Task.Delay(50);
+                    }
+                    int widthWithPreview = window.SelectedTab.BrowserHost.GetShellViewWidthPx();
+                    string renderedKind = window.CurrentPreviewKindName;
+                    bool contentRenderedOk = previewTarget == null || string.Equals(renderedKind, expectedPreviewKind, StringComparison.Ordinal);
+                    bool keptSelection = previewTarget == null ||
+                                         window.SelectedTab.BrowserHost.GetSelectedPaths().Any(p => p.EndsWith(previewTarget, StringComparison.OrdinalIgnoreCase));
+
+                    window.TogglePreviewPane();
+                    for (int wait = 0; wait < 40; wait++)
+                    {
+                        int curW = window.SelectedTab.BrowserHost.GetShellViewWidthPx();
+                        if (!window.IsPreviewPaneOpen &&
+                            window.SelectedTab.BrowserHost.DirectUiHwnd != IntPtr.Zero &&
+                            Math.Abs(curW - widthBefore) <= 8)
+                        {
+                            break;
+                        }
+                        await Task.Delay(50);
+                    }
+                    int widthAfterOff = window.SelectedTab.BrowserHost.GetShellViewWidthPx();
+                    bool previewToggleOk = widthBefore > 300 &&
+                                           widthWithPreview > 100 &&
+                                           (widthBefore - widthWithPreview) >= 150 &&
+                                           Math.Abs(widthAfterOff - widthBefore) <= 8 &&
+                                           contentRenderedOk &&
+                                           keptSelection;
+                    log.AppendLine($"- PreviewPaneToggleSameFolder: Target='{previewTarget}', Kind='{renderedKind}' (Expected='{expectedPreviewKind}'), WidthBefore={widthBefore}, WidthOn={widthWithPreview}, WidthOff={widthAfterOff}, KeptSelection={keptSelection}");
+                    AssertCheck(previewToggleOk, "PreviewPaneToggleSameFolder");
+
                     var crumbs = PidlManager.BuildBreadcrumbChain(window.SelectedTab.CurrentPidl);
                     string crumbText = string.Join(" > ", crumbs.Select(c => c.Title));
                     log.AppendLine($"- BreadcrumbChain: [{crumbText}] (Count={crumbs.Count})");
