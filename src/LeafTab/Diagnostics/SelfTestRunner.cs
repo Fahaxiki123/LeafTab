@@ -53,7 +53,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab v0.6.2 Native Regression Diagnostics");
+                log.AppendLine("# LeafTab v0.6.3 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -64,10 +64,14 @@ namespace LeafTab.Diagnostics
                 // ==================== 1. SPECIAL & VIRTUAL FOLDERS ====================
                 log.AppendLine("## 1. Folder & Namespace Navigation Checks");
 
+                ResourceSnapshot? coldStartupSnapshot = null;
                 ExplorerTabItem? tab1 = window.SelectedTab;
                 if (tab1 != null)
                 {
                     await WaitForDirectUiAsync(tab1.BrowserHost, 2500);
+                    coldStartupSnapshot = CaptureSnapshot("冷启动首屏纯净基准 (1 个标签 · 此电脑，零操作前)", window.Tabs.Count);
+                    log.AppendLine($"- [冷启动首屏资源基准] Tabs={coldStartupSnapshot.TabCount}, WorkingSet={coldStartupSnapshot.WorkingSetMb:F1} MB, PrivateBytes={coldStartupSnapshot.PrivateBytesMb:F1} MB, GDI={coldStartupSnapshot.GdiObjects}, USER={coldStartupSnapshot.UserObjects}");
+
                     List<string> thisPcItems = tab1.BrowserHost.GetDisplayedItemNames(30);
                     log.AppendLine($"- [此电脑] Title='{tab1.Title}', WindowTitle='{window.Title}', ItemCount={thisPcItems.Count}, Items=[{string.Join(", ", thisPcItems)}]");
                     AssertCheck(string.Equals(window.Title, "此电脑", StringComparison.Ordinal), "ThisPcWindowTitle");
@@ -186,6 +190,69 @@ namespace LeafTab.Diagnostics
                     log.AppendLine($"- PreviewPaneToggleSameFolder: Target='{previewTarget}', Kind='{renderedKind}' (Expected='{expectedPreviewKind}'), WidthBefore={widthBefore}, WidthOn={widthWithPreview}, WidthOff={widthAfterOff}, KeptSelection={keptSelection}");
                     AssertCheck(previewToggleOk, "PreviewPaneToggleSameFolder");
 
+                    // Verify clicking toolbar RefreshButton reloads preview content after selected file changes on disk
+                    string refreshProbeDir = Path.Combine(Path.GetTempPath(), $"leaftab_selftest_refresh_{Guid.NewGuid():N}");
+                    Directory.CreateDirectory(refreshProbeDir);
+                    string refreshProbeFile = Path.Combine(refreshProbeDir, "refresh_probe.md");
+                    File.WriteAllText(refreshProbeFile, "# 初版标题\n初始预览内容_V1", new UTF8Encoding(false));
+                    (IntPtr refreshDirPidl, _) = await PidlManager.TryParseAddressAsync(refreshProbeDir, CancellationToken.None);
+                    ExplorerTabItem? refreshProbeTab = null;
+                    try
+                    {
+                        if (refreshDirPidl != IntPtr.Zero)
+                        {
+                            refreshProbeTab = window.AddNewTab(refreshDirPidl, activate: true);
+                            await WaitForDirectUiAsync(refreshProbeTab.BrowserHost, 2000);
+                            await refreshProbeTab.BrowserHost.SelectChildItemWhenReadyAsync("refresh_probe.md");
+
+                            window.TogglePreviewPane();
+                            bool sawInitialContent = false;
+                            for (int wait = 0; wait < 40; wait++)
+                            {
+                                if (window.CurrentPreviewTextContent.Contains("初始预览内容_V1"))
+                                {
+                                    sawInitialContent = true;
+                                    break;
+                                }
+                                await Task.Delay(50);
+                            }
+
+                            File.WriteAllText(refreshProbeFile, "# 刷新后标题\n更新后预览内容_V2", new UTF8Encoding(false));
+                            var toolbarRefreshBtn = (Button)window.FindName("RefreshButton");
+                            toolbarRefreshBtn.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+
+                            bool sawUpdatedContent = false;
+                            for (int wait = 0; wait < 45; wait++)
+                            {
+                                if (window.CurrentPreviewTextContent.Contains("更新后预览内容_V2"))
+                                {
+                                    sawUpdatedContent = true;
+                                    break;
+                                }
+                                await Task.Delay(50);
+                            }
+
+                            if (window.IsPreviewPaneOpen)
+                                window.TogglePreviewPane();
+
+                            log.AppendLine($"- ToolbarRefreshUpdatesPreviewPane: InitialLoaded={sawInitialContent}, UpdatedAfterToolbarClick={sawUpdatedContent}");
+                            AssertCheck(sawInitialContent && sawUpdatedContent, "ToolbarRefreshUpdatesPreviewPane");
+                        }
+                        else
+                        {
+                            AssertCheck(false, "ToolbarRefreshUpdatesPreviewPane");
+                        }
+                    }
+                    finally
+                    {
+                        PidlManager.Free(ref refreshDirPidl);
+                        if (window.IsPreviewPaneOpen)
+                            window.TogglePreviewPane();
+                        if (refreshProbeTab != null && window.Tabs.Count > 1)
+                            window.CloseTab(refreshProbeTab);
+                        try { Directory.Delete(refreshProbeDir, recursive: true); } catch { }
+                    }
+
                     var crumbs = PidlManager.BuildBreadcrumbChain(window.SelectedTab.CurrentPidl);
                     string crumbText = string.Join(" > ", crumbs.Select(c => c.Title));
                     log.AppendLine($"- BreadcrumbChain: [{crumbText}] (Count={crumbs.Count})");
@@ -200,7 +267,7 @@ namespace LeafTab.Diagnostics
                     log.AppendLine($"- HistoryStack Back/Forward: CanBackBefore={canBackBefore}, CanFwdAfterBack={canFwdAfterBack}, RestoredTitle='{window.SelectedTab.Title}'");
                     AssertCheck(canBackBefore && canFwdAfterBack, "HistoryBackForward");
 
-                    // Async directory search into IResultsFolder
+                    // Async directory search into IResultsFolder + FolderPath column check
                     var searchSw = Stopwatch.StartNew();
                     int foundCs = await window.SelectedTab.BrowserHost.StartSearchAsync(
                         "*.cs",
@@ -208,11 +275,92 @@ namespace LeafTab.Diagnostics
                         window.SelectedTab.FileSystemPath);
                     searchSw.Stop();
                     bool inSearch = window.SelectedTab.BrowserHost.IsShowingSearchResults;
+                    bool hasFolderPathCol = false;
+                    for (int w = 0; w < 12; w++)
+                    {
+                        hasFolderPathCol = window.SelectedTab.BrowserHost.IsSearchFolderPathColumnVisible();
+                        if (hasFolderPathCol) break;
+                        await Task.Delay(40);
+                    }
+                    SearchBackendKind fsBackend = window.SelectedTab.BrowserHost.LastSearchBackend;
+                    long fsBackendMs = window.SelectedTab.BrowserHost.LastSearchElapsedMs;
                     List<string> searchSample = window.SelectedTab.BrowserHost.GetDisplayedItemNames(5);
                     window.SelectedTab.BrowserHost.ExitSearchMode();
                     await Task.Delay(150);
-                    log.AppendLine($"- AsyncSearch '*.cs': MatchedCount={foundCs}, Elapsed={searchSw.ElapsedMilliseconds}ms, EnteredSearchMode={inSearch}, ExitedCleanly={!window.SelectedTab.BrowserHost.IsShowingSearchResults}, Sample=[{string.Join(", ", searchSample)}]");
-                    AssertCheck(inSearch && !window.SelectedTab.BrowserHost.IsShowingSearchResults && (!Directory.Exists(Path.Combine(projectDir, "src", "LeafTab")) || foundCs > 0), "AsyncSearchResults");
+                    log.AppendLine($"- AsyncSearch '*.cs': MatchedCount={foundCs}, Backend={fsBackend}, BackendMs={fsBackendMs}ms, Elapsed={searchSw.ElapsedMilliseconds}ms, EnteredSearchMode={inSearch}, FolderPathColVisible={hasFolderPathCol}, ExitedCleanly={!window.SelectedTab.BrowserHost.IsShowingSearchResults}, Sample=[{string.Join(", ", searchSample)}]");
+                    AssertCheck(inSearch && hasFolderPathCol && !window.SelectedTab.BrowserHost.IsShowingSearchResults && (!Directory.Exists(Path.Combine(projectDir, "src", "LeafTab")) || foundCs > 0), "AsyncSearchResults");
+
+                    // Search filter syntax (ext:txt), LoadMore pagination, OpenItemLocation & Toolbar AutomationProperties.Name
+                    string searchUiDir = Path.Combine(Path.GetTempPath(), $"leaftab_selftest_searchui_{Guid.NewGuid():N}");
+                    string subLocA = Path.Combine(searchUiDir, "sub_alpha");
+                    string subLocB = Path.Combine(searchUiDir, "sub_beta");
+                    Directory.CreateDirectory(subLocA);
+                    Directory.CreateDirectory(subLocB);
+                    File.WriteAllText(Path.Combine(subLocA, "locate_me_alpha.txt"), "alpha");
+                    File.WriteAllText(Path.Combine(subLocB, "locate_me_beta.txt"), "beta");
+                    File.WriteAllText(Path.Combine(subLocB, "ignored_note.log"), "log");
+                    (IntPtr searchUiPidl, _) = await PidlManager.TryParseAddressAsync(searchUiDir, CancellationToken.None);
+                    ExplorerTabItem? searchUiTab = null;
+                    try
+                    {
+                        string backAutoName = System.Windows.Automation.AutomationProperties.GetName(window.BackButton);
+                        string moreAutoName = System.Windows.Automation.AutomationProperties.GetName(window.MoreMenuButton);
+                        bool a11yOk = !string.IsNullOrWhiteSpace(backAutoName) && !string.IsNullOrWhiteSpace(moreAutoName);
+
+                        bool loadMoreOk = false;
+                        bool openLocOk = false;
+                        if (searchUiPidl != IntPtr.Zero)
+                        {
+                            searchUiTab = window.AddNewTab(searchUiPidl, activate: true);
+                            await WaitForDirectUiAsync(searchUiTab.BrowserHost, 2000);
+
+                            int initialCapped = await searchUiTab.BrowserHost.StartSearchAsync("ext:txt", searchUiTab.CurrentPidl, searchUiDir, maxResults: 1);
+                            bool wasTruncated = searchUiTab.BrowserHost.IsSearchTruncated && searchUiTab.BrowserHost.CanLoadMoreSearchResults;
+                            int expandedCount = await window.LoadMoreSearchResultsInSelectedTabAsync();
+                            loadMoreOk = initialCapped == 1 && wasTruncated && expandedCount == 2 && !searchUiTab.BrowserHost.IsSearchTruncated;
+
+                            bool selectedInSearch = await searchUiTab.BrowserHost.SelectChildItemWhenReadyAsync("locate_me_alpha.txt");
+                            bool openedParent = selectedInSearch && await window.OpenSelectedSearchItemLocationAsync();
+                            ExplorerTabItem? parentTab = window.SelectedTab;
+                            bool selectedInParent = parentTab != null &&
+                                !ReferenceEquals(parentTab, searchUiTab) &&
+                                (parentTab.FileSystemPath?.EndsWith("sub_alpha", StringComparison.OrdinalIgnoreCase) ?? false) &&
+                                parentTab.BrowserHost.GetSelectedPaths().Any(p => p.EndsWith("locate_me_alpha.txt", StringComparison.OrdinalIgnoreCase));
+                            openLocOk = openedParent && selectedInParent;
+
+                            if (parentTab != null && !ReferenceEquals(parentTab, searchUiTab) && window.Tabs.Count > 1)
+                            {
+                                window.CloseTab(parentTab);
+                            }
+                        }
+
+                        log.AppendLine($"- SearchLoadMoreAndOpenLocation: LoadMoreOk={loadMoreOk}, OpenItemLocationOk={openLocOk}, ToolbarA11yOk={a11yOk}");
+                        AssertCheck(loadMoreOk && openLocOk && a11yOk, "SearchLoadMoreAndOpenLocation");
+                    }
+                    finally
+                    {
+                        PidlManager.Free(ref searchUiPidl);
+                        if (searchUiTab != null && window.Tabs.Contains(searchUiTab) && window.Tabs.Count > 1)
+                        {
+                            window.CloseTab(searchUiTab);
+                        }
+                        try { Directory.Delete(searchUiDir, recursive: true); } catch { }
+                    }
+
+                    // Async search from '此电脑' (virtual root -> drive letters + file results)
+                    ExplorerTabItem thisPcSearchTab = window.OpenNewThisPcTab();
+                    await WaitForDirectUiAsync(thisPcSearchTab.BrowserHost, 1500);
+                    var pcSearchSw = Stopwatch.StartNew();
+                    int pcFound = await thisPcSearchTab.BrowserHost.StartSearchAsync(
+                        "C:",
+                        thisPcSearchTab.CurrentPidl,
+                        thisPcSearchTab.FileSystemPath);
+                    pcSearchSw.Stop();
+                    bool pcInSearch = thisPcSearchTab.BrowserHost.IsShowingSearchResults;
+                    bool pcExited = thisPcSearchTab.BrowserHost.ExitSearchMode();
+                    window.CloseTab(thisPcSearchTab);
+                    log.AppendLine($"- ThisPcAsyncSearch 'C:': MatchedCount={pcFound}, Elapsed={pcSearchSw.ElapsedMilliseconds}ms, EnteredSearchMode={pcInSearch}, Exited={pcExited}");
+                    AssertCheck(pcInSearch && pcExited && pcFound > 0, "ThisPcAsyncSearchResults");
 
                     // Reopen closed tab (Ctrl+Shift+T)
                     (IntPtr dlPidl, _) = await PidlManager.TryParseAddressAsync("下载", CancellationToken.None);
@@ -603,10 +751,12 @@ namespace LeafTab.Diagnostics
                 await Task.Delay(500);
                 ForceGcAndPump();
 
-                var snapshots = new List<ResourceSnapshot>
+                var snapshots = new List<ResourceSnapshot>();
+                if (coldStartupSnapshot != null)
                 {
-                    CaptureSnapshot("1 个标签 (此电脑)", window.Tabs.Count)
-                };
+                    snapshots.Add(coldStartupSnapshot);
+                }
+                snapshots.Add(CaptureSnapshot("自检前序操作后回落 1 个标签 (此电脑)", window.Tabs.Count));
 
                 var candidateFolders = new List<string>
                 {

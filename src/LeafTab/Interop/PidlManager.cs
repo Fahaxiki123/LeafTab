@@ -50,6 +50,25 @@ namespace LeafTab.Interop
         public static IntPtr CreateDesktopPidl() =>
             CreateKnownFolderPidl(NativeMethods.FOLDERID_Desktop);
 
+        public static bool IsThisPcPidl(IntPtr pidl)
+        {
+            if (pidl == IntPtr.Zero)
+                return false;
+
+            IntPtr thisPc = CreateThisPcPidl();
+            if (thisPc == IntPtr.Zero)
+                return false;
+
+            try
+            {
+                return AreEqual(pidl, thisPc);
+            }
+            finally
+            {
+                Free(ref thisPc);
+            }
+        }
+
         public static IntPtr Clone(IntPtr pidl) =>
             pidl == IntPtr.Zero ? IntPtr.Zero : NativeMethods.ILClone(pidl);
 
@@ -309,7 +328,11 @@ namespace LeafTab.Interop
                                input[1] == ':' &&
                                (input.Length == 2 || (input.Length == 3 && (input[2] == '\\' || input[2] == '/')));
 
+            bool isRemoteUnc = input.StartsWith(@"\\", StringComparison.Ordinal) &&
+                               !input.StartsWith(@"\\wsl", StringComparison.OrdinalIgnoreCase);
+
             bool perInstanceIcon = !isDirectory &&
+                                   !isRemoteUnc &&
                                    (string.Equals(ext, ".exe", StringComparison.OrdinalIgnoreCase) ||
                                     string.Equals(ext, ".ico", StringComparison.OrdinalIgnoreCase) ||
                                     string.Equals(ext, ".lnk", StringComparison.OrdinalIgnoreCase) ||
@@ -878,6 +901,133 @@ namespace LeafTab.Interop
             }
 
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Uses an OLE IBindCtx populated with STR_FILE_SYS_BIND_DATA (IFileSystemBindData) so
+        /// SHParseDisplayName constructs file/folder PIDLs from already-known metadata without
+        /// issuing synchronous disk stat syscalls on the STA UI thread. Not thread-safe across
+        /// concurrent callers; create one instance per worker task and Dispose when finished.
+        /// </summary>
+        internal sealed class FastPidlBinder : IDisposable
+        {
+            [ComVisible(true)]
+            private sealed class ManagedFileSystemBindData : IFileSystemBindData
+            {
+                private WIN32_FIND_DATAW _data;
+
+                public void SetData(in WIN32_FIND_DATAW data) => _data = data;
+
+                public int SetFindData(ref WIN32_FIND_DATAW pfd)
+                {
+                    _data = pfd;
+                    return ShellConstants.S_OK;
+                }
+
+                public int GetFindData(out WIN32_FIND_DATAW pfd)
+                {
+                    pfd = _data;
+                    return ShellConstants.S_OK;
+                }
+            }
+
+            private readonly ManagedFileSystemBindData _fsData = new ManagedFileSystemBindData();
+            private System.Runtime.InteropServices.ComTypes.IBindCtx? _bindCtx;
+            private IntPtr _bindCtxPtr;
+            private bool _disposed;
+
+            public FastPidlBinder()
+            {
+                if (NativeMethods.CreateBindCtx(0, out System.Runtime.InteropServices.ComTypes.IBindCtx? ctx) == ShellConstants.S_OK && ctx != null)
+                {
+                    try
+                    {
+                        ctx.RegisterObjectParam(ShellConstants.STR_FILE_SYS_BIND_DATA, _fsData);
+                        _bindCtxPtr = Marshal.GetIUnknownForObject(ctx);
+                        _bindCtx = ctx;
+                    }
+                    catch
+                    {
+                        try { Marshal.ReleaseComObject(ctx); } catch { }
+                        if (_bindCtxPtr != IntPtr.Zero)
+                        {
+                            Marshal.Release(_bindCtxPtr);
+                            _bindCtxPtr = IntPtr.Zero;
+                        }
+                        _bindCtx = null;
+                    }
+                }
+            }
+
+            public IntPtr CreatePidlFromMetadata(
+                string fullPath,
+                uint fileAttributes,
+                ulong fileSize,
+                System.Runtime.InteropServices.ComTypes.FILETIME lastWriteTime)
+            {
+                if (_disposed || string.IsNullOrWhiteSpace(fullPath))
+                    return IntPtr.Zero;
+
+                string trimmed = fullPath.TrimEnd('\\');
+                int sep = trimmed.LastIndexOf('\\');
+                string fileName = sep >= 0 ? trimmed.Substring(sep + 1) : trimmed;
+
+                // Drive roots (e.g. "C:") or long filenames >255 chars fall back directly
+                if (_bindCtxPtr == IntPtr.Zero ||
+                    string.IsNullOrEmpty(fileName) ||
+                    (fileName.Length == 2 && fileName[1] == ':') ||
+                    fileName.Length > 255)
+                {
+                    return NativeMethods.SHParseDisplayName(fullPath, IntPtr.Zero, out IntPtr directPidl, 0, out _) == ShellConstants.S_OK
+                        ? directPidl
+                        : IntPtr.Zero;
+                }
+
+                var fd = new WIN32_FIND_DATAW
+                {
+                    dwFileAttributes = fileAttributes != 0 ? fileAttributes : NativeMethods.FILE_ATTRIBUTE_NORMAL,
+                    ftCreationTime = lastWriteTime,
+                    ftLastAccessTime = lastWriteTime,
+                    ftLastWriteTime = lastWriteTime,
+                    nFileSizeHigh = (uint)(fileSize >> 32),
+                    nFileSizeLow = (uint)(fileSize & 0xFFFFFFFFUL),
+                    dwReserved0 = 0,
+                    dwReserved1 = 0,
+                    cFileName = fileName,
+                    cAlternateFileName = string.Empty
+                };
+
+                _fsData.SetData(in fd);
+
+                if (NativeMethods.SHParseDisplayName(fullPath, _bindCtxPtr, out IntPtr pidl, 0, out _) == ShellConstants.S_OK &&
+                    pidl != IntPtr.Zero)
+                {
+                    return pidl;
+                }
+
+                return NativeMethods.SHParseDisplayName(fullPath, IntPtr.Zero, out IntPtr fallbackPidl, 0, out _) == ShellConstants.S_OK
+                    ? fallbackPidl
+                    : IntPtr.Zero;
+            }
+
+            public void Dispose()
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                if (_bindCtx != null)
+                {
+                    try { _bindCtx.RevokeObjectParam(ShellConstants.STR_FILE_SYS_BIND_DATA); } catch { }
+                    if (_bindCtxPtr != IntPtr.Zero)
+                    {
+                        Marshal.Release(_bindCtxPtr);
+                        _bindCtxPtr = IntPtr.Zero;
+                    }
+                    try { Marshal.ReleaseComObject(_bindCtx); } catch { }
+                    _bindCtx = null;
+                }
+            }
         }
     }
 }

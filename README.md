@@ -1,12 +1,22 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.2 内置文件预览与交互细节优化版**（2026-11-14）。
+当前最新版本：**v0.6.3 极速搜索增强、预览保护与工作区偏好完善版**（2026-11-15）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（`LeafTab-v0.6.2-Setup-x64.exe`，约 268 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（`LeafTab-v0.6.3-Setup-x64.exe`，326.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.3 更新内容
+
+- **原生搜索筛选语法、继续加载与搜索结果闭环增强**：
+  - 原生 Win32 扫描与内存缓存完整支持 `ext:`（如 `ext:txt`、`ext:cs;md`）、`size:`（如 `size:>4kb`、`size:100b..5mb`、`size:empty`）、`dm:` / `date:`（如 `dm:today`、`dm:2026`、`dm:2026-01-01..2026-12-31`）、`type:`（`doc` / `image` / `audio` / `video` / `archive` / `code` / `exe`）、`folder:` / `file:`、`path:`、`regex:` / `path:regex:`（默认匹配文件名，显式 `path:` 匹配相对路径，对齐 Everything 正则语义）及完整子句级 `|` 或运算（如 `size:>4kb | ext:txt`）；当未运行 Everything 且输入 `content:` 等仅索引支持的语法时，在状态栏与空视图给出明确中文提示；
+  - 搜索结果视图自动通过 `IColumnManager` 注入「所在文件夹」（`System.ItemFolderPathDisplay`）列并支持按所在文件夹排序；新增工具栏「打开所在位置」按钮、`Ctrl + Enter` 快捷键与 `⋯` 菜单项，一键在新标签页打开选中结果所在目录并高亮定位目标项目；搜索命中超过 400 项时，状态栏提供「继续加载更多」渐进扩容按钮（最高至 10,000 项）；
+  - 内存搜索缓存除目录级变更失效与 30 秒绝对 TTL 外，新增匹配项交付前 `GetFileAttributesExW` 实时元数据复核与首次跳过的隐藏子目录可见性跟踪，文件原地扩容、文件/文件夹隐藏与取消隐藏及删除均在缓存有效期内即时生效。
+- **Markdown 预览后台预解析与高密度表格/换行复杂度保护**：将 Markdown 结构解析下沉至后台线程，并对块节点数（320）、表格行数（120 行）、单元格数（800 格）及内联节点总数（2,400，含硬换行节点）设置严格复杂度上限；遇到数千行超密表格或数万行密集换行文档自动切换为零卡顿源码预览并提示原因，手动点击「渲染」亦严格执行节选截断与软换行合并，杜绝阻塞主线程。
+- **多窗口会话统一保存、偏好记忆、无障碍与后台静默容错**：`⋯` 菜单新增可选「启动时恢复上次打开的标签页」（默认关闭，多窗口「彻底退出」或系统注销前统一聚合保存全部窗口标签快照，避免单窗口依次关闭互相覆盖）、「打开诊断日志目录」与当前版本号展示；持久化记忆右侧预览侧栏拖拽宽度（`PreviewPaneWidthDip`）；为全套纯图标按钮补齐 `AutomationProperties.Name` 无障碍名称；统一接入全局未处理异常诊断日志，并在无可见窗口的后台热驻留态静默记录异常并重置预热宿主，避免悬空弹出模态警告框。
+- **前期审查修复归档**：包含 Everything IPC `QUERY2W` 连续翻页与单窗口并发协调、大图总像素与长图高度保护、工具栏刷新同步更新预览内容，以及安装器跨目录事务级完整回滚。
 
 ## 0.6.2 更新内容
 
@@ -31,9 +41,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.2`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.3`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.2-Setup-x64.exe`（约 268 KB）
+- **图形化一键安装包**：`LeafTab-v0.6.3-Setup-x64.exe`（326.5 KB / 334,336 字节）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -82,7 +92,8 @@
 | `Ctrl + Tab` / `Ctrl + Shift + Tab` / 标签栏滚轮 | 循环切换标签页 |
 | `Ctrl + L` / `Alt + D` / `F4` | 聚焦编辑路径（支持 `Tab` 逐级补全子目录与输入 `wt` / `cmd` / `powershell` / `code .`） |
 | `` Ctrl + ` `` | 在当前文件夹位置打开终端（优先 Windows Terminal，自动回退 PowerShell） |
-| `Ctrl + F` / `Ctrl + E` | 聚焦右侧异步目录搜索框 |
+| `Ctrl + F` / `Ctrl + E` | 聚焦右侧异步目录搜索框（原生支持 `ext:` / `size:` / `dm:` / `type:` / `folder:` / `path:` / `regex:` 与 `|` 组合筛选） |
+| `Ctrl + Enter`（搜索结果视图中） | 在新标签页打开选中搜索结果所在文件夹并自动高亮定位该文件 |
 | `Ctrl + D` | 将当前目录加入/移出书签栏 |
 | `Ctrl + Shift + B` | 显示 / 隐藏书签栏 |
 | `Ctrl + Shift + N` | 在当前目录原子新建文件夹并立即重命名 |
@@ -131,7 +142,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.2-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.3-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---

@@ -122,6 +122,60 @@ namespace LeafTab.Interop
 
     internal delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
 
+    // x64 natural alignment (24 bytes) — do NOT use Pack=1
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct COPYDATASTRUCT
+    {
+        public IntPtr dwData;
+        public int cbData;
+        public IntPtr lpData;
+    }
+
+    // Strict 592-byte Win32 layout (uses ComTypes.FILETIME so 4-byte alignment matches native SDK)
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct WIN32_FIND_DATAW
+    {
+        public uint dwFileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint dwReserved0;
+        public uint dwReserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string cFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+        public string cAlternateFileName;
+    }
+
+    internal enum FINDEX_INFO_LEVELS : int
+    {
+        FindExInfoStandard = 0,
+        FindExInfoBasic = 1
+    }
+
+    internal enum FINDEX_SEARCH_OPS : int
+    {
+        FindExSearchNameMatch = 0
+    }
+
+    internal enum GET_FILEEX_INFO_LEVELS : int
+    {
+        GetFileExInfoStandard = 0
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct WIN32_FILE_ATTRIBUTE_DATA
+    {
+        public uint dwFileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+    }
+
     internal static class NativeMethods
     {
         public const int WS_CHILD = 0x40000000;
@@ -164,6 +218,13 @@ namespace LeafTab.Interop
         public const uint WM_APPCOMMAND = 0x0319;
         public const uint WM_ERASEBKGND = 0x0014;
         public const uint WM_NCDESTROY = 0x0082;
+        public const uint WM_COPYDATA = 0x004A;
+        public const uint WM_CLOSE = 0x0010;
+        public const uint WM_QUIT = 0x0012;
+
+        public static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
+        public const uint SMTO_NORMAL = 0x0000;
+        public const uint SMTO_ABORTIFHUNG = 0x0002;
 
         public const int XBUTTON1 = 1;
         public const int XBUTTON2 = 2;
@@ -181,8 +242,14 @@ namespace LeafTab.Interop
 
         public const int WHITE_BRUSH = 0;
 
+        public const uint FILE_ATTRIBUTE_HIDDEN = 0x00000002;
+        public const uint FILE_ATTRIBUTE_SYSTEM = 0x00000004;
         public const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
         public const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+        public const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+        public const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
+        public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+        public const uint FIND_FIRST_EX_LARGE_FETCH = 0x00000002;
 
         public const uint SHGFI_LARGEICON = 0x000000000;
         public const uint SHGFI_ICON = 0x000000100;
@@ -501,6 +568,86 @@ namespace LeafTab.Interop
             int dwAttribute,
             ref int pvAttribute,
             int cbAttribute);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindWindowW(
+            [MarshalAs(UnmanagedType.LPWStr)] string? lpClassName,
+            [MarshalAs(UnmanagedType.LPWStr)] string? lpWindowName);
+
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeoutCopyDataW(
+            IntPtr hWnd,
+            uint Msg,
+            IntPtr wParam,
+            ref COPYDATASTRUCT lParam,
+            uint fuFlags,
+            uint uTimeout,
+            out IntPtr lpdwResult);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern int GetMessageW(
+            out NATIVE_MSG lpMsg,
+            IntPtr hWnd,
+            uint wMsgFilterMin,
+            uint wMsgFilterMax);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool TranslateMessage(ref NATIVE_MSG lpMsg);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr DispatchMessageW(ref NATIVE_MSG lpMsg);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnregisterClassW(
+            [MarshalAs(UnmanagedType.LPWStr)] string lpClassName,
+            IntPtr hInstance);
+
+        [DllImport("ole32.dll")]
+        public static extern int CreateBindCtx(
+            uint reserved,
+            [MarshalAs(UnmanagedType.Interface)] out System.Runtime.InteropServices.ComTypes.IBindCtx? ppbc);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindFirstFileExW(
+            string lpFileName,
+            FINDEX_INFO_LEVELS fInfoLevelId,
+            out WIN32_FIND_DATAW lpFindFileData,
+            FINDEX_SEARCH_OPS fSearchOp,
+            IntPtr lpSearchFilter,
+            uint dwAdditionalFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool FindNextFileW(
+            IntPtr hFindFile,
+            out WIN32_FIND_DATAW lpFindFileData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool FindClose(IntPtr hFindFile);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr FindWindowExW(
+            IntPtr hWndParent,
+            IntPtr hWndChildAfter,
+            [MarshalAs(UnmanagedType.LPWStr)] string? lpszClass,
+            [MarshalAs(UnmanagedType.LPWStr)] string? lpszWindow);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFileAttributesW(string lpFileName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileAttributesExW(
+            string lpFileName,
+            GET_FILEEX_INFO_LEVELS fInfoLevelId,
+            out WIN32_FILE_ATTRIBUTE_DATA lpFileInformation);
 
         public static POINT PointFromLParam(IntPtr lParam)
         {

@@ -112,10 +112,12 @@ namespace LeafTab.RegressionTests
             });
             RunProtocolAndPackagingTests();
             RunReviewRegressionTests();
+            RunSearchOptimizationTests();
         }
 
         static partial void RunProtocolAndPackagingTests();
         static partial void RunReviewRegressionTests();
+        static partial void RunSearchOptimizationTests();
 
         private static string MakeDirectory(string name)
         {

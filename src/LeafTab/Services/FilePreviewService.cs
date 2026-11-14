@@ -4,8 +4,6 @@ using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Documents;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using LeafTab.Interop;
@@ -34,6 +32,7 @@ namespace LeafTab.Services
         public string FilePath { get; set; } = string.Empty;
         public string Title { get; set; } = string.Empty;
         public string Subtitle { get; set; } = string.Empty;
+        public ImageSource? HeaderIcon { get; set; }
         public bool IsDirectory { get; set; }
         public string TextContent { get; set; } = string.Empty;
         public string EncodingName { get; set; } = string.Empty;
@@ -45,15 +44,27 @@ namespace LeafTab.Services
         public List<FilePreviewMetadataRow> MetadataRows { get; } = new List<FilePreviewMetadataRow>();
         public string StatusMessage { get; set; } = string.Empty;
         public bool CanOpenWithDefaultApp { get; set; }
+        public MarkdownParsedDocument? ParsedMarkdown { get; set; }
+        public bool MarkdownAutoRawFallback => ParsedMarkdown?.ExceedsComplexityBudget == true;
+        public string MarkdownComplexityNotice => ParsedMarkdown?.ComplexityNotice ?? string.Empty;
     }
 
-    internal static class FilePreviewService
+    internal static partial class FilePreviewService
     {
         public const int MaxTextPreviewBytes = 96 * 1024;
-        private const long MaxImagePreviewBytes = 32L * 1024 * 1024;
+        public const long MaxImagePreviewBytes = 32L * 1024 * 1024;
+        public const int MaxDecodedImageDimension = 1600;
+        public const long MaxImageTotalPixels = 64L * 1024 * 1024;
+        private const int MaxWpfTextureDimension = 16384;
         private const long MaxSniffableUnknownFileBytes = 8L * 1024 * 1024;
-        private const int MaxDecodedImageWidth = 1600;
         private const int MaxFolderChildProbeCount = 500;
+
+        private enum ImageLoadOutcome
+        {
+            Loaded,
+            ExceedsPixelLimit,
+            Failed
+        }
 
         private static readonly HashSet<string> MarkdownExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -97,33 +108,12 @@ namespace LeafTab.Services
             ".psd", ".ai", ".blend", ".fbx", ".db", ".sqlite", ".sqlite3", ".lnk"
         };
 
-        // Cached frozen brushes & fonts for fast FlowDocument construction on UI thread
-        private static readonly FontFamily BodyFont = new FontFamily("Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI");
-        private static readonly FontFamily MonoFont = new FontFamily("Cascadia Mono, Consolas, Microsoft YaHei UI");
-        private static readonly SolidColorBrush BodyBrush = CreateFrozenBrush(0x1E, 0x29, 0x3B);
-        private static readonly SolidColorBrush HeadingBrush = CreateFrozenBrush(0x0F, 0x17, 0x2A);
-        private static readonly SolidColorBrush MutedBrush = CreateFrozenBrush(0x64, 0x74, 0x8B);
-        private static readonly SolidColorBrush BorderBrush = CreateFrozenBrush(0xE2, 0xE8, 0xF0);
-        private static readonly SolidColorBrush SurfaceBrush = CreateFrozenBrush(0xF8, 0xFA, 0xFC);
-        private static readonly SolidColorBrush CodeInlineBgBrush = CreateFrozenBrush(0xF1, 0xF5, 0xF9);
-        private static readonly SolidColorBrush QuoteBorderBrush = CreateFrozenBrush(0x3B, 0x82, 0xF6);
-        private static readonly SolidColorBrush LinkBrush = CreateFrozenBrush(0x00, 0x62, 0xCC);
-        private static readonly SolidColorBrush TaskDoneBrush = CreateFrozenBrush(0x00, 0x7A, 0xFF);
-        private static readonly SolidColorBrush TableHeaderBorderBrush = CreateFrozenBrush(0xCB, 0xD5, 0xE1);
-
-        private static SolidColorBrush CreateFrozenBrush(byte r, byte g, byte b)
-        {
-            var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
-            brush.Freeze();
-            return brush;
-        }
-
         public static Task<FilePreviewData> LoadPreviewAsync(
             string? fullPath,
             string? displayName,
             bool isFolderHint,
-            string typeName,
-            CancellationToken cancellationToken)
+            string? typeName = null,
+            CancellationToken cancellationToken = default)
         {
             return Task.Run(() => LoadPreviewCore(fullPath, displayName, isFolderHint, typeName, cancellationToken), cancellationToken);
         }
@@ -132,9 +122,19 @@ namespace LeafTab.Services
             string? fullPath,
             string? displayName,
             bool isFolderHint,
-            string typeName,
+            string? typeName,
             CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            string iconKey = !string.IsNullOrWhiteSpace(fullPath) ? fullPath! : (displayName ?? string.Empty);
+            ImageSource? resolvedIcon = null;
+            string shellTypeName = string.Empty;
+            if (!string.IsNullOrWhiteSpace(iconKey))
+            {
+                (resolvedIcon, shellTypeName) = PidlManager.GetLargeIconAndTypeName(iconKey, isFolderHint);
+            }
+
             cancellationToken.ThrowIfCancellationRequested();
 
             string? leafName = string.IsNullOrWhiteSpace(fullPath)
@@ -159,24 +159,37 @@ namespace LeafTab.Services
 
             if (string.IsNullOrWhiteSpace(fullPath))
             {
-                return BuildVirtualItemCard(fallbackTitle, typeName);
+                string virtualType = !string.IsNullOrWhiteSpace(typeName)
+                    ? typeName!.Trim()
+                    : (!string.IsNullOrWhiteSpace(shellTypeName) ? shellTypeName : "系统命名空间项目");
+                FilePreviewData virtualCard = BuildVirtualItemCard(fallbackTitle, virtualType);
+                virtualCard.HeaderIcon = resolvedIcon;
+                return virtualCard;
             }
 
             string normalizedPath = fullPath!;
-            string resolvedType = string.IsNullOrWhiteSpace(typeName)
-                ? (isFolderHint ? "文件夹" : GetFallbackTypeName(normalizedPath))
-                : typeName.Trim();
+            string resolvedType = !string.IsNullOrWhiteSpace(typeName)
+                ? typeName!.Trim()
+                : (!string.IsNullOrWhiteSpace(shellTypeName)
+                    ? shellTypeName
+                    : (isFolderHint ? "文件夹" : GetFallbackTypeName(normalizedPath)));
+
+            FilePreviewData AttachIcon(FilePreviewData result)
+            {
+                result.HeaderIcon = resolvedIcon;
+                return result;
+            }
 
             try
             {
                 if (isFolderHint || Directory.Exists(normalizedPath))
                 {
-                    return BuildDirectoryCard(normalizedPath, fallbackTitle, resolvedType, cancellationToken);
+                    return AttachIcon(BuildDirectoryCard(normalizedPath, fallbackTitle, resolvedType, cancellationToken));
                 }
 
                 if (!File.Exists(normalizedPath))
                 {
-                    return new FilePreviewData
+                    return AttachIcon(new FilePreviewData
                     {
                         Kind = FilePreviewKind.MetadataCard,
                         FilePath = normalizedPath,
@@ -188,7 +201,7 @@ namespace LeafTab.Services
                             new FilePreviewMetadataRow { Label = "类型", Value = resolvedType },
                             new FilePreviewMetadataRow { Label = "路径", Value = normalizedPath }
                         }
-                    };
+                    });
                 }
 
                 var fi = new FileInfo(normalizedPath);
@@ -196,10 +209,21 @@ namespace LeafTab.Services
                 string ext = fi.Extension ?? string.Empty;
                 string fileName = fi.Name ?? fallbackTitle;
 
+                int oversizedPixelW = 0;
+                int oversizedPixelH = 0;
                 if (ImageExtensions.Contains(ext) && fileLength > 0 && fileLength <= MaxImagePreviewBytes)
                 {
-                    if (TryLoadImagePreview(normalizedPath, fallbackTitle, resolvedType, fi, out FilePreviewData? imageData))
-                        return imageData!;
+                    ImageLoadOutcome imgOutcome = TryLoadImagePreview(
+                        normalizedPath,
+                        fallbackTitle,
+                        resolvedType,
+                        fi,
+                        out FilePreviewData? imageData,
+                        out oversizedPixelW,
+                        out oversizedPixelH);
+
+                    if (imgOutcome == ImageLoadOutcome.Loaded && imageData != null)
+                        return AttachIcon(imageData);
                 }
 
                 bool isMarkdown = MarkdownExtensions.Contains(ext);
@@ -214,10 +238,10 @@ namespace LeafTab.Services
                 if (isTextExt || canSniff)
                 {
                     if (TryLoadTextPreview(normalizedPath, fallbackTitle, resolvedType, fi, isMarkdown, cancellationToken, out FilePreviewData? textData))
-                        return textData!;
+                        return AttachIcon(textData!);
                 }
 
-                return BuildFileMetadataCard(normalizedPath, fallbackTitle, resolvedType, fi);
+                return AttachIcon(BuildFileMetadataCard(normalizedPath, fallbackTitle, resolvedType, fi, oversizedPixelW, oversizedPixelH));
             }
             catch (OperationCanceledException)
             {
@@ -225,7 +249,7 @@ namespace LeafTab.Services
             }
             catch (UnauthorizedAccessException)
             {
-                return new FilePreviewData
+                return AttachIcon(new FilePreviewData
                 {
                     Kind = FilePreviewKind.MetadataCard,
                     FilePath = normalizedPath,
@@ -238,11 +262,11 @@ namespace LeafTab.Services
                         new FilePreviewMetadataRow { Label = "类型", Value = resolvedType },
                         new FilePreviewMetadataRow { Label = "路径", Value = normalizedPath }
                     }
-                };
+                });
             }
             catch (Exception ex)
             {
-                return new FilePreviewData
+                return AttachIcon(new FilePreviewData
                 {
                     Kind = FilePreviewKind.MetadataCard,
                     FilePath = normalizedPath,
@@ -255,7 +279,7 @@ namespace LeafTab.Services
                         new FilePreviewMetadataRow { Label = "类型", Value = resolvedType },
                         new FilePreviewMetadataRow { Label = "路径", Value = normalizedPath }
                     }
-                };
+                });
             }
         }
 
@@ -365,7 +389,6 @@ namespace LeafTab.Services
             }
             catch
             {
-                // Keep directory timestamps & path even if child enumeration fails
             }
 
             string containsText = accessDenied
@@ -389,23 +412,51 @@ namespace LeafTab.Services
             return data;
         }
 
-        private static FilePreviewData BuildFileMetadataCard(string filePath, string title, string typeName, FileInfo fi)
+        private static FilePreviewData BuildFileMetadataCard(
+            string filePath,
+            string title,
+            string typeName,
+            FileInfo fi,
+            int oversizedPixelW = 0,
+            int oversizedPixelH = 0)
         {
             string sizeText = PidlManager.FormatByteSize((ulong)Math.Max(0, fi.Length));
+            bool isImage = ImageExtensions.Contains(fi.Extension ?? string.Empty);
+
+            string statusMsg;
+            if (oversizedPixelW > 0 && oversizedPixelH > 0)
+            {
+                statusMsg = $"图片像素总量或尺寸过大（{oversizedPixelW} × {oversizedPixelH}），为避免占用过多内存已跳过缩略预览。";
+            }
+            else if (isImage && fi.Length > MaxImagePreviewBytes)
+            {
+                statusMsg = "图片体积超过 32 MB，为避免占用过多内存已跳过缩略预览。";
+            }
+            else
+            {
+                statusMsg = "此文件类型暂不支持文本或图像直出预览，可点击下方按钮使用系统默认程序打开。";
+            }
+
             var data = new FilePreviewData
             {
                 Kind = FilePreviewKind.MetadataCard,
                 FilePath = filePath,
                 Title = title,
-                Subtitle = $"{typeName} · {sizeText}",
+                Subtitle = (oversizedPixelW > 0 && oversizedPixelH > 0)
+                    ? $"{typeName} · {oversizedPixelW} × {oversizedPixelH} · {sizeText}"
+                    : $"{typeName} · {sizeText}",
                 TotalFileBytes = fi.Length,
+                ImagePixelWidth = oversizedPixelW,
+                ImagePixelHeight = oversizedPixelH,
                 CanOpenWithDefaultApp = true,
-                StatusMessage = ImageExtensions.Contains(fi.Extension ?? string.Empty) && fi.Length > MaxImagePreviewBytes
-                    ? "图片体积超过 32 MB，为避免占用过多内存已跳过缩略预览。"
-                    : "此文件类型暂不支持文本或图像直出预览，可点击下方按钮使用系统默认程序打开。"
+                StatusMessage = statusMsg
             };
 
             data.MetadataRows.Add(new FilePreviewMetadataRow { Label = "类型", Value = typeName });
+            if (oversizedPixelW > 0 && oversizedPixelH > 0)
+            {
+                data.MetadataRows.Add(new FilePreviewMetadataRow { Label = "尺寸", Value = $"{oversizedPixelW} × {oversizedPixelH}" });
+            }
             data.MetadataRows.Add(new FilePreviewMetadataRow { Label = "大小", Value = $"{sizeText} ({fi.Length:N0} 字节)" });
             data.MetadataRows.Add(new FilePreviewMetadataRow { Label = "修改时间", Value = fi.LastWriteTime.ToString("yyyy/MM/dd HH:mm:ss") });
             data.MetadataRows.Add(new FilePreviewMetadataRow { Label = "创建时间", Value = fi.CreationTime.ToString("yyyy/MM/dd HH:mm:ss") });
@@ -413,19 +464,24 @@ namespace LeafTab.Services
             return data;
         }
 
-        private static bool TryLoadImagePreview(
+        private static ImageLoadOutcome TryLoadImagePreview(
             string filePath,
             string title,
             string typeName,
             FileInfo fi,
-            out FilePreviewData? data)
+            out FilePreviewData? data,
+            out int rawPixelW,
+            out int rawPixelH)
         {
             data = null;
+            rawPixelW = 0;
+            rawPixelH = 0;
+
             byte[] bytes;
             using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             {
                 if (fs.Length <= 0 || fs.Length > MaxImagePreviewBytes)
-                    return false;
+                    return ImageLoadOutcome.Failed;
 
                 int len = (int)fs.Length;
                 bytes = new byte[len];
@@ -439,7 +495,7 @@ namespace LeafTab.Services
                 }
 
                 if (readTotal <= 0)
-                    return false;
+                    return ImageLoadOutcome.Failed;
 
                 if (readTotal != len)
                 {
@@ -447,91 +503,108 @@ namespace LeafTab.Services
                 }
             }
 
+            ImageLoadOutcome firstAttempt = TryDecodeBoundedImage(bytes, BitmapCreateOptions.None, out BitmapSource? bmp, out rawPixelW, out rawPixelH);
+            if (firstAttempt == ImageLoadOutcome.ExceedsPixelLimit)
+                return ImageLoadOutcome.ExceedsPixelLimit;
+
+            if (firstAttempt == ImageLoadOutcome.Failed)
+            {
+                ImageLoadOutcome fallbackAttempt = TryDecodeBoundedImage(bytes, BitmapCreateOptions.IgnoreColorProfile, out bmp, out rawPixelW, out rawPixelH);
+                if (fallbackAttempt != ImageLoadOutcome.Loaded || bmp == null)
+                    return fallbackAttempt;
+            }
+
+            if (bmp == null)
+                return ImageLoadOutcome.Failed;
+
+            string sizeText = PidlManager.FormatByteSize((ulong)fi.Length);
+            data = new FilePreviewData
+            {
+                Kind = FilePreviewKind.Image,
+                FilePath = filePath,
+                Title = title,
+                Subtitle = $"{typeName} · {rawPixelW} × {rawPixelH} · {sizeText}",
+                TotalFileBytes = fi.Length,
+                Image = bmp,
+                ImagePixelWidth = rawPixelW,
+                ImagePixelHeight = rawPixelH,
+                CanOpenWithDefaultApp = true
+            };
+            return ImageLoadOutcome.Loaded;
+        }
+
+        private static ImageLoadOutcome TryDecodeBoundedImage(
+            byte[] imageBytes,
+            BitmapCreateOptions createOptions,
+            out BitmapSource? bitmapResult,
+            out int pixelWidth,
+            out int pixelHeight)
+        {
+            bitmapResult = null;
+            pixelWidth = 0;
+            pixelHeight = 0;
+
             try
             {
-                (BitmapSource? bmp, int pixelW, int pixelH) = DecodeFrozenBitmap(bytes, BitmapCreateOptions.None);
-                if (bmp == null)
-                    return false;
-
-                string sizeText = PidlManager.FormatByteSize((ulong)fi.Length);
-                data = new FilePreviewData
+                using (var msDim = new MemoryStream(imageBytes, writable: false))
                 {
-                    Kind = FilePreviewKind.Image,
-                    FilePath = filePath,
-                    Title = title,
-                    Subtitle = $"{typeName} · {pixelW} × {pixelH} · {sizeText}",
-                    TotalFileBytes = fi.Length,
-                    Image = bmp,
-                    ImagePixelWidth = pixelW,
-                    ImagePixelHeight = pixelH,
-                    CanOpenWithDefaultApp = true
-                };
-                return true;
+                    // Inspect frame header metadata ONLY (BitmapCacheOption.None avoids decoding/caching full image buffer)
+                    BitmapDecoder decoder = BitmapDecoder.Create(msDim, createOptions, BitmapCacheOption.None);
+                    if (decoder.Frames.Count == 0)
+                        return ImageLoadOutcome.Failed;
+
+                    BitmapFrame frame = decoder.Frames[0];
+                    pixelWidth = frame.PixelWidth;
+                    pixelHeight = frame.PixelHeight;
+                    if (pixelWidth <= 0 || pixelHeight <= 0)
+                        return ImageLoadOutcome.Failed;
+                }
+
+                long totalPixels = (long)pixelWidth * pixelHeight;
+                if (totalPixels > MaxImageTotalPixels)
+                {
+                    return ImageLoadOutcome.ExceedsPixelLimit;
+                }
+
+                int majorAxis = Math.Max(pixelWidth, pixelHeight);
+                int minorAxis = Math.Min(pixelWidth, pixelHeight);
+
+                // Guard ultra-thin strips (>1600:1) exceeding WPF's 16384px texture bound where scaling majorAxis to 1600 would round minorAxis to 0
+                if (majorAxis > MaxWpfTextureDimension && (long)minorAxis * MaxDecodedImageDimension < majorAxis)
+                {
+                    return ImageLoadOutcome.ExceedsPixelLimit;
+                }
+
+                using (var msDecode = new MemoryStream(imageBytes, writable: false))
+                {
+                    var bitmap = new BitmapImage();
+                    bitmap.BeginInit();
+                    bitmap.CacheOption = BitmapCacheOption.OnLoad;
+                    bitmap.CreateOptions = createOptions;
+
+                    if (majorAxis > MaxDecodedImageDimension && (long)minorAxis * MaxDecodedImageDimension >= majorAxis)
+                    {
+                        if (pixelWidth >= pixelHeight)
+                        {
+                            bitmap.DecodePixelWidth = MaxDecodedImageDimension;
+                        }
+                        else
+                        {
+                            bitmap.DecodePixelHeight = MaxDecodedImageDimension;
+                        }
+                    }
+
+                    bitmap.StreamSource = msDecode;
+                    bitmap.EndInit();
+                    bitmap.Freeze();
+                    bitmapResult = bitmap;
+                    return ImageLoadOutcome.Loaded;
+                }
             }
             catch
             {
-                try
-                {
-                    (BitmapSource? bmp, int pixelW, int pixelH) = DecodeFrozenBitmap(bytes, BitmapCreateOptions.IgnoreColorProfile);
-                    if (bmp == null)
-                        return false;
-
-                    string sizeText = PidlManager.FormatByteSize((ulong)fi.Length);
-                    data = new FilePreviewData
-                    {
-                        Kind = FilePreviewKind.Image,
-                        FilePath = filePath,
-                        Title = title,
-                        Subtitle = $"{typeName} · {pixelW} × {pixelH} · {sizeText}",
-                        TotalFileBytes = fi.Length,
-                        Image = bmp,
-                        ImagePixelWidth = pixelW,
-                        ImagePixelHeight = pixelH,
-                        CanOpenWithDefaultApp = true
-                    };
-                    return true;
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-        }
-
-        private static (BitmapSource? Bitmap, int PixelWidth, int PixelHeight) DecodeFrozenBitmap(
-            byte[] imageBytes,
-            BitmapCreateOptions createOptions)
-        {
-            int pixelWidth;
-            int pixelHeight;
-
-            using (var msDim = new MemoryStream(imageBytes, writable: false))
-            {
-                BitmapDecoder decoder = BitmapDecoder.Create(msDim, createOptions, BitmapCacheOption.OnLoad);
-                if (decoder.Frames.Count == 0)
-                    return (null, 0, 0);
-
-                BitmapFrame frame = decoder.Frames[0];
-                pixelWidth = frame.PixelWidth;
-                pixelHeight = frame.PixelHeight;
-                if (pixelWidth <= 0 || pixelHeight <= 0)
-                    return (null, 0, 0);
-            }
-
-            using (var msDecode = new MemoryStream(imageBytes, writable: false))
-            {
-                var bitmap = new BitmapImage();
-                bitmap.BeginInit();
-                bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                bitmap.CreateOptions = createOptions;
-                if (pixelWidth > MaxDecodedImageWidth)
-                {
-                    bitmap.DecodePixelWidth = MaxDecodedImageWidth;
-                }
-                bitmap.StreamSource = msDecode;
-                bitmap.EndInit();
-                bitmap.Freeze();
-                return (bitmap, pixelWidth, pixelHeight);
+                bitmapResult = null;
+                return ImageLoadOutcome.Failed;
             }
         }
 
@@ -586,6 +659,13 @@ namespace LeafTab.Services
             string decoded = DecodeTextBuffer(buffer, bytesRead, isTruncated, out string encodingLabel);
             decoded = decoded.Replace("\r\n", "\n").Replace('\r', '\n');
 
+            MarkdownParsedDocument? parsedMd = null;
+            if (isMarkdown)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                parsedMd = ParseMarkdownStructure(decoded);
+            }
+
             string sizeText = PidlManager.FormatByteSize((ulong)fi.Length);
             data = new FilePreviewData
             {
@@ -597,7 +677,8 @@ namespace LeafTab.Services
                 EncodingName = encodingLabel,
                 IsTruncated = isTruncated,
                 TotalFileBytes = fi.Length,
-                CanOpenWithDefaultApp = true
+                CanOpenWithDefaultApp = true,
+                ParsedMarkdown = parsedMd
             };
             return true;
         }
@@ -607,7 +688,6 @@ namespace LeafTab.Services
             if (count <= 0)
                 return false;
 
-            // Recognized Unicode BOMs are always text (even though UTF-16/UTF-32 contain 0x00 bytes)
             if (count >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
                 return false;
             if (count >= 2 && ((buffer[0] == 0xFF && buffer[1] == 0xFE) || (buffer[0] == 0xFE && buffer[1] == 0xFF)))
@@ -630,7 +710,7 @@ namespace LeafTab.Services
                 }
             }
 
-            return suspiciousControlCount * 50 > inspectLen; // > 2% non-whitespace control bytes
+            return suspiciousControlCount * 50 > inspectLen;
         }
 
         internal static string DecodeTextBuffer(byte[] buffer, int count, bool isTruncated, out string encodingLabel)
@@ -766,993 +846,5 @@ namespace LeafTab.Services
                 ? "文件"
                 : $"{ext.TrimStart('.').ToUpperInvariant()} 文件";
         }
-
-        // ==================== RICH LIGHTWEIGHT MARKDOWN RENDERER (UI THREAD ONLY) ====================
-
-        public static FlowDocument BuildMarkdownDocument(string markdown, Action<Uri>? onHyperlinkNavigate = null)
-        {
-            var doc = new FlowDocument
-            {
-                ColumnWidth = double.PositiveInfinity,
-                PagePadding = new Thickness(16, 14, 16, 20),
-                FontFamily = BodyFont,
-                FontSize = 13,
-                LineHeight = 20.5,
-                Foreground = BodyBrush,
-                Background = Brushes.White
-            };
-
-            string normalized = (markdown ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n');
-            if (normalized.Length == 0)
-                return doc;
-
-            string[] lines = normalized.Split('\n');
-            RenderMarkdownLines(doc.Blocks, lines, 0, lines.Length, onHyperlinkNavigate, depth: 0);
-            return doc;
-        }
-
-        private static void RenderMarkdownLines(
-            BlockCollection targetBlocks,
-            string[] lines,
-            int startIndex,
-            int endIndex,
-            Action<Uri>? onHyperlinkNavigate,
-            int depth)
-        {
-            int i = startIndex;
-
-            // Render YAML frontmatter if present at top of document
-            if (depth == 0 && i == 0 && i < endIndex && lines[i].Trim() == "---")
-            {
-                int closing = FindFrontmatterClose(lines, i + 1, Math.Min(endIndex, i + 45));
-                if (closing > i)
-                {
-                    var fmSection = new Section
-                    {
-                        Background = SurfaceBrush,
-                        BorderBrush = BorderBrush,
-                        BorderThickness = new Thickness(1),
-                        Padding = new Thickness(11, 8, 11, 8),
-                        Margin = new Thickness(0, 0, 0, 12)
-                    };
-                    string fmText = string.Join("\n", lines, i + 1, closing - (i + 1));
-                    var fmPara = new Paragraph(new Run(fmText))
-                    {
-                        FontFamily = MonoFont,
-                        FontSize = 11.5,
-                        LineHeight = 17,
-                        Foreground = MutedBrush,
-                        Margin = new Thickness(0)
-                    };
-                    fmSection.Blocks.Add(fmPara);
-                    targetBlocks.Add(fmSection);
-                    i = closing + 1;
-                }
-            }
-
-            while (i < endIndex)
-            {
-                string line = lines[i];
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    i++;
-                    continue;
-                }
-
-                // 1. Fenced code block (``` or ~~~)
-                if (TryParseFenceHeader(line, out char fenceChar, out int fenceLen, out string infoString))
-                {
-                    int closeIdx = FindClosingFence(lines, i + 1, endIndex, fenceChar, fenceLen);
-                    int contentEnd = closeIdx >= 0 ? closeIdx : endIndex;
-                    string codeText = contentEnd > i + 1
-                        ? string.Join("\n", lines, i + 1, contentEnd - (i + 1))
-                        : string.Empty;
-
-                    var codeSection = new Section
-                    {
-                        Background = SurfaceBrush,
-                        BorderBrush = BorderBrush,
-                        BorderThickness = new Thickness(1),
-                        Padding = new Thickness(11, 8, 11, 9),
-                        Margin = new Thickness(0, 4, 0, 10)
-                    };
-
-                    if (!string.IsNullOrEmpty(infoString))
-                    {
-                        codeSection.Blocks.Add(new Paragraph(new Run(infoString))
-                        {
-                            FontFamily = MonoFont,
-                            FontSize = 10.5,
-                            LineHeight = 14,
-                            Foreground = MutedBrush,
-                            Margin = new Thickness(0, 0, 0, 4)
-                        });
-                    }
-
-                    codeSection.Blocks.Add(new Paragraph(new Run(codeText))
-                    {
-                        FontFamily = MonoFont,
-                        FontSize = 12,
-                        LineHeight = 18,
-                        Foreground = HeadingBrush,
-                        Margin = new Thickness(0)
-                    });
-
-                    targetBlocks.Add(codeSection);
-                    i = closeIdx >= 0 ? closeIdx + 1 : endIndex;
-                    continue;
-                }
-
-                // 2. ATX Heading (# .. ######)
-                if (TryParseAtxHeading(line, out int headingLevel, out string headingText))
-                {
-                    var heading = CreateHeadingParagraph(headingLevel, headingText, onHyperlinkNavigate);
-                    targetBlocks.Add(heading);
-                    i++;
-                    continue;
-                }
-
-                // 3. Horizontal Rule (---, ***, ___)
-                if (IsHorizontalRule(line))
-                {
-                    targetBlocks.Add(new Paragraph
-                    {
-                        BorderBrush = BorderBrush,
-                        BorderThickness = new Thickness(0, 0, 0, 1),
-                        FontSize = 1,
-                        LineHeight = 1,
-                        Margin = new Thickness(0, 8, 0, 12),
-                        Padding = new Thickness(0)
-                    });
-                    i++;
-                    continue;
-                }
-
-                // 4. Markdown Pipe Table
-                if (i + 1 < endIndex && LooksLikeTableRow(line) && IsTableSeparatorRow(lines[i + 1]))
-                {
-                    List<string> headers = SplitTableRow(line);
-                    int rowStart = i + 2;
-                    int rowEnd = rowStart;
-                    while (rowEnd < endIndex &&
-                           !string.IsNullOrWhiteSpace(lines[rowEnd]) &&
-                           LooksLikeTableRow(lines[rowEnd]) &&
-                           !TryParseFenceHeader(lines[rowEnd], out _, out _, out _) &&
-                           !TryParseAtxHeading(lines[rowEnd], out _, out _))
-                    {
-                        rowEnd++;
-                    }
-
-                    targetBlocks.Add(BuildMarkdownTable(headers, lines, rowStart, rowEnd, onHyperlinkNavigate));
-                    i = rowEnd;
-                    continue;
-                }
-
-                // 5. Blockquote (> ...)
-                if (IsBlockquoteLine(line))
-                {
-                    var quotedLines = new List<string>();
-                    while (i < endIndex && IsBlockquoteLine(lines[i]))
-                    {
-                        quotedLines.Add(StripBlockquotePrefix(lines[i]));
-                        i++;
-                    }
-
-                    var quoteSection = new Section
-                    {
-                        Background = SurfaceBrush,
-                        BorderBrush = QuoteBorderBrush,
-                        BorderThickness = new Thickness(3, 0, 0, 0),
-                        Padding = new Thickness(12, 6, 10, 6),
-                        Margin = new Thickness(0, 4, 0, 10)
-                    };
-
-                    if (depth < 3)
-                    {
-                        string[] innerLines = quotedLines.ToArray();
-                        RenderMarkdownLines(quoteSection.Blocks, innerLines, 0, innerLines.Length, onHyperlinkNavigate, depth + 1);
-                    }
-                    else
-                    {
-                        var fallbackPara = new Paragraph { Margin = new Thickness(0) };
-                        AppendInlines(fallbackPara.Inlines, string.Join(" ", quotedLines), onHyperlinkNavigate);
-                        quoteSection.Blocks.Add(fallbackPara);
-                    }
-
-                    targetBlocks.Add(quoteSection);
-                    continue;
-                }
-
-                // 6. List (- / * / + or 1.) including GitHub task items (- [ ] / - [x])
-                if (TryParseListItem(line, out bool isOrdered, out string firstItemBody, out bool isTask, out bool taskDone))
-                {
-                    var items = new List<(string Body, bool IsTask, bool TaskDone)>();
-                    bool anyTask = isTask;
-                    items.Add((firstItemBody, isTask, taskDone));
-                    i++;
-
-                    while (i < endIndex)
-                    {
-                        string nextLine = lines[i];
-                        if (string.IsNullOrWhiteSpace(nextLine))
-                        {
-                            // Keep consuming if the very next non-empty line continues the same list type
-                            if (i + 1 < endIndex &&
-                                TryParseListItem(lines[i + 1], out bool nextIsOrd, out _, out _, out _) &&
-                                nextIsOrd == isOrdered)
-                            {
-                                i++;
-                                continue;
-                            }
-                            break;
-                        }
-
-                        if (TryParseListItem(nextLine, out bool itemOrd, out string itemBody, out bool itemTask, out bool itemDone))
-                        {
-                            if (itemOrd != isOrdered)
-                                break;
-                            anyTask |= itemTask;
-                            items.Add((itemBody, itemTask, itemDone));
-                            i++;
-                            continue;
-                        }
-
-                        // Indented continuation line inside previous list item
-                        if ((nextLine.StartsWith("  ", StringComparison.Ordinal) || nextLine.StartsWith("\t", StringComparison.Ordinal)) &&
-                            !TryParseFenceHeader(nextLine, out _, out _, out _) &&
-                            !IsBlockquoteLine(nextLine))
-                        {
-                            int lastIdx = items.Count - 1;
-                            var prev = items[lastIdx];
-                            items[lastIdx] = (prev.Body + " " + nextLine.Trim(), prev.IsTask, prev.TaskDone);
-                            i++;
-                            continue;
-                        }
-
-                        break;
-                    }
-
-                    var list = new List
-                    {
-                        MarkerStyle = anyTask
-                            ? TextMarkerStyle.None
-                            : (isOrdered ? TextMarkerStyle.Decimal : TextMarkerStyle.Disc),
-                        Padding = new Thickness(anyTask ? 8 : 20, 0, 0, 0),
-                        Margin = new Thickness(0, 2, 0, 10)
-                    };
-
-                    foreach (var entry in items)
-                    {
-                        var para = new Paragraph
-                        {
-                            Margin = new Thickness(0, 2, 0, 3),
-                            LineHeight = 20
-                        };
-
-                        if (entry.IsTask)
-                        {
-                            para.Inlines.Add(new Run(entry.TaskDone ? "☑ " : "☐ ")
-                            {
-                                FontWeight = FontWeights.SemiBold,
-                                Foreground = entry.TaskDone ? TaskDoneBrush : MutedBrush
-                            });
-                        }
-
-                        AppendInlines(para.Inlines, entry.Body, onHyperlinkNavigate);
-                        list.ListItems.Add(new ListItem(para));
-                    }
-
-                    targetBlocks.Add(list);
-                    continue;
-                }
-
-                // 7. Plain paragraph
-                var paraLines = new List<string>();
-                while (i < endIndex)
-                {
-                    string pLine = lines[i];
-                    if (string.IsNullOrWhiteSpace(pLine))
-                        break;
-                    if (paraLines.Count > 0 &&
-                        (TryParseFenceHeader(pLine, out _, out _, out _) ||
-                         TryParseAtxHeading(pLine, out _, out _) ||
-                         IsHorizontalRule(pLine) ||
-                         IsBlockquoteLine(pLine) ||
-                         TryParseListItem(pLine, out _, out _, out _, out _) ||
-                         (i + 1 < endIndex && LooksLikeTableRow(pLine) && IsTableSeparatorRow(lines[i + 1]))))
-                    {
-                        break;
-                    }
-
-                    paraLines.Add(pLine);
-                    i++;
-                }
-
-                targetBlocks.Add(BuildParagraphFromLines(paraLines, onHyperlinkNavigate));
-            }
-        }
-
-        private static int FindFrontmatterClose(string[] lines, int startIndex, int limitIndex)
-        {
-            for (int j = startIndex; j < limitIndex; j++)
-            {
-                string trimmed = lines[j].Trim();
-                if (trimmed == "---" || trimmed == "...")
-                    return j;
-            }
-            return -1;
-        }
-
-        private static bool TryParseFenceHeader(string line, out char fenceChar, out int fenceLen, out string infoString)
-        {
-            fenceChar = '\0';
-            fenceLen = 0;
-            infoString = string.Empty;
-
-            int idx = SkipLeadingSpaces(line, 3);
-            if (idx >= line.Length)
-                return false;
-
-            char c = line[idx];
-            if (c != '`' && c != '~')
-                return false;
-
-            int len = 0;
-            while (idx + len < line.Length && line[idx + len] == c)
-                len++;
-
-            if (len < 3)
-                return false;
-
-            string rest = line.Substring(idx + len).Trim();
-            if (c == '`' && rest.IndexOf('`') >= 0)
-                return false;
-
-            fenceChar = c;
-            fenceLen = len;
-            infoString = rest;
-            return true;
-        }
-
-        private static int FindClosingFence(string[] lines, int startIndex, int endIndex, char fenceChar, int minFenceLen)
-        {
-            for (int j = startIndex; j < endIndex; j++)
-            {
-                string line = lines[j];
-                int idx = SkipLeadingSpaces(line, 3);
-                int count = 0;
-                while (idx + count < line.Length && line[idx + count] == fenceChar)
-                    count++;
-
-                if (count >= minFenceLen && string.IsNullOrWhiteSpace(line.Substring(idx + count)))
-                    return j;
-            }
-            return -1;
-        }
-
-        private static bool TryParseAtxHeading(string line, out int level, out string text)
-        {
-            level = 0;
-            text = string.Empty;
-
-            int idx = SkipLeadingSpaces(line, 3);
-            if (idx >= line.Length || line[idx] != '#')
-                return false;
-
-            int hashes = 0;
-            while (idx + hashes < line.Length && line[idx + hashes] == '#')
-                hashes++;
-
-            if (hashes < 1 || hashes > 6)
-                return false;
-
-            if (idx + hashes < line.Length && !char.IsWhiteSpace(line[idx + hashes]))
-                return false;
-
-            string body = line.Substring(idx + hashes).Trim();
-            // Strip optional closing ATX hashes preceded by whitespace
-            int end = body.Length;
-            while (end > 0 && body[end - 1] == '#')
-                end--;
-            if (end < body.Length && (end == 0 || char.IsWhiteSpace(body[end - 1])))
-                body = body.Substring(0, end).TrimEnd();
-
-            level = hashes;
-            text = body;
-            return true;
-        }
-
-        private static Paragraph CreateHeadingParagraph(int level, string text, Action<Uri>? onHyperlinkNavigate)
-        {
-            double fontSize = level switch
-            {
-                1 => 20,
-                2 => 16.5,
-                3 => 14.5,
-                4 => 13.5,
-                5 => 13,
-                _ => 12.5
-            };
-
-            var para = new Paragraph
-            {
-                FontSize = fontSize,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = level == 6 ? MutedBrush : HeadingBrush,
-                LineHeight = fontSize + 7,
-                Margin = new Thickness(0, level == 1 ? 4 : 10, 0, level <= 2 ? 8 : 5)
-            };
-
-            if (level <= 2)
-            {
-                para.BorderBrush = BorderBrush;
-                para.BorderThickness = new Thickness(0, 0, 0, 1);
-                para.Padding = new Thickness(0, 0, 0, 4);
-            }
-
-            AppendInlines(para.Inlines, text, onHyperlinkNavigate);
-            return para;
-        }
-
-        private static bool IsHorizontalRule(string line)
-        {
-            string trimmed = line.Trim();
-            if (trimmed.Length < 3)
-                return false;
-
-            char marker = '\0';
-            int count = 0;
-            for (int i = 0; i < trimmed.Length; i++)
-            {
-                char c = trimmed[i];
-                if (c == ' ' || c == '\t')
-                    continue;
-                if (c != '-' && c != '*' && c != '_')
-                    return false;
-                if (marker == '\0')
-                    marker = c;
-                else if (c != marker)
-                    return false;
-                count++;
-            }
-
-            return count >= 3;
-        }
-
-        private static bool LooksLikeTableRow(string line) => line.IndexOf('|') >= 0;
-
-        private static bool IsTableSeparatorRow(string line)
-        {
-            List<string> cells = SplitTableRow(line);
-            if (cells.Count == 0)
-                return false;
-
-            foreach (string rawCell in cells)
-            {
-                string cell = rawCell.Trim();
-                if (cell.Length == 0)
-                    return false;
-
-                int start = cell[0] == ':' ? 1 : 0;
-                int end = cell[cell.Length - 1] == ':' ? cell.Length - 1 : cell.Length;
-                if (end - start < 1)
-                    return false;
-
-                for (int k = start; k < end; k++)
-                {
-                    if (cell[k] != '-')
-                        return false;
-                }
-            }
-
-            return true;
-        }
-
-        private static List<string> SplitTableRow(string line)
-        {
-            var cells = new List<string>();
-            string trimmed = line.Trim();
-            if (trimmed.Length == 0)
-                return cells;
-
-            int startIdx = trimmed[0] == '|' ? 1 : 0;
-            int endIdx = trimmed.Length;
-            if (endIdx > startIdx && trimmed[endIdx - 1] == '|' && (endIdx < 2 || trimmed[endIdx - 2] != '\\'))
-                endIdx--;
-
-            var sb = new StringBuilder();
-            for (int i = startIdx; i < endIdx; i++)
-            {
-                char c = trimmed[i];
-                if (c == '\\' && i + 1 < endIdx && trimmed[i + 1] == '|')
-                {
-                    sb.Append('|');
-                    i++;
-                }
-                else if (c == '|')
-                {
-                    cells.Add(sb.ToString().Trim());
-                    sb.Clear();
-                }
-                else
-                {
-                    sb.Append(c);
-                }
-            }
-
-            cells.Add(sb.ToString().Trim());
-            return cells;
-        }
-
-        private static Table BuildMarkdownTable(
-            List<string> headers,
-            string[] lines,
-            int rowStart,
-            int rowEnd,
-            Action<Uri>? onHyperlinkNavigate)
-        {
-            int colCount = Math.Max(1, headers.Count);
-            var table = new Table
-            {
-                CellSpacing = 0,
-                BorderBrush = BorderBrush,
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(0, 4, 0, 12),
-                FontSize = 12.5
-            };
-
-            for (int c = 0; c < colCount; c++)
-            {
-                table.Columns.Add(new TableColumn());
-            }
-
-            var rowGroup = new TableRowGroup();
-
-            // Header row
-            var headerRow = new TableRow { Background = CodeInlineBgBrush };
-            for (int c = 0; c < colCount; c++)
-            {
-                string cellText = c < headers.Count ? headers[c] : string.Empty;
-                var para = new Paragraph
-                {
-                    Margin = new Thickness(0),
-                    FontWeight = FontWeights.SemiBold,
-                    Foreground = HeadingBrush,
-                    LineHeight = 18
-                };
-                AppendInlines(para.Inlines, cellText, onHyperlinkNavigate);
-
-                headerRow.Cells.Add(new TableCell(para)
-                {
-                    Padding = new Thickness(8, 6, 8, 6),
-                    BorderBrush = TableHeaderBorderBrush,
-                    BorderThickness = new Thickness(0, 0, c < colCount - 1 ? 1 : 0, 1)
-                });
-            }
-            rowGroup.Rows.Add(headerRow);
-
-            // Body rows
-            for (int r = rowStart; r < rowEnd; r++)
-            {
-                List<string> rowCells = SplitTableRow(lines[r]);
-                int bodyRowIdx = r - rowStart;
-                var row = new TableRow
-                {
-                    Background = (bodyRowIdx % 2 == 1) ? SurfaceBrush : Brushes.White
-                };
-
-                for (int c = 0; c < colCount; c++)
-                {
-                    string cellText = c < rowCells.Count ? rowCells[c] : string.Empty;
-                    var para = new Paragraph
-                    {
-                        Margin = new Thickness(0),
-                        LineHeight = 18
-                    };
-                    AppendInlines(para.Inlines, cellText, onHyperlinkNavigate);
-
-                    row.Cells.Add(new TableCell(para)
-                    {
-                        Padding = new Thickness(8, 5, 8, 5),
-                        BorderBrush = BorderBrush,
-                        BorderThickness = new Thickness(0, 0, c < colCount - 1 ? 1 : 0, r < rowEnd - 1 ? 1 : 0)
-                    });
-                }
-
-                rowGroup.Rows.Add(row);
-            }
-
-            table.RowGroups.Add(rowGroup);
-            return table;
-        }
-
-        private static bool IsBlockquoteLine(string line)
-        {
-            int idx = SkipLeadingSpaces(line, 3);
-            return idx < line.Length && line[idx] == '>';
-        }
-
-        private static string StripBlockquotePrefix(string line)
-        {
-            int idx = SkipLeadingSpaces(line, 3);
-            if (idx < line.Length && line[idx] == '>')
-            {
-                idx++;
-                if (idx < line.Length && line[idx] == ' ')
-                    idx++;
-                return line.Substring(idx);
-            }
-            return line;
-        }
-
-        private static bool TryParseListItem(
-            string line,
-            out bool isOrdered,
-            out string body,
-            out bool isTask,
-            out bool taskDone)
-        {
-            isOrdered = false;
-            body = string.Empty;
-            isTask = false;
-            taskDone = false;
-
-            int idx = SkipLeadingSpaces(line, 5);
-            if (idx >= line.Length)
-                return false;
-
-            char c = line[idx];
-            if ((c == '-' || c == '*' || c == '+') &&
-                idx + 1 < line.Length &&
-                (line[idx + 1] == ' ' || line[idx + 1] == '\t'))
-            {
-                body = line.Substring(idx + 2).TrimStart();
-                ExtractTaskPrefix(ref body, out isTask, out taskDone);
-                return true;
-            }
-
-            if (char.IsDigit(c))
-            {
-                int digitEnd = idx;
-                while (digitEnd < line.Length && char.IsDigit(line[digitEnd]))
-                    digitEnd++;
-
-                if (digitEnd < line.Length &&
-                    digitEnd - idx <= 6 &&
-                    (line[digitEnd] == '.' || line[digitEnd] == ')') &&
-                    digitEnd + 1 < line.Length &&
-                    (line[digitEnd + 1] == ' ' || line[digitEnd + 1] == '\t'))
-                {
-                    isOrdered = true;
-                    body = line.Substring(digitEnd + 2).TrimStart();
-                    ExtractTaskPrefix(ref body, out isTask, out taskDone);
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static void ExtractTaskPrefix(ref string body, out bool isTask, out bool taskDone)
-        {
-            isTask = false;
-            taskDone = false;
-
-            if (body.Length >= 4 &&
-                body[0] == '[' &&
-                (body[1] == ' ' || body[1] == 'x' || body[1] == 'X') &&
-                body[2] == ']' &&
-                char.IsWhiteSpace(body[3]))
-            {
-                isTask = true;
-                taskDone = body[1] != ' ';
-                body = body.Substring(4).TrimStart();
-            }
-        }
-
-        private static Paragraph BuildParagraphFromLines(List<string> lines, Action<Uri>? onHyperlinkNavigate)
-        {
-            var para = new Paragraph
-            {
-                Margin = new Thickness(0, 0, 0, 9),
-                LineHeight = 20.5
-            };
-
-            for (int i = 0; i < lines.Count; i++)
-            {
-                string raw = lines[i];
-                bool hardBreak = raw.EndsWith("  ", StringComparison.Ordinal);
-                string content = raw.Trim();
-                AppendInlines(para.Inlines, content, onHyperlinkNavigate);
-
-                if (i < lines.Count - 1)
-                {
-                    if (hardBreak)
-                        para.Inlines.Add(new LineBreak());
-                    else
-                        para.Inlines.Add(new Run(" "));
-                }
-            }
-
-            return para;
-        }
-
-        private static int SkipLeadingSpaces(string line, int maxSpaces)
-        {
-            int idx = 0;
-            while (idx < line.Length && idx < maxSpaces && line[idx] == ' ')
-                idx++;
-            return idx;
-        }
-
-        private static void AppendInlines(InlineCollection target, string text, Action<Uri>? onHyperlinkNavigate)
-        {
-            if (string.IsNullOrEmpty(text))
-                return;
-
-            var plainBuffer = new StringBuilder();
-            int i = 0;
-
-            void FlushPlain()
-            {
-                if (plainBuffer.Length > 0)
-                {
-                    target.Add(new Run(plainBuffer.ToString()));
-                    plainBuffer.Clear();
-                }
-            }
-
-            while (i < text.Length)
-            {
-                char ch = text[i];
-
-                // Backslash escape for ASCII punctuation
-                if (ch == '\\' && i + 1 < text.Length && IsAsciiPunctuation(text[i + 1]))
-                {
-                    plainBuffer.Append(text[i + 1]);
-                    i += 2;
-                    continue;
-                }
-
-                // Inline code (`code`)
-                if (ch == '`')
-                {
-                    int close = text.IndexOf('`', i + 1);
-                    if (close > i)
-                    {
-                        FlushPlain();
-                        string code = text.Substring(i + 1, close - (i + 1));
-                        var codeSpan = new Span(new Run(code))
-                        {
-                            FontFamily = MonoFont,
-                            FontSize = 12,
-                            Background = CodeInlineBgBrush,
-                            Foreground = HeadingBrush
-                        };
-                        target.Add(codeSpan);
-                        i = close + 1;
-                        continue;
-                    }
-                }
-
-                // Markdown image fallback: ![alt](url) -> crisp badge text [图片: alt]
-                if (ch == '!' && i + 1 < text.Length && text[i + 1] == '[' &&
-                    TryParseBracketUrl(text, i + 1, out string altText, out _, out int afterImg))
-                {
-                    FlushPlain();
-                    string label = string.IsNullOrWhiteSpace(altText) ? "[图片]" : $"[图片: {altText}]";
-                    target.Add(new Run(label) { Foreground = MutedBrush });
-                    i = afterImg;
-                    continue;
-                }
-
-                // Markdown link [label](url)
-                if (ch == '[' && TryParseBracketUrl(text, i, out string linkLabel, out string linkUrl, out int afterLink))
-                {
-                    FlushPlain();
-                    if (Uri.TryCreate(linkUrl.Trim(), UriKind.Absolute, out Uri? uri) &&
-                        (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
-                         string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        var hyperlink = new Hyperlink
-                        {
-                            Foreground = LinkBrush,
-                            ToolTip = uri.AbsoluteUri
-                        };
-                        AppendInlines(hyperlink.Inlines, linkLabel, null);
-                        if (onHyperlinkNavigate != null)
-                        {
-                            hyperlink.Click += (_, _) => onHyperlinkNavigate(uri);
-                        }
-                        target.Add(hyperlink);
-                    }
-                    else
-                    {
-                        target.Add(new Run(linkLabel) { Foreground = LinkBrush });
-                    }
-                    i = afterLink;
-                    continue;
-                }
-
-                // ***bold italic*** or ___bold italic___
-                if ((text.IndexOf("***", i, StringComparison.Ordinal) == i || text.IndexOf("___", i, StringComparison.Ordinal) == i))
-                {
-                    string marker = text.Substring(i, 3);
-                    int close = text.IndexOf(marker, i + 3, StringComparison.Ordinal);
-                    if (close > i + 3)
-                    {
-                        FlushPlain();
-                        var span = new Span
-                        {
-                            FontWeight = FontWeights.SemiBold,
-                            FontStyle = FontStyles.Italic
-                        };
-                        AppendInlines(span.Inlines, text.Substring(i + 3, close - (i + 3)), onHyperlinkNavigate);
-                        target.Add(span);
-                        i = close + 3;
-                        continue;
-                    }
-                }
-
-                // **bold** or __bold__
-                if ((text.IndexOf("**", i, StringComparison.Ordinal) == i || text.IndexOf("__", i, StringComparison.Ordinal) == i))
-                {
-                    string marker = text.Substring(i, 2);
-                    int close = text.IndexOf(marker, i + 2, StringComparison.Ordinal);
-                    if (close > i + 2)
-                    {
-                        FlushPlain();
-                        var span = new Span
-                        {
-                            FontWeight = FontWeights.SemiBold,
-                            Foreground = HeadingBrush
-                        };
-                        AppendInlines(span.Inlines, text.Substring(i + 2, close - (i + 2)), onHyperlinkNavigate);
-                        target.Add(span);
-                        i = close + 2;
-                        continue;
-                    }
-                }
-
-                // ~~strikethrough~~
-                if (text.IndexOf("~~", i, StringComparison.Ordinal) == i)
-                {
-                    int close = text.IndexOf("~~", i + 2, StringComparison.Ordinal);
-                    if (close > i + 2)
-                    {
-                        FlushPlain();
-                        var span = new Span
-                        {
-                            TextDecorations = TextDecorations.Strikethrough,
-                            Foreground = MutedBrush
-                        };
-                        AppendInlines(span.Inlines, text.Substring(i + 2, close - (i + 2)), onHyperlinkNavigate);
-                        target.Add(span);
-                        i = close + 2;
-                        continue;
-                    }
-                }
-
-                // *italic* (only match '_' when flanked cleanly to avoid breaking snake_case_identifiers)
-                if (ch == '*' || (ch == '_' && IsFlankingUnderscoreStart(text, i)))
-                {
-                    int close = FindClosingEmphasis(text, i + 1, ch);
-                    if (close > i + 1)
-                    {
-                        FlushPlain();
-                        var span = new Span { FontStyle = FontStyles.Italic };
-                        AppendInlines(span.Inlines, text.Substring(i + 1, close - (i + 1)), onHyperlinkNavigate);
-                        target.Add(span);
-                        i = close + 1;
-                        continue;
-                    }
-                }
-
-                plainBuffer.Append(ch);
-                i++;
-            }
-
-            FlushPlain();
-        }
-
-        private static bool TryParseBracketUrl(string text, int openBracketIdx, out string label, out string url, out int afterIndex)
-        {
-            label = string.Empty;
-            url = string.Empty;
-            afterIndex = openBracketIdx;
-
-            if (openBracketIdx < 0 || openBracketIdx >= text.Length || text[openBracketIdx] != '[')
-                return false;
-
-            int closeBracket = -1;
-            int depth = 1;
-            for (int j = openBracketIdx + 1; j < text.Length; j++)
-            {
-                if (text[j] == '\\' && j + 1 < text.Length)
-                {
-                    j++;
-                    continue;
-                }
-                if (text[j] == '[')
-                    depth++;
-                else if (text[j] == ']')
-                {
-                    depth--;
-                    if (depth == 0)
-                    {
-                        closeBracket = j;
-                        break;
-                    }
-                }
-            }
-
-            if (closeBracket < 0 || closeBracket + 1 >= text.Length || text[closeBracket + 1] != '(')
-                return false;
-
-            int closeParen = -1;
-            int parenDepth = 1;
-            for (int k = closeBracket + 2; k < text.Length; k++)
-            {
-                if (text[k] == '\\' && k + 1 < text.Length)
-                {
-                    k++;
-                    continue;
-                }
-                if (text[k] == '(')
-                    parenDepth++;
-                else if (text[k] == ')')
-                {
-                    parenDepth--;
-                    if (parenDepth == 0)
-                    {
-                        closeParen = k;
-                        break;
-                    }
-                }
-            }
-
-            if (closeParen < 0)
-                return false;
-
-            label = text.Substring(openBracketIdx + 1, closeBracket - (openBracketIdx + 1));
-            url = text.Substring(closeBracket + 2, closeParen - (closeBracket + 2));
-            afterIndex = closeParen + 1;
-            return true;
-        }
-
-        private static bool IsFlankingUnderscoreStart(string text, int idx)
-        {
-            if (idx > 0 && char.IsLetterOrDigit(text[idx - 1]))
-                return false;
-            return idx + 1 < text.Length && !char.IsWhiteSpace(text[idx + 1]);
-        }
-
-        private static int FindClosingEmphasis(string text, int searchStart, char marker)
-        {
-            for (int j = searchStart; j < text.Length; j++)
-            {
-                if (text[j] == '\\' && j + 1 < text.Length)
-                {
-                    j++;
-                    continue;
-                }
-
-                if (text[j] == marker)
-                {
-                    if (j > searchStart && !char.IsWhiteSpace(text[j - 1]))
-                    {
-                        if (marker == '_' && j + 1 < text.Length && char.IsLetterOrDigit(text[j + 1]))
-                            continue;
-                        return j;
-                    }
-                }
-            }
-            return -1;
-        }
-
-        private static bool IsAsciiPunctuation(char c) =>
-            c == '\\' || c == '`' || c == '*' || c == '_' || c == '{' || c == '}' ||
-            c == '[' || c == ']' || c == '(' || c == ')' || c == '#' || c == '+' ||
-            c == '-' || c == '.' || c == '!' || c == '|' || c == '~' || c == '>';
     }
 }

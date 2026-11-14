@@ -51,11 +51,19 @@ namespace LeafTab.Models
         [DataMember(Order = 14)]
         public List<string> RecentFolders { get; set; } = new List<string>();
 
+        [DataMember(Order = 15)]
+        public double PreviewPaneWidthDip { get; set; } = 340.0;
+
+        [DataMember(Order = 16)]
+        public bool RestorePreviousTabs { get; set; }
+
         [OnDeserializing]
         private void OnDeserializing(StreamingContext context)
         {
             EnableWarmStandby = true;
             RecentFolders = new List<string>();
+            PreviewPaneWidthDip = 340.0;
+            RestorePreviousTabs = false;
         }
 
         [OnDeserialized]
@@ -64,6 +72,13 @@ namespace LeafTab.Models
             Bookmarks ??= new List<BookmarkConfigItem>();
             OpenTabs ??= new List<SavedTabConfigItem>();
             RecentFolders ??= new List<string>();
+            if (double.IsNaN(PreviewPaneWidthDip) ||
+                double.IsInfinity(PreviewPaneWidthDip) ||
+                PreviewPaneWidthDip < 220.0 ||
+                PreviewPaneWidthDip > 1600.0)
+            {
+                PreviewPaneWidthDip = 340.0;
+            }
         }
     }
 

@@ -100,7 +100,10 @@ namespace LeafTab.Views
         private CancellationTokenSource? _previewLoadCts;
         private int _previewRequestVersion;
         private bool _enableWarmStandby = true;
+        private bool _restorePreviousTabs;
+        private bool _isRestoringSavedTabs;
         private bool _forceExitProcess;
+        private bool _skipSaveOnForceClose;
         private bool _isLoadedCompleted;
         private bool _isClosingWindow;
 
@@ -110,7 +113,11 @@ namespace LeafTab.Views
         internal bool IsClosingOrClosed => _isClosingWindow;
         internal bool IsStatusPollingActive => _statusRefreshTimer.IsEnabled;
         internal bool IsPreviewPaneOpen => _showPreviewPane && PreviewSidebarBorder.Visibility == Visibility.Visible;
+        internal double PreviewPaneWidthDip => _previewPaneWidthDip;
+        internal bool RestorePreviousTabs => _restorePreviousTabs;
+        internal void SetRestorePreviousTabs(bool enabled) => _restorePreviousTabs = enabled;
         internal string CurrentPreviewKindName => _currentPreviewData?.Kind.ToString() ?? "None";
+        internal string CurrentPreviewTextContent => _currentPreviewData?.TextContent ?? string.Empty;
         internal IReadOnlyList<string> RecentFolders => _recentFolders;
         internal void RefreshNavigationChromeState() => UpdateNavigationButtonsState();
 
@@ -145,7 +152,7 @@ namespace LeafTab.Views
 
             _searchDebounceTimer = new DispatcherTimer(DispatcherPriority.Input)
             {
-                Interval = TimeSpan.FromMilliseconds(420)
+                Interval = TimeSpan.FromMilliseconds(110)
             };
             _searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
 
@@ -224,7 +231,9 @@ namespace LeafTab.Views
             _config = _sharedStore!.Settings;
             _showBookmarkBar = _config.ShowBookmarkBar;
             _showPreviewPane = _config.ShowPreviewPane;
+            _previewPaneWidthDip = _config.PreviewPaneWidthDip;
             _enableWarmStandby = _config.EnableWarmStandby;
+            _restorePreviousTabs = _config.RestorePreviousTabs;
 
             BookmarkBarBorder.Visibility = _showBookmarkBar ? Visibility.Visible : Visibility.Collapsed;
             CommandBarSurface.BorderThickness = _showBookmarkBar ? new Thickness(0) : new Thickness(0, 0, 0, 1);
@@ -258,10 +267,217 @@ namespace LeafTab.Views
             }
         }
 
-        private void SaveConfigurationSnapshot()
+        private void CaptureOpenTabsSnapshotForStore(bool isWindowClosing = false)
+        {
+            if (_sharedStore == null || _isRestoringSavedTabs || _skipSaveOnForceClose)
+                return;
+
+            if (!_restorePreviousTabs)
+            {
+                _sharedStore.UpdateSavedTabs(null, 0);
+                return;
+            }
+
+            // Do not overwrite previously saved tabs when an already-hidden standby window with 0 tabs exits.
+            if (!IsVisible && _tabs.Count == 0)
+                return;
+
+            var items = new List<SavedTabConfigItem>();
+            int selectedIdx = 0;
+
+            if (App.CurrentApp != null)
+            {
+                if (isWindowClosing && !_forceExitProcess)
+                {
+                    // If this secondary window is closing while other visible windows remain open, keep remaining windows' tabs.
+                    var otherTabs = new List<(ExplorerTabItem Tab, bool IsSelected)>();
+                    foreach (MainWindow w in App.CurrentApp.ManagedWindows)
+                    {
+                        if (!ReferenceEquals(w, this) && w.IsVisible && !w.IsClosingOrClosed && w.Tabs.Count > 0)
+                        {
+                            foreach (ExplorerTabItem t in w.Tabs)
+                            {
+                                otherTabs.Add((t, ReferenceEquals(w, App.CurrentApp.MainWindow) && ReferenceEquals(t, w.SelectedTab)));
+                            }
+                        }
+                    }
+
+                    if (otherTabs.Count > 0)
+                    {
+                        foreach (var entry in otherTabs)
+                        {
+                            SavedTabConfigItem exported = entry.Tab.ExportSavedConfig();
+                            if (!string.IsNullOrWhiteSpace(exported.CurrentPath))
+                            {
+                                if (entry.IsSelected) selectedIdx = items.Count;
+                                items.Add(exported);
+                            }
+                        }
+                        if (items.Count > 0)
+                        {
+                            _sharedStore.UpdateSavedTabs(items, selectedIdx);
+                        }
+                        return;
+                    }
+                }
+                else if (!isWindowClosing)
+                {
+                    // Live session auto-save: aggregate tabs across all visible open windows so multi-window sessions never clobber one another.
+                    MainWindow? activeWin = App.CurrentApp.GetPreferredTargetWindow() ?? this;
+                    var allTabs = new List<(ExplorerTabItem Tab, bool IsSelected)>();
+                    foreach (MainWindow w in App.CurrentApp.ManagedWindows)
+                    {
+                        if (w.IsVisible && !w.IsClosingOrClosed && w.Tabs.Count > 0)
+                        {
+                            foreach (ExplorerTabItem t in w.Tabs)
+                            {
+                                allTabs.Add((t, ReferenceEquals(w, activeWin) && ReferenceEquals(t, w.SelectedTab)));
+                            }
+                        }
+                    }
+
+                    if (allTabs.Count > 0)
+                    {
+                        foreach (var entry in allTabs)
+                        {
+                            SavedTabConfigItem exported = entry.Tab.ExportSavedConfig();
+                            if (!string.IsNullOrWhiteSpace(exported.CurrentPath))
+                            {
+                                if (entry.IsSelected) selectedIdx = items.Count;
+                                items.Add(exported);
+                            }
+                        }
+                        if (items.Count > 0)
+                        {
+                            _sharedStore.UpdateSavedTabs(items, selectedIdx);
+                        }
+                        return;
+                    }
+                }
+            }
+
+            if (_tabs.Count == 0)
+                return;
+
+            for (int i = 0; i < _tabs.Count; i++)
+            {
+                ExplorerTabItem tab = _tabs[i];
+                SavedTabConfigItem exported = tab.ExportSavedConfig();
+                if (!string.IsNullOrWhiteSpace(exported.CurrentPath))
+                {
+                    if (ReferenceEquals(tab, _selectedTab))
+                    {
+                        selectedIdx = items.Count;
+                    }
+                    items.Add(exported);
+                }
+            }
+
+            if (items.Count > 0)
+            {
+                _sharedStore.UpdateSavedTabs(items, selectedIdx);
+            }
+        }
+
+        internal static void SaveUnifiedSessionBeforeExit(IReadOnlyList<MainWindow> windows, MainWindow? preferredWindow)
+        {
+            if (windows == null || windows.Count == 0)
+                return;
+
+            var visibleWithTabs = new List<MainWindow>(windows.Count);
+            foreach (MainWindow w in windows)
+            {
+                if (!w.IsClosingOrClosed && w.Tabs.Count > 0 && (w.IsVisible || windows.Count > 1))
+                {
+                    visibleWithTabs.Add(w);
+                }
+            }
+
+            MainWindow? primary = null;
+            if (preferredWindow != null && !preferredWindow.IsClosingOrClosed)
+            {
+                primary = preferredWindow;
+            }
+            else if (visibleWithTabs.Count > 0)
+            {
+                primary = visibleWithTabs[visibleWithTabs.Count - 1];
+            }
+            else
+            {
+                for (int i = windows.Count - 1; i >= 0; i--)
+                {
+                    if (!windows[i].IsClosingOrClosed)
+                    {
+                        primary = windows[i];
+                        break;
+                    }
+                }
+            }
+
+            if (primary?._sharedStore == null || primary._skipSessionPersistence)
+                return;
+
+            AppConfigStore store = primary._sharedStore;
+            store.UpdatePreferences(
+                primary._showBookmarkBar,
+                primary._showPreviewPane,
+                primary._enableWarmStandby,
+                primary._previewPaneWidthDip,
+                primary._restorePreviousTabs);
+
+            if (!primary._restorePreviousTabs)
+            {
+                store.UpdateSavedTabs(null, 0);
+            }
+            else if (visibleWithTabs.Count > 0)
+            {
+                var items = new List<SavedTabConfigItem>();
+                int selectedIdx = 0;
+                MainWindow activeWin = visibleWithTabs.Contains(primary) ? primary : visibleWithTabs[visibleWithTabs.Count - 1];
+
+                foreach (MainWindow w in visibleWithTabs)
+                {
+                    foreach (ExplorerTabItem tab in w.Tabs)
+                    {
+                        SavedTabConfigItem exported = tab.ExportSavedConfig();
+                        if (!string.IsNullOrWhiteSpace(exported.CurrentPath))
+                        {
+                            if (ReferenceEquals(w, activeWin) && ReferenceEquals(tab, w.SelectedTab))
+                            {
+                                selectedIdx = items.Count;
+                            }
+                            items.Add(exported);
+                        }
+                    }
+                }
+
+                if (items.Count > 0)
+                {
+                    store.UpdateSavedTabs(items, selectedIdx);
+                }
+            }
+
+            if (primary.IsVisible)
+            {
+                Rect bounds = primary.WindowState == WindowState.Normal
+                    ? new Rect(primary.Left, primary.Top, primary.Width, primary.Height)
+                    : primary.RestoreBounds;
+                store.UpdatePlacement(bounds, primary.WindowState == WindowState.Maximized);
+            }
+
+            store.Flush();
+        }
+
+        private void SaveConfigurationSnapshot(bool isWindowClosing = false)
         {
             if (_sharedStore == null) return;
-            _sharedStore.UpdatePreferences(_showBookmarkBar, _showPreviewPane, _enableWarmStandby);
+            _sharedStore.UpdatePreferences(
+                _showBookmarkBar,
+                _showPreviewPane,
+                _enableWarmStandby,
+                _previewPaneWidthDip,
+                _restorePreviousTabs);
+            CaptureOpenTabsSnapshotForStore(isWindowClosing);
             Rect bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
             _sharedStore.UpdatePlacement(bounds, WindowState == WindowState.Maximized);
             if (!_sharedStore.Flush() && !_isClosingWindow)
@@ -273,6 +489,12 @@ namespace LeafTab.Views
             if (_isClosingWindow || _sharedStore == null) return;
             var cfg = _sharedStore.Settings;
             _enableWarmStandby = cfg.EnableWarmStandby;
+            _restorePreviousTabs = cfg.RestorePreviousTabs;
+            bool widthChanged = Math.Abs(_previewPaneWidthDip - cfg.PreviewPaneWidthDip) >= 1.0;
+            if (widthChanged)
+            {
+                _previewPaneWidthDip = cfg.PreviewPaneWidthDip;
+            }
             if (_showBookmarkBar != cfg.ShowBookmarkBar)
             {
                 _showBookmarkBar = cfg.ShowBookmarkBar;
@@ -286,6 +508,10 @@ namespace LeafTab.Views
                 _showPreviewPane = cfg.ShowPreviewPane;
                 foreach (var tab in _tabs) tab.BrowserHost.SetPreviewPaneVisible(_showPreviewPane);
                 UpdatePreviewButtonVisual();
+                ApplyPreviewPaneLayout();
+            }
+            else if (widthChanged && _showPreviewPane)
+            {
                 ApplyPreviewPaneLayout();
             }
             HydrateBookmarkIconsDeferred();
@@ -321,10 +547,16 @@ namespace LeafTab.Views
 
         private void ScheduleSessionSave()
         {
-            if (_skipSessionPersistence || _isClosingWindow || !_isLoadedCompleted)
+            if (_skipSessionPersistence || _isClosingWindow || !_isLoadedCompleted || _isRestoringSavedTabs)
                 return;
 
-            _sharedStore?.UpdatePreferences(_showBookmarkBar, _showPreviewPane, _enableWarmStandby);
+            _sharedStore?.UpdatePreferences(
+                _showBookmarkBar,
+                _showPreviewPane,
+                _enableWarmStandby,
+                _previewPaneWidthDip,
+                _restorePreviousTabs);
+            CaptureOpenTabsSnapshotForStore();
             _sharedStore?.ScheduleSave();
         }
 
@@ -531,6 +763,67 @@ namespace LeafTab.Views
             SyncStatusTimerState();
         }
 
+        public async Task<bool> TryRestoreSavedTabsIfEnabledAsync()
+        {
+            if (_skipSessionPersistence || _isClosingWindow || _sharedStore == null)
+                return false;
+
+            AppConfig cfg = _sharedStore.Settings;
+            if (!cfg.RestorePreviousTabs || cfg.OpenTabs == null || cfg.OpenTabs.Count == 0)
+                return false;
+
+            var snapshot = cfg.OpenTabs.ToArray();
+            int savedSelectedIdx = Math.Max(0, Math.Min(cfg.SelectedTabIndex, snapshot.Length - 1));
+            var restoredTabs = new List<ExplorerTabItem>(snapshot.Length);
+            ExplorerTabItem? preferredTab = null;
+
+            _isRestoringSavedTabs = true;
+            try
+            {
+                for (int i = 0; i < snapshot.Length; i++)
+                {
+                    SavedTabConfigItem item = snapshot[i];
+                    if (item == null || string.IsNullOrWhiteSpace(item.CurrentPath))
+                        continue;
+
+                    (IntPtr pidl, _) = await PidlManager.TryParseAddressAsync(item.CurrentPath, CancellationToken.None);
+                    if (pidl == IntPtr.Zero)
+                        continue;
+
+                    try
+                    {
+                        ExplorerTabItem tab = AddNewTab(pidl, activate: false, animateOpen: false);
+                        if (item.HistoryPaths != null && item.HistoryPaths.Count > 0)
+                        {
+                            tab.RestoreHistory(item.HistoryPaths, item.HistoryIndex);
+                        }
+                        restoredTabs.Add(tab);
+                        if (i == savedSelectedIdx)
+                        {
+                            preferredTab = tab;
+                        }
+                    }
+                    finally
+                    {
+                        PidlManager.Free(ref pidl);
+                    }
+                }
+            }
+            finally
+            {
+                _isRestoringSavedTabs = false;
+            }
+
+            if (restoredTabs.Count == 0)
+                return false;
+
+            ExplorerTabItem toActivate = preferredTab ?? restoredTabs[Math.Min(savedSelectedIdx, restoredTabs.Count - 1)];
+            ActivateTab(toActivate, focusNativeView: true);
+            UpdateNavigationButtonsState();
+            ScheduleSessionSave();
+            return true;
+        }
+
         public async Task HandleExternalLaunchRequestAsync(LaunchActionRequest request, bool isInitialLaunch)
         {
             if (_isClosingWindow || request == null)
@@ -557,7 +850,14 @@ namespace LeafTab.Views
                     BringWindowToFront();
                 }
 
-                if (!isInitialLaunch || _tabs.Count == 0)
+                if ((wakingFromStandby || isInitialLaunch) && _tabs.Count == 0)
+                {
+                    if (!await TryRestoreSavedTabsIfEnabledAsync())
+                    {
+                        OpenNewThisPcTab();
+                    }
+                }
+                else if (!isInitialLaunch || _tabs.Count == 0)
                 {
                     OpenNewThisPcTab();
                 }
@@ -1293,6 +1593,12 @@ namespace LeafTab.Views
 
             if (mods == ModifierKeys.Control)
             {
+                if (vk == 0x0D && !inWpfTextBox && _selectedTab?.BrowserHost.IsShowingSearchResults == true) // Ctrl + Enter
+                {
+                    _ = OpenSelectedSearchItemLocationAsync();
+                    handled = true;
+                    return;
+                }
                 if (vk == 'T')
                 {
                     OpenNewThisPcTab();
@@ -1414,8 +1720,7 @@ namespace LeafTab.Views
             {
                 if (vk == 0x74 && _selectedTab != null) // F5
                 {
-                    _lastPreviewSelectionKey = string.Empty;
-                    _selectedTab.BrowserHost.RefreshView();
+                    RefreshActiveTab(focusNativeView: false);
                     handled = true;
                     return;
                 }
@@ -1781,811 +2086,6 @@ namespace LeafTab.Views
             }
         }
 
-        // ==================== NAVIGATION & INTERACTIVE BREADCRUMB BAR ====================
-
-        private void BackButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_selectedTab != null)
-            {
-                _selectedTab.NavigateHistoryStep(-1);
-                UpdateNavigationButtonsState();
-                _selectedTab.BrowserHost.FocusNativeView();
-            }
-        }
-
-        private void ForwardButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_selectedTab != null)
-            {
-                _selectedTab.NavigateHistoryStep(+1);
-                UpdateNavigationButtonsState();
-                _selectedTab.BrowserHost.FocusNativeView();
-            }
-        }
-
-        private void UpButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_selectedTab != null)
-            {
-                _selectedTab.BrowserHost.NavigateUp();
-                _selectedTab.BrowserHost.FocusNativeView();
-            }
-        }
-
-        private void RefreshButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_selectedTab != null)
-            {
-                _selectedTab.BrowserHost.RefreshView();
-                _selectedTab.BrowserHost.FocusNativeView();
-            }
-        }
-
-        private void UpdateNavigationButtonsState()
-        {
-            if (_selectedTab == null)
-            {
-                BackButton.IsEnabled = false;
-                ForwardButton.IsEnabled = false;
-                UpButton.IsEnabled = false;
-                return;
-            }
-
-            BackButton.IsEnabled = _selectedTab.CanNavigateBack;
-            ForwardButton.IsEnabled = _selectedTab.CanNavigateForward;
-            UpButton.IsEnabled = _selectedTab.CanNavigateUp;
-        }
-
-        private void RebuildBreadcrumbBar(ExplorerTabItem tab)
-        {
-            BreadcrumbItemsPanel.Children.Clear();
-            Style segStyle = (Style)FindResource("GlassBreadcrumbSegmentButtonStyle");
-
-            string currentKey = tab.BrowserHost.IsShowingSearchResults
-                ? $"__SEARCH__:{tab.Id}:{tab.SearchQuery}"
-                : $"{tab.Id}:{tab.AddressText}";
-
-            if (tab.BrowserHost.IsShowingSearchResults)
-            {
-                var searchLabel = new Button
-                {
-                    Content = $"“{tab.SearchQuery}”在 {tab.Title} 中的搜索结果",
-                    Style = segStyle,
-                    Foreground = UiBrushes.Get(Color.FromRgb(0x00, 0x62, 0xCC)),
-                    FontWeight = FontWeights.Medium,
-                    ToolTip = "点击退出搜索并返回原目录"
-                };
-                searchLabel.Click += (_, _) =>
-                {
-                    ClearAndExitSearch();
-                    _selectedTab?.BrowserHost.FocusNativeView();
-                };
-                BreadcrumbItemsPanel.Children.Add(searchLabel);
-                AnimateBreadcrumbIfChanged(currentKey);
-                return;
-            }
-
-            List<BreadcrumbNode> chain = PidlManager.BuildBreadcrumbChain(tab.CurrentPidl);
-            for (int i = 0; i < chain.Count; i++)
-            {
-                BreadcrumbNode node = chain[i];
-                bool isLast = (i == chain.Count - 1);
-
-                var segBtn = new Button
-                {
-                    Content = node.Title,
-                    Tag = node,
-                    Style = segStyle,
-                    FontWeight = isLast ? FontWeights.SemiBold : FontWeights.Normal,
-                    Foreground = UiBrushes.Get(
-                        isLast ? Color.FromRgb(0x0F, 0x17, 0x2A) : Color.FromRgb(0x33, 0x41, 0x55)),
-                    ToolTip = node.ParsingName
-                };
-                segBtn.Click += BreadcrumbSegment_Click;
-                segBtn.MouseUp += BreadcrumbSegment_MouseUp;
-                BreadcrumbItemsPanel.Children.Add(segBtn);
-
-                var chevronBtn = new Button
-                {
-                    Width = 18,
-                    Height = 24,
-                    Padding = new Thickness(0),
-                    Tag = node,
-                    Style = segStyle,
-                    ToolTip = $"查看「{node.Title}」下的子文件夹",
-                    Content = new System.Windows.Shapes.Path
-                    {
-                        Width = 4.8,
-                        Height = 7.8,
-                        Stretch = Stretch.Uniform,
-                        Stroke = UiBrushes.Get(Color.FromRgb(0x94, 0xA3, 0xB8)),
-                        StrokeThickness = 1.25,
-                        StrokeStartLineCap = PenLineCap.Round,
-                        StrokeEndLineCap = PenLineCap.Round,
-                        StrokeLineJoin = PenLineJoin.Round,
-                        Data = Geometry.Parse("M1,1 L4.5,4.5 L1,8")
-                    }
-                };
-                chevronBtn.Click += BreadcrumbChevron_Click;
-                BreadcrumbItemsPanel.Children.Add(chevronBtn);
-            }
-
-            BreadcrumbScrollViewer.ScrollToRightEnd();
-            AnimateBreadcrumbIfChanged(currentKey);
-        }
-
-        private void AnimateBreadcrumbIfChanged(string currentKey)
-        {
-            if (!_skipSessionPersistence &&
-                !string.IsNullOrEmpty(_lastRenderedBreadcrumbKey) &&
-                !string.Equals(_lastRenderedBreadcrumbKey, currentKey, StringComparison.Ordinal))
-            {
-                BreadcrumbSlideTransform.X = 0.0;
-                BreadcrumbItemsPanel.Opacity = 1.0;
-
-                var slideAnim = new DoubleAnimation(5.5, 0.0, TimeSpan.FromMilliseconds(135))
-                {
-                    EasingFunction = s_cubicOutEase,
-                    FillBehavior = FillBehavior.Stop
-                };
-                var fadeAnim = new DoubleAnimation(0.45, 1.0, TimeSpan.FromMilliseconds(135))
-                {
-                    EasingFunction = s_cubicOutEase,
-                    FillBehavior = FillBehavior.Stop
-                };
-
-                BreadcrumbSlideTransform.BeginAnimation(TranslateTransform.XProperty, slideAnim);
-                BreadcrumbItemsPanel.BeginAnimation(UIElement.OpacityProperty, fadeAnim);
-            }
-
-            _lastRenderedBreadcrumbKey = currentKey;
-        }
-
-        private void BreadcrumbSegment_Click(object sender, RoutedEventArgs e)
-        {
-            if (sender is Button btn && btn.Tag is BreadcrumbNode node && _selectedTab != null)
-            {
-                IntPtr pidl = PidlManager.FromBytes(node.PidlBytes);
-                if (pidl != IntPtr.Zero)
-                {
-                    try
-                    {
-                        _selectedTab.BrowserHost.NavigateToPidl(pidl);
-                        _selectedTab.BrowserHost.FocusNativeView();
-                    }
-                    finally
-                    {
-                        PidlManager.Free(ref pidl);
-                    }
-                }
-            }
-        }
-
-        private void BreadcrumbSegment_MouseUp(object sender, MouseButtonEventArgs e)
-        {
-            if (e.ChangedButton == MouseButton.Middle &&
-                sender is Button btn &&
-                btn.Tag is BreadcrumbNode node)
-            {
-                IntPtr pidl = PidlManager.FromBytes(node.PidlBytes);
-                if (pidl != IntPtr.Zero)
-                {
-                    try
-                    {
-                        AddNewTab(pidl, activate: false, animateOpen: !_skipSessionPersistence);
-                        SetTransientStatus($"已在后台新标签打开：{node.Title}");
-                    }
-                    finally
-                    {
-                        PidlManager.Free(ref pidl);
-                    }
-                }
-                e.Handled = true;
-            }
-        }
-
-        private void BreadcrumbChevron_Click(object sender, RoutedEventArgs e)
-        {
-            if (sender is not Button btn || btn.Tag is not BreadcrumbNode node || _selectedTab == null)
-                return;
-
-            IntPtr parentPidl = PidlManager.FromBytes(node.PidlBytes);
-            if (parentPidl == IntPtr.Zero)
-                return;
-
-            List<BreadcrumbNode> children;
-            try
-            {
-                children = PidlManager.EnumerateChildFolders(parentPidl, maxCount: 80);
-            }
-            finally
-            {
-                PidlManager.Free(ref parentPidl);
-            }
-
-            var menu = CreateLiquidGlassContextMenu(btn);
-            if (children.Count == 0)
-            {
-                menu.Items.Add(new MenuItem { Header = "（无子文件夹）", IsEnabled = false });
-            }
-            else
-            {
-                foreach (BreadcrumbNode child in children)
-                {
-                    var mi = new MenuItem
-                    {
-                        Header = child.Title,
-                        Tag = child,
-                        Icon = CreateMenuIcon(child.Icon)
-                    };
-                    mi.Click += (_, _) =>
-                    {
-                        IntPtr target = PidlManager.FromBytes(child.PidlBytes);
-                        if (target != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                _selectedTab?.BrowserHost.NavigateToPidl(target);
-                                _selectedTab?.BrowserHost.FocusNativeView();
-                            }
-                            finally
-                            {
-                                PidlManager.Free(ref target);
-                            }
-                        }
-                    };
-                    menu.Items.Add(mi);
-                }
-            }
-
-            menu.IsOpen = true;
-            e.Handled = true;
-        }
-
-        private void AddressBoxBorder_MouseEnter(object sender, MouseEventArgs e) => UpdateBookmarkStarOpacity(animate: true);
-
-        private void AddressBoxBorder_MouseLeave(object sender, MouseEventArgs e) => UpdateBookmarkStarOpacity(animate: true);
-
-        private void UpdateBookmarkStarOpacity(bool animate)
-        {
-            double targetOpacity = _isCurrentFolderStarred
-                ? 1.0
-                : (AddressBoxBorder.IsMouseOver ? 0.82 : 0.0);
-
-            BookmarkStarButton.IsHitTestVisible = targetOpacity > 0.01;
-
-            if (!animate || _skipSessionPersistence)
-            {
-                BookmarkStarButton.BeginAnimation(UIElement.OpacityProperty, null);
-                BookmarkStarButton.Opacity = targetOpacity;
-                return;
-            }
-
-            var anim = new DoubleAnimation(targetOpacity, TimeSpan.FromMilliseconds(120))
-            {
-                EasingFunction = s_cubicOutEase
-            };
-            BookmarkStarButton.BeginAnimation(UIElement.OpacityProperty, anim);
-        }
-
-        private void BreadcrumbRootIconButton_Click(object sender, RoutedEventArgs e)
-        {
-            EnterAddressEditMode();
-            e.Handled = true;
-        }
-
-        internal static bool ShouldEnterAddressEditFromBreadcrumbClick(DependencyObject? originalSource, DependencyObject? containerStop)
-        {
-            if (originalSource == null)
-                return false;
-
-            DependencyObject? current = originalSource;
-            while (current != null && !ReferenceEquals(current, containerStop))
-            {
-                if (current is System.Windows.Controls.Primitives.ButtonBase)
-                    return false;
-
-                if (current is Visual || current is System.Windows.Media.Media3D.Visual3D)
-                {
-                    current = VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current);
-                }
-                else
-                {
-                    current = LogicalTreeHelper.GetParent(current);
-                }
-            }
-
-            return true;
-        }
-
-        private void BreadcrumbBlank_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-        {
-            if (AddressEditGrid.Visibility == Visibility.Visible)
-                return;
-
-            if (ShouldEnterAddressEditFromBreadcrumbClick(e.OriginalSource as DependencyObject, AddressBoxBorder))
-            {
-                EnterAddressEditMode();
-                e.Handled = true;
-            }
-        }
-
-        public void EnterAddressEditMode()
-        {
-            _suppressAddressSuggestUpdate = true;
-            try
-            {
-                if (_selectedTab != null)
-                {
-                    AddressTextBox.Text = _selectedTab.AddressText;
-                }
-            }
-            finally
-            {
-                _suppressAddressSuggestUpdate = false;
-            }
-
-            BreadcrumbContainerGrid.Visibility = Visibility.Collapsed;
-            AddressEditGrid.Visibility = Visibility.Visible;
-            AddressBoxBorder.Background = Brushes.White;
-            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
-            AddressBoxBorder.BorderThickness = new Thickness(1.4);
-
-            IntPtr mainHwnd = new WindowInteropHelper(this).Handle;
-            IntPtr curWin32Focus = mainHwnd != IntPtr.Zero ? NativeMethods.GetFocus() : IntPtr.Zero;
-            if (mainHwnd != IntPtr.Zero &&
-                curWin32Focus != IntPtr.Zero &&
-                curWin32Focus != mainHwnd &&
-                NativeMethods.IsChild(mainHwnd, curWin32Focus))
-            {
-                NativeMethods.SetFocus(mainHwnd);
-            }
-
-            AddressEditGrid.UpdateLayout();
-            AddressTextBox.Focus();
-            Keyboard.Focus(AddressTextBox);
-            AddressTextBox.SelectAll();
-
-            if (!_skipSessionPersistence && IsActive)
-            {
-                RefreshAddressSuggestions(showDefaultHistory: true);
-            }
-        }
-
-        public void ExitAddressEditMode()
-        {
-            _addressSuggestCts?.Cancel();
-            AddressSuggestPopup.IsOpen = false;
-            AddressEditGrid.Visibility = Visibility.Collapsed;
-            BreadcrumbContainerGrid.Visibility = Visibility.Visible;
-            AddressBoxBorder.Background = UiBrushes.Get(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
-            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
-            AddressBoxBorder.BorderThickness = new Thickness(1);
-        }
-
-        private async void RefreshAddressSuggestions(bool showDefaultHistory)
-        {
-            if (AddressEditGrid.Visibility != Visibility.Visible || _isClosingWindow)
-            {
-                AddressSuggestPopup.IsOpen = false;
-                return;
-            }
-
-            var bookmarkPaths = new List<string>(_bookmarks.Count);
-            foreach (BookmarkItemViewModel bm in _bookmarks)
-            {
-                if (!string.IsNullOrWhiteSpace(bm.TargetPath))
-                {
-                    bookmarkPaths.Add(bm.TargetPath);
-                }
-            }
-
-            _addressSuggestCts?.Cancel();
-            _addressSuggestCts?.Dispose();
-            _addressSuggestCts = new CancellationTokenSource();
-            CancellationToken token = _addressSuggestCts.Token;
-            string text = AddressTextBox.Text;
-            try
-            {
-                var suggestions = await QuickLaunchAndInstallService.BuildAddressSuggestionsAsync(
-                    text, showDefaultHistory, _recentFolders.ToArray(), bookmarkPaths, token);
-                if (token.IsCancellationRequested || _isClosingWindow || AddressEditGrid.Visibility != Visibility.Visible) return;
-                AddressSuggestListBox.ItemsSource = suggestions;
-                AddressSuggestListBox.SelectedIndex = -1;
-                AddressSuggestPopup.IsOpen = suggestions.Count > 0 && IsActive;
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex) { DiagnosticLog.Write("address-completion-failed", ex); }
-        }
-
-        private void SetAddressTextFromSuggestion(string text)
-        {
-            _suppressAddressSuggestUpdate = true;
-            try
-            {
-                AddressTextBox.Text = text ?? string.Empty;
-                AddressTextBox.CaretIndex = AddressTextBox.Text.Length;
-            }
-            finally
-            {
-                _suppressAddressSuggestUpdate = false;
-            }
-        }
-
-        private void AddressHistoryToggleButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (AddressSuggestPopup.IsOpen)
-            {
-                AddressSuggestPopup.IsOpen = false;
-            }
-            else
-            {
-                RefreshAddressSuggestions(showDefaultHistory: true);
-            }
-            e.Handled = true;
-        }
-
-        private void AddressTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            if (_suppressAddressSuggestUpdate ||
-                AddressEditGrid.Visibility != Visibility.Visible ||
-                !AddressTextBox.IsKeyboardFocusWithin)
-            {
-                return;
-            }
-
-            RefreshAddressSuggestions(showDefaultHistory: false);
-        }
-
-        private void AddressTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Down)
-            {
-                if (!AddressSuggestPopup.IsOpen)
-                {
-                    bool useDefault = string.IsNullOrWhiteSpace(AddressTextBox.Text) ||
-                                      string.Equals(AddressTextBox.Text, _selectedTab?.AddressText, StringComparison.OrdinalIgnoreCase);
-                    RefreshAddressSuggestions(showDefaultHistory: useDefault);
-                }
-
-                if (AddressSuggestListBox.Items.Count > 0)
-                {
-                    int next = (AddressSuggestListBox.SelectedIndex + 1) % AddressSuggestListBox.Items.Count;
-                    AddressSuggestListBox.SelectedIndex = next;
-                    AddressSuggestListBox.ScrollIntoView(AddressSuggestListBox.SelectedItem);
-                    if (AddressSuggestListBox.SelectedItem is AddressSuggestionItem sel)
-                    {
-                        SetAddressTextFromSuggestion(sel.InsertText);
-                    }
-                    e.Handled = true;
-                }
-                return;
-            }
-
-            if (e.Key == Key.Up && AddressSuggestPopup.IsOpen && AddressSuggestListBox.Items.Count > 0)
-            {
-                int count = AddressSuggestListBox.Items.Count;
-                int prev = AddressSuggestListBox.SelectedIndex <= 0
-                    ? count - 1
-                    : AddressSuggestListBox.SelectedIndex - 1;
-                AddressSuggestListBox.SelectedIndex = prev;
-                AddressSuggestListBox.ScrollIntoView(AddressSuggestListBox.SelectedItem);
-                if (AddressSuggestListBox.SelectedItem is AddressSuggestionItem sel)
-                {
-                    SetAddressTextFromSuggestion(sel.InsertText);
-                }
-                e.Handled = true;
-                return;
-            }
-
-            if (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.None)
-            {
-                if (!AddressSuggestPopup.IsOpen)
-                {
-                    RefreshAddressSuggestions(showDefaultHistory: false);
-                }
-
-                AddressSuggestionItem? candidate = AddressSuggestListBox.SelectedItem as AddressSuggestionItem
-                    ?? (AddressSuggestListBox.Items.Count > 0 ? AddressSuggestListBox.Items[0] as AddressSuggestionItem : null);
-
-                if (candidate != null)
-                {
-                    string completed = candidate.InsertText;
-                    if (!candidate.IsCommand &&
-                        Directory.Exists(completed) &&
-                        !completed.EndsWith("\\", StringComparison.Ordinal))
-                    {
-                        completed += "\\";
-                    }
-
-                    SetAddressTextFromSuggestion(completed);
-                    RefreshAddressSuggestions(showDefaultHistory: false);
-                    e.Handled = true;
-                }
-            }
-        }
-
-        private async void AddressSuggestItem_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        {
-            if (sender is ListBoxItem lbi && lbi.DataContext is AddressSuggestionItem item)
-            {
-                e.Handled = true;
-                AddressSuggestPopup.IsOpen = false;
-                await NavigateAddressInputAsync(item.InsertText);
-            }
-        }
-
-        private void AddressTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        {
-            AddressBoxBorder.Background = Brushes.White;
-            AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
-            AddressTextBox.SelectAll();
-        }
-
-        private void AddressTextBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        {
-            ExitAddressEditMode();
-        }
-
-        private async void AddressTextBox_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Escape)
-            {
-                ExitAddressEditMode();
-                _selectedTab?.BrowserHost.FocusNativeView();
-                e.Handled = true;
-                return;
-            }
-
-            if (e.Key == Key.Enter)
-            {
-                e.Handled = true;
-                string targetInput = (AddressSuggestPopup.IsOpen &&
-                                      AddressSuggestListBox.SelectedItem is AddressSuggestionItem selectedItem)
-                    ? selectedItem.InsertText
-                    : AddressTextBox.Text;
-                AddressSuggestPopup.IsOpen = false;
-                await NavigateAddressInputAsync(targetInput);
-            }
-        }
-
-        public async Task<bool> NavigateAddressInputAsync(string inputText)
-        {
-            if (_selectedTab == null)
-                return false;
-
-            if (QuickLaunchAndInstallService.TryExecuteAddressToolCommand(
-                    inputText,
-                    _selectedTab.FileSystemPath,
-                    out string toolStatus))
-            {
-                ExitAddressEditMode();
-                _selectedTab.BrowserHost.FocusNativeView();
-                if (!string.IsNullOrEmpty(toolStatus))
-                {
-                    SetTransientStatus(toolStatus);
-                }
-                return true;
-            }
-
-            _addressParseCts?.Cancel();
-            _addressParseCts?.Dispose();
-            _addressParseCts = new CancellationTokenSource();
-            CancellationToken token = _addressParseCts.Token;
-
-            int reqId = ++_addressNavRequestId;
-            ExplorerTabItem targetTab = _selectedTab;
-            AddressBusyIndicator.Visibility = Visibility.Visible;
-
-            try
-            {
-                (IntPtr pidl, string? error) = await PidlManager.TryParseAddressAsync(inputText, token);
-                if (token.IsCancellationRequested || _isClosingWindow || !_tabs.Contains(targetTab))
-                {
-                    PidlManager.Free(ref pidl);
-                    return false;
-                }
-
-                if (pidl == IntPtr.Zero)
-                {
-                    if (ReferenceEquals(_selectedTab, targetTab))
-                    {
-                        SetTransientStatus(error ?? "路径无效。");
-                    }
-                    return false;
-                }
-
-                try
-                {
-                    bool ok = targetTab.BrowserHost.NavigateToPidl(pidl);
-                    if (ok)
-                    {
-                        if (ReferenceEquals(_selectedTab, targetTab))
-                        {
-                            ExitAddressEditMode();
-                            targetTab.BrowserHost.FocusNativeView();
-                        }
-                    }
-                    else if (ReferenceEquals(_selectedTab, targetTab))
-                    {
-                        SetTransientStatus($"无法跳转到：{inputText}");
-                    }
-                    return ok;
-                }
-                finally
-                {
-                    PidlManager.Free(ref pidl);
-                }
-            }
-            finally
-            {
-                if (reqId == _addressNavRequestId)
-                {
-                    AddressBusyIndicator.Visibility = Visibility.Collapsed;
-                }
-            }
-        }
-
-        // ==================== ASYNC DIRECTORY SEARCH POD ====================
-
-        private void FocusSearchBox()
-        {
-            SearchTextBox.Focus();
-            SearchTextBox.SelectAll();
-        }
-
-        private void SetSearchBoxTextSilently(string text)
-        {
-            _suppressSearchTextChanged = true;
-            try
-            {
-                SearchTextBox.Text = text ?? string.Empty;
-                UpdateSearchBoxVisuals();
-            }
-            finally
-            {
-                _suppressSearchTextChanged = false;
-            }
-        }
-
-        private void UpdateSearchBoxVisuals()
-        {
-            bool hasText = !string.IsNullOrEmpty(SearchTextBox.Text);
-            SearchPlaceholderText.Visibility = hasText ? Visibility.Collapsed : Visibility.Visible;
-            ClearSearchButton.Visibility = (hasText || (_selectedTab?.BrowserHost.IsShowingSearchResults ?? false))
-                ? Visibility.Visible
-                : Visibility.Collapsed;
-        }
-
-        private void SearchTextBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        {
-            SearchBoxBorder.Background = Brushes.White;
-            SearchBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
-            SearchBoxBorder.BorderThickness = new Thickness(1.4);
-        }
-
-        private void SearchTextBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        {
-            SearchBoxBorder.Background = UiBrushes.Get(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF));
-            SearchBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0x16, 0x0F, 0x17, 0x2A));
-            SearchBoxBorder.BorderThickness = new Thickness(1);
-        }
-
-        private void SearchTextBox_TextChanged(object sender, TextChangedEventArgs e)
-        {
-            UpdateSearchBoxVisuals();
-            if (_suppressSearchTextChanged || _selectedTab == null)
-                return;
-
-            _selectedTab.SearchQuery = SearchTextBox.Text;
-            _searchDebounceTimer.Stop();
-            _pendingSearchTab = null;
-
-            if (string.IsNullOrWhiteSpace(SearchTextBox.Text))
-            {
-                if (_selectedTab.BrowserHost.IsShowingSearchResults)
-                {
-                    _selectedTab.BrowserHost.ExitSearchMode();
-                }
-                return;
-            }
-
-            _pendingSearchTab = _selectedTab;
-            _searchDebounceTimer.Start();
-        }
-
-        private async void SearchDebounceTimer_Tick(object? sender, EventArgs e)
-        {
-            _searchDebounceTimer.Stop();
-            ExplorerTabItem? target = _pendingSearchTab;
-            _pendingSearchTab = null;
-
-            if (target != null && _tabs.Contains(target))
-            {
-                await ExecuteSearchOnTabAsync(target, target.SearchQuery);
-            }
-        }
-
-        private async void SearchTextBox_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.Key == Key.Escape)
-            {
-                ClearAndExitSearch();
-                _selectedTab?.BrowserHost.FocusNativeView();
-                e.Handled = true;
-                return;
-            }
-
-            if (e.Key == Key.Enter)
-            {
-                _searchDebounceTimer.Stop();
-                _pendingSearchTab = null;
-                e.Handled = true;
-                await ExecuteSearchOnSelectedTabAsync();
-            }
-        }
-
-        private async void SearchSubmitButton_Click(object sender, RoutedEventArgs e)
-        {
-            _searchDebounceTimer.Stop();
-            _pendingSearchTab = null;
-            if (string.IsNullOrWhiteSpace(SearchTextBox.Text))
-            {
-                FocusSearchBox();
-                return;
-            }
-            await ExecuteSearchOnSelectedTabAsync();
-        }
-
-        private void ClearSearchButton_Click(object sender, RoutedEventArgs e)
-        {
-            ClearAndExitSearch();
-            _selectedTab?.BrowserHost.FocusNativeView();
-        }
-
-        private void ClearAndExitSearch()
-        {
-            _searchDebounceTimer.Stop();
-            _pendingSearchTab = null;
-            if (_selectedTab != null)
-            {
-                _selectedTab.SearchQuery = string.Empty;
-                _selectedTab.BrowserHost.ExitSearchMode();
-            }
-            SetSearchBoxTextSilently(string.Empty);
-            UpdateNavigationButtonsState();
-            UpdateCommandBarAndStatus(computeBytes: false);
-        }
-
-        public Task<int> ExecuteSearchOnSelectedTabAsync() =>
-            _selectedTab != null
-                ? ExecuteSearchOnTabAsync(_selectedTab, SearchTextBox.Text)
-                : Task.FromResult(0);
-
-        private async Task<int> ExecuteSearchOnTabAsync(ExplorerTabItem targetTab, string? rawQuery)
-        {
-            if (targetTab == null || !_tabs.Contains(targetTab))
-                return 0;
-
-            string query = (rawQuery ?? string.Empty).Trim();
-            if (string.IsNullOrEmpty(query))
-                return 0;
-
-            targetTab.SearchQuery = query;
-            int found = await targetTab.BrowserHost.StartSearchAsync(
-                query,
-                targetTab.CurrentPidl,
-                targetTab.FileSystemPath);
-
-            if (ReferenceEquals(_selectedTab, targetTab))
-            {
-                UpdateNavigationButtonsState();
-                UpdateCommandBarAndStatus(computeBytes: false);
-            }
-
-            return found;
-        }
-
         // ==================== LIQUID GLASS COMMAND BAR ACTIONS & DROPDOWNS ====================
 
         private ContextMenu CreateLiquidGlassContextMenu(UIElement placementTarget)
@@ -2786,6 +2286,10 @@ namespace LeafTab.Views
             }
 
             AddSortKeyItem("名称", PropertyKeys.ItemNameDisplay);
+            if (_selectedTab.BrowserHost.IsShowingSearchResults)
+            {
+                AddSortKeyItem("所在文件夹", PropertyKeys.ItemFolderPathDisplay);
+            }
             AddSortKeyItem("修改日期", PropertyKeys.DateModified);
             AddSortKeyItem("类型", PropertyKeys.ItemTypeText);
             AddSortKeyItem("大小", PropertyKeys.Size);
@@ -2893,6 +2397,19 @@ namespace LeafTab.Views
         private void MoreMenuButton_Click(object sender, RoutedEventArgs e)
         {
             var menu = CreateLiquidGlassContextMenu(MoreMenuButton);
+
+            if (_selectedTab?.BrowserHost.IsShowingSearchResults == true)
+            {
+                var miOpenLoc = new MenuItem
+                {
+                    Header = "打开文件所在位置",
+                    InputGestureText = "Ctrl+Enter",
+                    IsEnabled = _selectedTab.BrowserHost.GetItemCounts().SelectedItems == 1
+                };
+                miOpenLoc.Click += async (_, _) => await OpenSelectedSearchItemLocationAsync();
+                menu.Items.Add(miOpenLoc);
+                menu.Items.Add(CreateLiquidGlassMenuSeparator());
+            }
 
             var miSelectAll = new MenuItem { Header = "全选", InputGestureText = "Ctrl+A" };
             miSelectAll.Click += (_, _) =>
@@ -3084,6 +2601,61 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miWarmStandby);
 
+            var miRestoreTabs = new MenuItem
+            {
+                Header = "启动时恢复上次打开的标签页",
+                IsChecked = _restorePreviousTabs
+            };
+            miRestoreTabs.Click += (_, _) =>
+            {
+                _restorePreviousTabs = !_restorePreviousTabs;
+                SaveConfigurationSnapshot();
+                SetTransientStatus(_restorePreviousTabs
+                    ? "已开启启动时自动恢复上次打开的标签页"
+                    : "已关闭启动时恢复标签页（直接启动将打开「此电脑」）");
+            };
+            menu.Items.Add(miRestoreTabs);
+
+            menu.Items.Add(CreateLiquidGlassMenuSeparator());
+
+            var miOpenDiagLogs = new MenuItem
+            {
+                Header = "打开诊断日志目录"
+            };
+            miOpenDiagLogs.Click += async (_, _) =>
+            {
+                try
+                {
+                    Directory.CreateDirectory(DiagnosticLog.DirectoryPath);
+                    (IntPtr logPidl, _) = await PidlManager.TryParseAddressAsync(DiagnosticLog.DirectoryPath, CancellationToken.None);
+                    if (logPidl != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            AddNewTab(logPidl, activate: true, animateOpen: !_skipSessionPersistence);
+                            SetTransientStatus($"已打开诊断日志目录：{DiagnosticLog.DirectoryPath}");
+                        }
+                        finally
+                        {
+                            PidlManager.Free(ref logPidl);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SetTransientStatus($"无法打开诊断日志目录：{ex.Message}");
+                }
+            };
+            menu.Items.Add(miOpenDiagLogs);
+
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.3";
+            var miAboutVer = new MenuItem
+            {
+                Header = $"版本 LeafTab v{appVer} (x64)",
+                IsEnabled = false
+            };
+            menu.Items.Add(miAboutVer);
+
             menu.Items.Add(CreateLiquidGlassMenuSeparator());
 
             var miQuitAll = new MenuItem
@@ -3096,450 +2668,17 @@ namespace LeafTab.Views
             menu.IsOpen = true;
         }
 
-        private void PreviewPaneButton_Click(object sender, RoutedEventArgs e)
-        {
-            TogglePreviewPane();
-            _selectedTab?.BrowserHost.FocusNativeView();
-        }
-
-        private void PreviewCloseButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_showPreviewPane)
-            {
-                TogglePreviewPane();
-                _selectedTab?.BrowserHost.FocusNativeView();
-            }
-        }
-
-        private void PreviewRawToggleButton_Click(object sender, RoutedEventArgs e)
-        {
-            _previewMarkdownRawMode = !_previewMarkdownRawMode;
-            if (_currentPreviewData != null && _currentPreviewData.Kind == FilePreviewKind.Markdown)
-            {
-                RenderLoadedPreviewData(_currentPreviewData, PreviewHeaderIcon.Source);
-            }
-        }
-
-        private void PreviewGridSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
-        {
-            if (PreviewPaneColumn.Width.IsAbsolute && PreviewPaneColumn.Width.Value >= 220)
-            {
-                _previewPaneWidthDip = PreviewPaneColumn.Width.Value;
-            }
-            _selectedTab?.BrowserHost.SyncBrowserRect();
-        }
-
-        private void PreviewOpenDefaultButton_Click(object sender, RoutedEventArgs e)
-        {
-            if (_currentPreviewData == null ||
-                !_currentPreviewData.CanOpenWithDefaultApp ||
-                string.IsNullOrWhiteSpace(_currentPreviewData.FilePath) ||
-                !File.Exists(_currentPreviewData.FilePath))
-            {
-                return;
-            }
-
-            try
-            {
-                Process.Start(new ProcessStartInfo(_currentPreviewData.FilePath) { UseShellExecute = true });
-            }
-            catch (Exception ex)
-            {
-                SetTransientStatus($"无法打开文件：{ex.Message}");
-            }
-        }
-
-        internal void TogglePreviewPane()
-        {
-            _showPreviewPane = !_showPreviewPane;
-            UpdatePreviewButtonVisual();
-
-            foreach (ExplorerTabItem tab in _tabs)
-            {
-                tab.BrowserHost.SetPreviewPaneVisible(_showPreviewPane);
-            }
-
-            _prewarmedThisPcHost?.SetPreviewPaneVisible(_showPreviewPane);
-
-            ApplyPreviewPaneLayout();
-            SetTransientStatus(_showPreviewPane ? "已开启右侧预览窗格" : "已关闭右侧预览窗格");
-            ScheduleSessionSave();
-        }
-
-        private double ComputePreviewMaxWidth()
-        {
-            double refWidth = ActualWidth > 400
-                ? ActualWidth
-                : (!double.IsNaN(Width) && Width > 400 ? Width : 1160);
-            return Math.Max(220, Math.Min(refWidth * 0.55, refWidth - 330));
-        }
-
-        private void ApplyPreviewPaneLayout()
-        {
-            if (_showPreviewPane)
-            {
-                PreviewGridSplitter.Visibility = Visibility.Visible;
-                PreviewSidebarBorder.Visibility = Visibility.Visible;
-                PreviewSplitterColumn.Width = new GridLength(5);
-                PreviewPaneColumn.MinWidth = 220;
-
-                double maxW = ComputePreviewMaxWidth();
-                PreviewPaneColumn.MaxWidth = maxW;
-                PreviewPaneColumn.Width = new GridLength(Math.Max(220, Math.Min(_previewPaneWidthDip, maxW)));
-
-                _lastPreviewSelectionKey = string.Empty;
-                _selectedTab?.BrowserHost.InvalidateSelectionCache();
-            }
-            else
-            {
-                CancelPendingPreviewLoad();
-                _currentPreviewData = null;
-                _lastPreviewSelectionKey = string.Empty;
-                ClearPreviewBodyContent();
-
-                // Reset MinWidth/MaxWidth before setting Width=0 so Grid column collapses cleanly to zero width.
-                PreviewPaneColumn.MinWidth = 0;
-                PreviewPaneColumn.MaxWidth = double.PositiveInfinity;
-                PreviewSplitterColumn.Width = new GridLength(0);
-                PreviewPaneColumn.Width = new GridLength(0);
-                PreviewGridSplitter.Visibility = Visibility.Collapsed;
-                PreviewSidebarBorder.Visibility = Visibility.Collapsed;
-            }
-
-            ContentSurfaceGrid.UpdateLayout();
-            _selectedTab?.BrowserHost.SyncBrowserRect();
-
-            if (_showPreviewPane && _selectedTab != null)
-            {
-                UpdateCommandBarAndStatus(computeBytes: true);
-            }
-        }
-
-        private void CancelPendingPreviewLoad()
-        {
-            _previewRequestVersion++;
-            if (_previewLoadCts != null)
-            {
-                try { _previewLoadCts.Cancel(); } catch { }
-                _previewLoadCts.Dispose();
-                _previewLoadCts = null;
-            }
-        }
-
-        private void ClearPreviewBodyContent()
-        {
-            PreviewHeaderIcon.Source = null;
-            PreviewHeaderTitle.Text = "预览";
-            PreviewHeaderSubtitle.Text = "未选择任何项目";
-            PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-            PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-            PreviewNoticeText.Text = string.Empty;
-            PreviewDocumentViewer.Document = null;
-            PreviewTextBox.Text = string.Empty;
-            PreviewImageControl.Source = null;
-            PreviewCardIcon.Source = null;
-            PreviewMetadataRowsPanel.Children.Clear();
-            PreviewCardNote.Text = string.Empty;
-            PreviewCardNote.Visibility = Visibility.Collapsed;
-            PreviewOpenDefaultButton.Visibility = Visibility.Collapsed;
-            PreviewEmptyText.Text = "选择一个文件以预览内容";
-            ShowPreviewBodyElement(PreviewEmptyPanel);
-        }
-
-        private void ShowPreviewBodyElement(UIElement activeElement)
-        {
-            PreviewEmptyPanel.Visibility = ReferenceEquals(activeElement, PreviewEmptyPanel) ? Visibility.Visible : Visibility.Collapsed;
-            PreviewDocumentViewer.Visibility = ReferenceEquals(activeElement, PreviewDocumentViewer) ? Visibility.Visible : Visibility.Collapsed;
-            PreviewTextBox.Visibility = ReferenceEquals(activeElement, PreviewTextBox) ? Visibility.Visible : Visibility.Collapsed;
-            PreviewImagePanel.Visibility = ReferenceEquals(activeElement, PreviewImagePanel) ? Visibility.Visible : Visibility.Collapsed;
-            PreviewMetadataScroll.Visibility = ReferenceEquals(activeElement, PreviewMetadataScroll) ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private void RefreshPreviewPaneForSelection(
-            SelectionStatusInfo sel,
-            (string? FileSystemPath, string? DisplayName, bool IsFolder) single)
-        {
-            if (!_showPreviewPane || _isClosingWindow)
-                return;
-
-            string key;
-            if (sel.SelectedItems <= 0)
-            {
-                key = "EMPTY";
-            }
-            else if (sel.SelectedItems > 1)
-            {
-                key = $"MULTI|{sel.SelectedItems}|{sel.SelectedSizeBytes}|{sel.HasSizedFileSelection}";
-            }
-            else
-            {
-                key = $"ONE|{single.FileSystemPath ?? string.Empty}|{single.DisplayName ?? string.Empty}|{single.IsFolder}";
-            }
-
-            if (string.Equals(key, _lastPreviewSelectionKey, StringComparison.Ordinal))
-                return;
-
-            _lastPreviewSelectionKey = key;
-            CancelPendingPreviewLoad();
-
-            if (sel.SelectedItems <= 0)
-            {
-                _currentPreviewData = null;
-                PreviewHeaderIcon.Source = _selectedTab?.Icon;
-                PreviewHeaderTitle.Text = "预览";
-                PreviewHeaderSubtitle.Text = "未选择任何项目";
-                PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-                PreviewDocumentViewer.Document = null;
-                PreviewTextBox.Text = string.Empty;
-                PreviewImageControl.Source = null;
-                PreviewEmptyText.Text = "选择一个文件以预览内容";
-                ShowPreviewBodyElement(PreviewEmptyPanel);
-                return;
-            }
-
-            if (sel.SelectedItems > 1)
-            {
-                _currentPreviewData = null;
-                PreviewHeaderIcon.Source = null;
-                PreviewHeaderTitle.Text = $"已选择 {sel.SelectedItems} 个项目";
-                PreviewHeaderSubtitle.Text = sel.HasSizedFileSelection
-                    ? $"总大小 {PidlManager.FormatByteSize(sel.SelectedSizeBytes)}"
-                    : "多项选择";
-                PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-                PreviewDocumentViewer.Document = null;
-                PreviewTextBox.Text = string.Empty;
-                PreviewImageControl.Source = null;
-                PreviewEmptyText.Text = sel.HasSizedFileSelection
-                    ? $"已选择 {sel.SelectedItems} 个项目（共 {PidlManager.FormatByteSize(sel.SelectedSizeBytes)}）"
-                    : $"已选择 {sel.SelectedItems} 个项目";
-                ShowPreviewBodyElement(PreviewEmptyPanel);
-                return;
-            }
-
-            int requestVersion = _previewRequestVersion;
-            var cts = new CancellationTokenSource();
-            _previewLoadCts = cts;
-            _ = LoadAndRenderSingleItemPreviewAsync(
-                single.FileSystemPath,
-                single.DisplayName,
-                single.IsFolder,
-                requestVersion,
-                cts);
-        }
-
-        private async Task LoadAndRenderSingleItemPreviewAsync(
-            string? filePath,
-            string? displayName,
-            bool isFolder,
-            int requestVersion,
-            CancellationTokenSource cts)
-        {
-            string iconKey = !string.IsNullOrWhiteSpace(filePath) ? filePath! : (displayName ?? string.Empty);
-            (ImageSource? largeIcon, string typeName) = !string.IsNullOrWhiteSpace(iconKey)
-                ? PidlManager.GetLargeIconAndTypeName(iconKey, isFolder)
-                : (null, isFolder ? "文件夹" : "项目");
-
-            try
-            {
-                FilePreviewData data = await FilePreviewService.LoadPreviewAsync(
-                    filePath,
-                    displayName,
-                    isFolder,
-                    typeName,
-                    cts.Token).ConfigureAwait(true);
-
-                if (_isClosingWindow || !_showPreviewPane || requestVersion != _previewRequestVersion || cts.IsCancellationRequested)
-                    return;
-
-                _currentPreviewData = data;
-                RenderLoadedPreviewData(data, largeIcon);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }
-
-        private void RenderLoadedPreviewData(FilePreviewData data, ImageSource? largeIcon)
-        {
-            PreviewHeaderIcon.Source = largeIcon ?? _selectedTab?.Icon;
-            PreviewHeaderTitle.Text = data.Title;
-            PreviewHeaderSubtitle.Text = data.Subtitle;
-
-            if (data.IsTruncated)
-            {
-                PreviewNoticeBanner.Visibility = Visibility.Visible;
-                PreviewNoticeText.Text = $"文件较大（{PidlManager.FormatByteSize((ulong)Math.Max(0, data.TotalFileBytes))}），仅展示前 96 KB 预览内容";
-            }
-            else
-            {
-                PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-                PreviewNoticeText.Text = string.Empty;
-            }
-
-            switch (data.Kind)
-            {
-                case FilePreviewKind.Markdown:
-                    PreviewImageControl.Source = null;
-                    PreviewRawToggleButton.Visibility = Visibility.Visible;
-                    PreviewRawToggleButton.Content = _previewMarkdownRawMode ? "渲染" : "源码";
-
-                    if (_previewMarkdownRawMode)
-                    {
-                        PreviewDocumentViewer.Document = null;
-                        PreviewTextBox.Text = data.TextContent;
-                        PreviewTextBox.ScrollToHome();
-                        ShowPreviewBodyElement(PreviewTextBox);
-                    }
-                    else
-                    {
-                        try
-                        {
-                            PreviewDocumentViewer.Document = FilePreviewService.BuildMarkdownDocument(data.TextContent, OpenSafePreviewUri);
-                            ShowPreviewBodyElement(PreviewDocumentViewer);
-                        }
-                        catch
-                        {
-                            PreviewDocumentViewer.Document = null;
-                            PreviewTextBox.Text = data.TextContent;
-                            PreviewTextBox.ScrollToHome();
-                            ShowPreviewBodyElement(PreviewTextBox);
-                        }
-                    }
-                    break;
-
-                case FilePreviewKind.Text:
-                    PreviewImageControl.Source = null;
-                    PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                    PreviewDocumentViewer.Document = null;
-                    PreviewTextBox.Text = data.TextContent;
-                    PreviewTextBox.ScrollToHome();
-                    ShowPreviewBodyElement(PreviewTextBox);
-                    break;
-
-                case FilePreviewKind.Image:
-                    PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                    PreviewDocumentViewer.Document = null;
-                    PreviewTextBox.Text = string.Empty;
-                    PreviewImageControl.Source = data.Image;
-                    ShowPreviewBodyElement(PreviewImagePanel);
-                    break;
-
-                default:
-                    PreviewImageControl.Source = null;
-                    PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                    PreviewDocumentViewer.Document = null;
-                    PreviewTextBox.Text = string.Empty;
-                    PopulatePreviewMetadataCard(data, largeIcon);
-                    ShowPreviewBodyElement(PreviewMetadataScroll);
-                    break;
-            }
-        }
-
-        private void PopulatePreviewMetadataCard(FilePreviewData data, ImageSource? largeIcon)
-        {
-            PreviewCardIcon.Source = largeIcon ?? _selectedTab?.Icon;
-            PreviewCardTitle.Text = data.Title;
-            PreviewCardType.Text = data.Subtitle;
-
-            PreviewMetadataRowsPanel.Children.Clear();
-            Brush labelBrush = UiBrushes.Get(Color.FromRgb(0x64, 0x74, 0x8B));
-            Brush valueBrush = UiBrushes.Get(Color.FromRgb(0x0F, 0x17, 0x2A));
-
-            for (int i = 0; i < data.MetadataRows.Count; i++)
-            {
-                FilePreviewMetadataRow meta = data.MetadataRows[i];
-                var rowGrid = new Grid
-                {
-                    Margin = i < data.MetadataRows.Count - 1 ? new Thickness(0, 0, 0, 7) : new Thickness(0)
-                };
-                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(68) });
-                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-                var lbl = new TextBlock
-                {
-                    Text = meta.Label,
-                    FontSize = 11.5,
-                    Foreground = labelBrush,
-                    VerticalAlignment = VerticalAlignment.Top
-                };
-                Grid.SetColumn(lbl, 0);
-
-                var val = new TextBlock
-                {
-                    Text = meta.Value,
-                    FontSize = 11.5,
-                    Foreground = valueBrush,
-                    TextWrapping = TextWrapping.Wrap,
-                    VerticalAlignment = VerticalAlignment.Top
-                };
-                Grid.SetColumn(val, 1);
-
-                rowGrid.Children.Add(lbl);
-                rowGrid.Children.Add(val);
-                PreviewMetadataRowsPanel.Children.Add(rowGrid);
-            }
-
-            if (!string.IsNullOrWhiteSpace(data.StatusMessage))
-            {
-                PreviewCardNote.Text = data.StatusMessage;
-                PreviewCardNote.Visibility = Visibility.Visible;
-            }
-            else
-            {
-                PreviewCardNote.Text = string.Empty;
-                PreviewCardNote.Visibility = Visibility.Collapsed;
-            }
-
-            PreviewOpenDefaultButton.Visibility = data.CanOpenWithDefaultApp ? Visibility.Visible : Visibility.Collapsed;
-            PreviewMetadataScroll.ScrollToTop();
-        }
-
-        private static void OpenSafePreviewUri(Uri uri)
-        {
-            if (uri == null || !uri.IsAbsoluteUri)
-                return;
-
-            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            try
-            {
-                Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
-            }
-            catch
-            {
-            }
-        }
-
-        private void UpdatePreviewButtonVisual()
-        {
-            if (_showPreviewPane)
-            {
-                PreviewPaneButton.Background = UiBrushes.Get(Color.FromArgb(0x22, 0x00, 0x7A, 0xFF));
-                PreviewPaneButton.BorderBrush = UiBrushes.Get(Color.FromArgb(0x48, 0x00, 0x7A, 0xFF));
-                PreviewPaneText.Foreground = UiBrushes.Get(Color.FromRgb(0x00, 0x62, 0xCC));
-                PreviewPaneText.FontWeight = FontWeights.Medium;
-            }
-            else
-            {
-                PreviewPaneButton.Background = Brushes.Transparent;
-                PreviewPaneButton.BorderBrush = Brushes.Transparent;
-                PreviewPaneText.Foreground = UiBrushes.Get(Color.FromRgb(0x1E, 0x29, 0x3B));
-                PreviewPaneText.FontWeight = FontWeights.Normal;
-            }
-        }
-
         private void RefreshAllTabs()
         {
             _lastPreviewSelectionKey = string.Empty;
             foreach (ExplorerTabItem tab in _tabs)
             {
                 tab.BrowserHost.RefreshView();
+            }
+            UpdateCommandBarAndStatus(computeBytes: true);
+            if (_showPreviewPane && _selectedTab != null)
+            {
+                SchedulePostRefreshPreviewSync(_selectedTab);
             }
         }
 
@@ -3828,12 +2967,19 @@ namespace LeafTab.Views
             ShareCopyPathButton.IsEnabled = hasSelection;
             DeleteButton.IsEnabled = hasSelection;
             PasteButton.IsEnabled = isRealFsFolder && CanPasteFromClipboardSafe();
+            OpenItemLocationButton.Visibility = host.IsShowingSearchResults ? Visibility.Visible : Visibility.Collapsed;
+            OpenItemLocationButton.IsEnabled = host.IsShowingSearchResults && sel.SelectedItems == 1;
 
             if (host.IsShowingSearchResults && host.IsSearchRunning)
             {
+                SearchLoadMoreButton.Visibility = Visibility.Collapsed;
                 StatusLeftText.Text = $"正在搜索… 已找到 {host.SearchMatchCount} 个项目";
                 return;
             }
+
+            SearchLoadMoreButton.Visibility = (host.IsShowingSearchResults && host.CanLoadMoreSearchResults)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
 
             if (sel.SelectedItems > 0)
             {
@@ -3841,9 +2987,38 @@ namespace LeafTab.Views
                     ? $"{sel.TotalItems} 个项目  ·  已选择 {sel.SelectedItems} 个项目（{PidlManager.FormatByteSize(sel.SelectedSizeBytes)}）"
                     : $"{sel.TotalItems} 个项目  ·  已选择 {sel.SelectedItems} 个项目";
             }
-            else if (host.IsShowingSearchResults && host.IsSearchTruncated)
+            else if (host.IsShowingSearchResults)
             {
-                StatusLeftText.Text = $"已显示前 {sel.TotalItems} 个匹配项目（输入更精确关键词可缩小范围）";
+                string backendLabel = host.LastSearchBackend switch
+                {
+                    SearchBackendKind.Everything => "Everything 极速索引",
+                    SearchBackendKind.MemoryCache or SearchBackendKind.NativeFastScan => "极速扫描",
+                    _ => string.Empty
+                };
+
+                string? notice = host.LastSearchNotice;
+                if (sel.TotalItems == 0 && !string.IsNullOrWhiteSpace(notice))
+                {
+                    StatusLeftText.Text = notice!;
+                }
+                else if (host.IsSearchTruncated)
+                {
+                    string baseText = !string.IsNullOrEmpty(backendLabel)
+                        ? $"已显示前 {sel.TotalItems} 个匹配项目  ·  {backendLabel} ({host.LastSearchElapsedMs} ms)"
+                        : $"已显示前 {sel.TotalItems} 个匹配项目（可继续加载更多或输入更精确关键词）";
+                    StatusLeftText.Text = !string.IsNullOrWhiteSpace(notice) ? $"{baseText}  ·  {notice}" : baseText;
+                }
+                else if (!string.IsNullOrEmpty(backendLabel))
+                {
+                    string baseText = $"{sel.TotalItems} 个项目  ·  {backendLabel} ({host.LastSearchElapsedMs} ms)";
+                    StatusLeftText.Text = !string.IsNullOrWhiteSpace(notice) ? $"{baseText}  ·  {notice}" : baseText;
+                }
+                else
+                {
+                    StatusLeftText.Text = !string.IsNullOrWhiteSpace(notice)
+                        ? $"{sel.TotalItems} 个项目  ·  {notice}"
+                        : $"{sel.TotalItems} 个项目";
+                }
             }
             else
             {
@@ -3866,7 +3041,14 @@ namespace LeafTab.Views
             catch { _clipboardSequence = uint.MaxValue; return false; }
         }
 
-        public void PrepareForForceExit() => _forceExitProcess = true;
+        public void PrepareForForceExit(bool skipPerWindowSave = false)
+        {
+            _forceExitProcess = true;
+            if (skipPerWindowSave)
+            {
+                _skipSaveOnForceClose = true;
+            }
+        }
 
         public void ForceExitApplication()
         {
@@ -3895,7 +3077,7 @@ namespace LeafTab.Views
 
         private void EnterWarmStandby()
         {
-            SaveConfigurationSnapshot();
+            SaveConfigurationSnapshot(isWindowClosing: true);
 
             _statusRefreshTimer.Stop();
             _searchDebounceTimer.Stop();
@@ -3930,7 +3112,10 @@ namespace LeafTab.Views
         {
             if (_sharedStore != null) _sharedStore.Changed -= SharedConfigurationChanged;
             AddressSuggestPopup.IsOpen = false;
-            SaveConfigurationSnapshot();
+            if (!_skipSaveOnForceClose)
+            {
+                SaveConfigurationSnapshot(isWindowClosing: true);
+            }
 
             _isClosingWindow = true;
             _statusRefreshTimer.Stop();

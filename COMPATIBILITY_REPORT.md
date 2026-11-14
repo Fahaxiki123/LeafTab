@@ -1,3 +1,46 @@
+# LeafTab 0.6.3 搜索完善、预览复杂度限制与复审边界收尾验证（2026-11-15）
+
+- 围绕四轮审查建议与高 ROI 体验优化收敛至 **`v0.6.3`**，含复审 5 项组合边界修复，全部改动已落地并完成项目外隔离构建与回归验证：
+  1. **内存搜索缓存文件级新鲜度复核与隐藏子目录可见性跟踪**（`FastFileSearchService.cs`）：在目录修改时间快照与 30 秒绝对 TTL 基础上，对缓存命中的候选条目在交付前通过 `GetFileAttributesExW` 实时复核文件属性、字节大小、修改时间及作用域内上级目录隐藏状态；同时记录首次扫描跳过的隐藏子目录快照（`WasHidden=true`），当隐藏文件夹被取消隐藏但父目录时间戳未变时立即触发缓存失效重新扫描（仍保持隐藏的子目录内部写入如 `.git` 不触发误失效）。
+  2. **原生搜索筛选语法、子句级 `|` 或运算与 Everything 正则路径语义**（`FastFileSearchService.QueryParser.cs` / `FastFileSearchService.cs`）：原生扫描与缓存完整支持 `ext:`、`size:`、`dm:`/`date:`、`type:`/`kind:`、`folder:`/`dir:`、`file:`、`path:`、`regex:`/`path:regex:` 及完整子句级 `|` 或运算（如 `size:>4kb | ext:txt`、`ext:txt | size:>4kb`、`folder:sub | size:>4kb`，兼容紧凑与空格分隔写法并保护正则内部 `|` 分支）；修复带反斜杠转义正则（如 `regex:^report_\d+\.txt$`）在递归子目录误按相对路径匹配导致 `^` 锚点失效的问题，默认匹配文件名并支持显式 `path:regex:`；未运行 Everything 输入 `content:` 等仅索引语法时输出明确中文提示。
+  3. **搜索结果视图闭环能力**（`ShellComInterfaces.cs` / `ExplorerBrowserHost.cs` / `ExplorerBrowserHost.Search.cs` / `MainWindow.AddressAndSearch.cs`）：搜索详细信息视图通过 `IColumnManager` 自动注入「所在文件夹」（`System.ItemFolderPathDisplay`）列并开放排序菜单项；状态栏新增「继续加载更多」渐进扩容按钮（`400 -> 1,200 -> 3,600 -> 10,000`）；命令栏、`Ctrl + Enter` 与 `⋯` 菜单新增「打开所在位置」，在新标签页（或复用已有标签页）打开父目录并等待原生视图枚举完成后精确高亮选中目标文件（严格校验 `S_OK` 与 `SVGIO_SELECTION > 0`）。
+  4. **Markdown 预览严格内联节点预算与后台预解析**（`FilePreviewService.cs` / `FilePreviewService.Markdown.cs` / `MainWindow.Preview.cs`）：将 Markdown 语法块解析移至后台线程，限制单文档块节点数（`320`）、表格总行数（`120`）、表格单元格总数（`800`）、单段行数（`1,200`）与总内联节点数（`2,400`，严格计入 `LineBreak` 硬换行、文本与嵌套内联节点，合并普通软换行）；命中 3,500 行超密表格或 20,000 行带换行标记文本时自动切换为零卡顿源码预览，且用户手动点击「渲染」时在 AST 与 WPF 物化双阶段严格截断于 `2,400` 内联节点上限内，杜绝 UI 布局卡顿。
+  5. **多窗口统一会话恢复、偏好记忆、无障碍与后台静默诊断**（`AppConfig.cs` / `AppConfigStore.cs` / `MainWindow.xaml` / `MainWindow.xaml.cs` / `App.xaml.cs`）：持久化保存预览侧栏宽度 `PreviewPaneWidthDip` 及可选「启动时恢复上次打开的标签页」（`RestorePreviousTabs`，默认关闭）；在「彻底退出」与系统注销关闭全部窗口前通过 `SaveUnifiedSessionBeforeExit` 一次性聚合保存所有打开窗口的完整标签列表并跳过逐窗口关闭覆写，解决多窗口退出仅恢复最后一个窗口标签的问题；为工具栏纯图标按钮补齐 `AutomationProperties.Name`；统一挂载全局未处理异常写入 `DiagnosticLog`，在无可见窗口的后台热驻留态静默记录异常并重置预热宿主。
+- `scripts/verify.ps1` 项目外副本隔离构建与测试完整通过（源码目录无 `bin/obj`）：.NET SDK `Release|x64` 构建 **0 警告、0 错误**。
+- **64 个独立回归用例全部通过**（`RESULT: 64 passed, 0 failed`），在 59 项基础上新增 5 组复审组合边界回归：多窗口「彻底退出」统一保存全部窗口标签会话、子句级 `|` 任意顺序组合 `size:`/`ext:`/`folder:`/`regex:`（冷扫与缓存一致）、带 `\d`/`\.` 转义的 `regex:` 递归子目录匹配与 `path:regex:` 语义、隐藏子目录取消隐藏后缓存自动失效、80 KB 两万行硬换行 Markdown 手动点击「渲染」严格截断内联节点数（`<= 2402`）与隔离控件布局耗时保护。
+- 原生 `--self-test` 全部断言通过（`## RESULT: PASS`）：
+  - `[冷启动首屏资源基准]`（1 标签 `此电脑`、零前序操作）：`WorkingSet=158.8 MB`，`PrivateBytes=100.6 MB`，`GDI=143`，`USER=139`。
+  - `AsyncSearch '*.cs'`：`MatchedCount=55`，`Backend=NativeFastScan`，`BackendMs=186ms`，`FolderPathColVisible=True`，`ExitedCleanly=True`。
+  - `SearchLoadMoreAndOpenLocation`：`LoadMoreOk=True`（超 400 项渐进加载扩容），`OpenItemLocationOk=True`（定位父目录并精确选中目标文件），`ToolbarA11yOk=True`。
+  - `ThisPcAsyncSearch 'C:'`：`MatchedCount=1`，`EnteredSearchMode=True`，`Exited=True`；`NativeSelectAll1000`：1,000 个测试文件全选通过（本次记录耗时 **411 ms**，测试目录已清理）。
+- 当前交付主程序 `LeafTab.exe`（516,608 字节 / 504.5 KB）SHA-256：`7FC7416C49FAF37D713B7CED2CC8E2F20A99725076AC6B8E5679BCD603508540`。
+- 当前安装包 `LeafTab-v0.6.3-Setup-x64.exe`（334,336 字节 / 326.5 KB）SHA-256：`3755C62FEA6AE1BECB7B421798A9A6FA456CBF5D270D2233CA5E8EE22B15733C`，已同步至 `artifacts/latest`，原始验证日志归档于 `artifacts/verification/v0.6.3-20261115`。
+
+尚未执行：Windows 10 实机、多显示器混合 DPI 实测、非沙盒环境下的真实用户默认关联安装/升级/卸载、断网共享/移动盘热插拔实测、代码签名及 GitHub Actions 云端运行记录。
+
+---
+
+# LeafTab 0.6.2 审查修复与边界回归收尾验证（2026-11-14）
+
+- 两轮代码审查发现的 **11 项问题（首轮 6 项 + 二轮补充复现 2 项 P1、3 项 P2）** 及模块职责拆分、CI 配置均已落地并完成隔离验证：
+  1. **搜索完整性与缓存一致性**（`FastFileSearchService.cs` / `EverythingIpcClient.cs`）：修复高密度目录同轮多批次覆盖丢结果问题；补齐 Everything IPC `offset` 连续翻页与截断提示；改用单次 `GetFileAttributesExW` 捕获前置目录时间戳，将缓存目录跟踪上限扩展至 `2048` 个子目录，并在超限或元数据不可读时自动放弃写入缓存（杜绝部分跟踪导致的新增文件漏报），同时以 `CreatedUtc` 严格限制 30 秒绝对有效期；协调 `EverythingIpcClient` 首次并发查询的惰性后台窗口/消息泵初始化，确保高并发冷启动仅创建唯一 `HWND_MESSAGE` 窗口且 `Dispose` 后零句柄/线程残留。
+  2. **预览侧栏线程边界、大图保护与刷新同步**（`FilePreviewService.cs` / `PidlManager.cs` / `MainWindow.AddressAndSearch.cs`）：图标与类型名称统一移至后台线程提取，UNC 远程路径直接使用文件属性提取避免网络阻塞；图片预览前置采用 `BitmapCacheOption.None` 探测尺寸，限制单图总像素上限 `67.1 MP`（超限回退信息卡）及超长图解码高度 `1600 px`；工具栏刷新按钮与 `F5` 共用 `RefreshActiveTab`，同步清空 `_lastPreviewSelectionKey` 并重拉当前选中文件的预览内容。
+  3. **安装器事务级回滚保护**（`SetupEngine.cs` / `ShellAssociationRecovery.cs`）：安装前完整快照受管关联子树、容器键默认值与备份槽位，解决跨目录安装（`A -> B`）中途失败丢失原安装目录 `A` 系统关联与备份的问题；将临时释放文件与 `.previous` 备份严格绑定当前事务 ID，杜绝尚未替换主程序即失败时误用历史遗留 `.previous` 覆盖当前程序。
+  4. **核心大文件拆分、冷启动基准与 CI**：按职责拆分 `MainWindow`（窗口生命周期 / 地址与搜索 / 预览侧栏）、`ExplorerBrowserHost`（原生宿主 / 搜索控制器）与 `FilePreviewService`（加载服务 / Markdown 渲染器）；`--self-test` 新增零操作前 1 标签冷启动纯净资源基准；新增 `.github/workflows/ci.yml` 自动化验证工作流。
+- `scripts/verify.ps1` 项目外副本隔离构建与测试完整通过（源码树无 `bin/obj`）：.NET SDK `Release|x64` 构建 **0 警告、0 错误**。
+- **54 个独立回归用例全部通过**（`RESULT: 54 passed, 0 failed`），新增覆盖：高密度目录全批次交付、Everything 过滤后连续翻页、超 64 子目录（100 子目录）新增文件自动失效与超限放弃缓存、12 路并发冷启动 Everything IPC 唯一窗口与零泄漏销毁、后台图标与 UNC 防阻塞、超长图限高与亿级像素炸弹拦截、安装事务故障注入回滚、跨目录 `A -> B` 失败保留 `A` 关联与备份、遗留 `.previous` 防误覆写、工具栏刷新与 `F5` 预览缓存同步。
+- 原生 `--self-test` 全部断言通过（`## RESULT: PASS`）：
+  - `[冷启动首屏资源基准]`（1 标签 `此电脑`、零前序操作）：`WorkingSet=158.9 MB`，`PrivateBytes=100.8 MB`，`GDI=143`，`USER=139`。
+  - `ToolbarRefreshUpdatesPreviewPane`：选中文件外部修改后点击工具栏刷新按钮，`InitialLoaded=True`，`UpdatedAfterToolbarClick=True`。
+  - `PreviewPaneToggleSameFolder`：`Kind='Markdown'`，`SHELLDLL_DefView` 宽度 `1250 -> 819 -> 1250` 像素，`KeptSelection=True`。
+  - `NativeSelectAll1000`：1,000 个测试文件全选通过（本次记录耗时 **314 ms**，测试目录已清理）；`NarrowWindowTabOverflow` 通过（72.0 DIP）。
+- 当前交付主程序 `LeafTab.exe`（452,608 字节 / 442.0 KB）SHA-256：`BFDAA8C9E8F0443C941E211929F463F7659780BAB02339706F3D87FE2A6EDBD0`。
+- 当前安装包 `LeafTab-v0.6.2-Setup-x64.exe`（312,832 字节 / 305.5 KB）SHA-256：`FE46BA82EA140A47F38DDEA0BE255F2C3FB2517CE8827CB2D2020378E3569F7E`，已同步至 `artifacts/latest`，原始验证日志归档于 `artifacts/verification/audit-fixes-20261114`。
+
+尚未执行：Windows 10 实机、多显示器混合 DPI 实测、非沙盒环境下的真实用户默认关联安装/升级/卸载、代码签名及 GitHub Actions 云端运行记录。
+
+---
+
 # LeafTab 0.6.2 交互细节、内置预览侧栏与安装包精简验证（2026-11-14）
 
 - 四项改进及内置预览方案全部落地并验证：

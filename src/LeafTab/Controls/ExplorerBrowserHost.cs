@@ -1,15 +1,16 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Threading;
 using LeafTab.Interop;
+using LeafTab.Services;
 
 namespace LeafTab.Controls
 {
@@ -76,7 +77,7 @@ namespace LeafTab.Controls
     /// - Win11 Command Bar verbs (New item + inline rename, Cut/Copy/Paste/Delete/Rename/Properties, Sort, View styles, Preview pane)
     /// - Asynchronous streaming directory search into native IResultsFolder
     /// </summary>
-    public sealed class ExplorerBrowserHost : HwndHost
+    public sealed partial class ExplorerBrowserHost : HwndHost
     {
         private static readonly UIntPtr DirectUiSubclassId = new UIntPtr(0x4C454146); // 'LEAF'
         private const string WhiteHostWindowClassName = "LeafTabWhiteHostWnd";
@@ -152,13 +153,22 @@ namespace LeafTab.Controls
         private bool _cachedSingleSelectedIsFolder;
 
         // Async directory search state
+        public const int DefaultMaxSearchResults = 400;
+        public const int MaxLoadMoreSearchResults = 10000;
+
         private IntPtr _preSearchFolderPidl;
         private bool _isShowingSearchResults;
         private bool _isFillSearchTransition;
         private bool _isSearchRunning;
         private bool _isSearchTruncated;
         private int _searchMatchCount;
+        private int _currentSearchMaxResults = DefaultMaxSearchResults;
+        private string _lastSearchQuery = string.Empty;
+        private string? _lastSearchRootPath;
+        private string? _lastSearchNotice;
         private int _searchGeneration;
+        private SearchBackendKind _lastSearchBackend = SearchBackendKind.None;
+        private long _lastSearchElapsedMs;
         private CancellationTokenSource? _searchCts;
 
         public IntPtr DirectUiHwnd => _subclassedDirectUiHwnd;
@@ -168,6 +178,16 @@ namespace LeafTab.Controls
         public bool IsSearchRunning => _isSearchRunning;
         public bool IsSearchTruncated => _isSearchTruncated;
         public int SearchMatchCount => _searchMatchCount;
+        public int CurrentSearchMaxResults => _currentSearchMaxResults;
+        public bool CanLoadMoreSearchResults =>
+            _isShowingSearchResults &&
+            !_isSearchRunning &&
+            _isSearchTruncated &&
+            _currentSearchMaxResults < MaxLoadMoreSearchResults &&
+            !string.IsNullOrWhiteSpace(_lastSearchQuery);
+        public string? LastSearchNotice => _lastSearchNotice;
+        public SearchBackendKind LastSearchBackend => _lastSearchBackend;
+        public long LastSearchElapsedMs => _lastSearchElapsedMs;
 
         public event EventHandler<NavigationCompletedEventArgs>? NavigationCompleted;
         public event EventHandler<string>? NavigationFailed;
@@ -475,6 +495,7 @@ namespace LeafTab.Controls
 
         public void RefreshView()
         {
+            FastFileSearchService.Shared.InvalidateCache();
             IExplorerBrowser? active = ActiveBrowser;
             if (_isDestroyed || active == null) return;
             InvalidateSelectionCache();
@@ -1026,12 +1047,19 @@ namespace LeafTab.Controls
 
         private bool TrySelectChildByName(string childFileName, bool beginRename)
         {
-            if (_isDestroyed || _browser == null || string.IsNullOrWhiteSpace(childFileName))
+            IExplorerBrowser? active = ActiveBrowser;
+            if (_isDestroyed || active == null || string.IsNullOrWhiteSpace(childFileName))
                 return false;
+
+            uint modeFlag = beginRename ? ShellConstants.SVSI_EDIT : ShellConstants.SVSI_SELECT;
+            uint flags = modeFlag |
+                         ShellConstants.SVSI_DESELECTOTHERS |
+                         ShellConstants.SVSI_ENSUREVISIBLE |
+                         ShellConstants.SVSI_FOCUSED;
 
             Guid iidSv = ShellConstants.IID_IShellView;
             Guid iidFv = ShellConstants.IID_IFolderView;
-            if (_browser.GetCurrentView(ref iidSv, out IntPtr psv) != ShellConstants.S_OK || psv == IntPtr.Zero)
+            if (active.GetCurrentView(ref iidSv, out IntPtr psv) != ShellConstants.S_OK || psv == IntPtr.Zero)
                 return false;
 
             var sv = (IShellView)Marshal.GetObjectForIUnknown(psv);
@@ -1042,32 +1070,88 @@ namespace LeafTab.Controls
 
             try
             {
-                if (_browser.GetCurrentView(ref iidFv, out pfv) == ShellConstants.S_OK && pfv != IntPtr.Zero)
+                if (active.GetCurrentView(ref iidFv, out pfv) == ShellConstants.S_OK && pfv != IntPtr.Zero)
                 {
                     fv = (IFolderView)Marshal.GetObjectForIUnknown(pfv);
-                    Guid iidSf = ShellConstants.IID_IShellFolder;
-                    if (fv.GetFolder(ref iidSf, out pFolder) == ShellConstants.S_OK && pFolder != IntPtr.Zero)
+                    if (!_isShowingSearchResults)
                     {
-                        sf = (IShellFolder)Marshal.GetObjectForIUnknown(pFolder);
-                        uint eaten = 0;
-                        uint attrs = 0;
-                        if (sf.ParseDisplayName(IntPtr.Zero, IntPtr.Zero, childFileName, ref eaten, out IntPtr childPidl, ref attrs) == ShellConstants.S_OK &&
-                            childPidl != IntPtr.Zero)
+                        Guid iidSf = ShellConstants.IID_IShellFolder;
+                        if (fv.GetFolder(ref iidSf, out pFolder) == ShellConstants.S_OK && pFolder != IntPtr.Zero)
                         {
-                            try
+                            sf = (IShellFolder)Marshal.GetObjectForIUnknown(pFolder);
+                            uint eaten = 0;
+                            uint attrs = 0;
+                            if (sf.ParseDisplayName(IntPtr.Zero, IntPtr.Zero, childFileName, ref eaten, out IntPtr childPidl, ref attrs) == ShellConstants.S_OK &&
+                                childPidl != IntPtr.Zero)
                             {
-                                uint modeFlag = beginRename ? ShellConstants.SVSI_EDIT : ShellConstants.SVSI_SELECT;
-                                uint flags = modeFlag |
-                                             ShellConstants.SVSI_DESELECTOTHERS |
-                                             ShellConstants.SVSI_ENSUREVISIBLE |
-                                             ShellConstants.SVSI_FOCUSED;
-                                return sv.SelectItem(childPidl, flags) >= 0;
-                            }
-                            finally
-                            {
-                                PidlManager.Free(ref childPidl);
+                                try
+                                {
+                                    if (sv.SelectItem(childPidl, flags) == ShellConstants.S_OK &&
+                                        fv.ItemCount(ShellConstants.SVGIO_SELECTION, out int selAfter) == ShellConstants.S_OK &&
+                                        selAfter > 0)
+                                    {
+                                        return true;
+                                    }
+                                }
+                                finally
+                                {
+                                    PidlManager.Free(ref childPidl);
+                                }
                             }
                         }
+                    }
+                }
+
+                // Fallback for virtual/aggregated views such as IResultsFolder (search results) or async enumeration
+                Guid iidFv2 = ShellConstants.IID_IFolderView2;
+                if (active.GetCurrentView(ref iidFv2, out IntPtr pfv2) == ShellConstants.S_OK && pfv2 != IntPtr.Zero)
+                {
+                    var fv2 = (IFolderView2)Marshal.GetObjectForIUnknown(pfv2);
+                    try
+                    {
+                        if (fv2.ItemCount(ShellConstants.SVGIO_ALLVIEW, out int total) == ShellConstants.S_OK && total > 0)
+                        {
+                            int limit = Math.Min(total, 2000);
+                            Guid iidShellItem = ShellConstants.IID_IShellItem;
+                            for (int i = 0; i < limit; i++)
+                            {
+                                if (fv2.GetItem(i, ref iidShellItem, out IntPtr pItem) == ShellConstants.S_OK && pItem != IntPtr.Zero)
+                                {
+                                    var item = (IShellItem)Marshal.GetObjectForIUnknown(pItem);
+                                    try
+                                    {
+                                        string? fsPath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
+                                        string? fsLeaf = !string.IsNullOrEmpty(fsPath)
+                                            ? Path.GetFileName(fsPath!.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                                            : null;
+                                        string? dispName = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
+
+                                        if (string.Equals(fsLeaf, childFileName, StringComparison.OrdinalIgnoreCase) ||
+                                            string.Equals(dispName, childFileName, StringComparison.OrdinalIgnoreCase) ||
+                                            string.Equals(fsPath, childFileName, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            if (fv2.SelectItem(i, flags) == ShellConstants.S_OK &&
+                                                fv2.ItemCount(ShellConstants.SVGIO_SELECTION, out int selCount) == ShellConstants.S_OK &&
+                                                selCount > 0)
+                                            {
+                                                return true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        Marshal.ReleaseComObject(item);
+                                        Marshal.Release(pItem);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.ReleaseComObject(fv2);
+                        Marshal.Release(pfv2);
                     }
                 }
 
@@ -1287,570 +1371,6 @@ namespace LeafTab.Controls
             {
                 Marshal.ReleaseComObject(fv);
                 Marshal.Release(pfv);
-            }
-        }
-
-        // ==================== ASYNC DIRECTORY SEARCH (NATIVE IResultsFolder) ====================
-
-        private bool EnsureSearchBrowserReady()
-        {
-            if (_isDestroyed || _hostHwnd == IntPtr.Zero)
-                return false;
-
-            if (_searchBrowser != null && _searchHostHwnd != IntPtr.Zero)
-            {
-                _searchBrowser.RemoveAll();
-                if (_browseHostHwnd != IntPtr.Zero)
-                    NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_HIDE);
-                NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_SHOW);
-                SyncBrowserRect();
-                AttachDirectUiSubclassIfNeeded();
-                return true;
-            }
-
-            NativeMethods.GetClientRect(_hostHwnd, out RECT rc);
-            int w = Math.Max(1, rc.Width > 0 ? rc.Width : 800);
-            int h = Math.Max(1, rc.Height > 0 ? rc.Height : 500);
-
-            _searchHostHwnd = NativeMethods.CreateWindowExW(
-                0,
-                EnsureWhiteHostWindowClass(),
-                string.Empty,
-                NativeMethods.WS_CHILD | NativeMethods.WS_CLIPCHILDREN | NativeMethods.WS_CLIPSIBLINGS,
-                0,
-                0,
-                w,
-                h,
-                _hostHwnd,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                IntPtr.Zero);
-
-            if (_searchHostHwnd == IntPtr.Zero)
-                return false;
-
-            Type? comType = Type.GetTypeFromCLSID(ShellConstants.CLSID_ExplorerBrowser, throwOnError: false);
-            if (comType == null)
-                return false;
-
-            _searchBrowser = (IExplorerBrowser)Activator.CreateInstance(comType)!;
-            if (_paneSite != null && _searchBrowser is IObjectWithSite withSite)
-            {
-                withSite.SetSite(_paneSite);
-            }
-
-            _searchBrowser.SetOptions(EXPLORER_BROWSER_OPTIONS.EBO_SHOWFRAMES | EXPLORER_BROWSER_OPTIONS.EBO_NOBORDER);
-
-            var initRect = new RECT(0, 0, w, h);
-            var fs = new FOLDERSETTINGS
-            {
-                ViewMode = FOLDERVIEWMODE.FVM_DETAILS,
-                fFlags = FOLDERFLAGS.FWF_AUTOARRANGE
-            };
-
-            if (_searchBrowser.Initialize(_searchHostHwnd, ref initRect, ref fs) != ShellConstants.S_OK)
-            {
-                DestroySearchBrowserOnly();
-                return false;
-            }
-
-            _searchBrowser.SetPropertyBag("LeafTab.SearchBag.v1");
-
-            _searchEventSink = new SearchBrowserEventSink(this);
-            if (_searchBrowser.Advise(_searchEventSink, out uint cookie) == ShellConstants.S_OK)
-            {
-                _searchAdviseCookie = cookie;
-            }
-
-            _isFillSearchTransition = true;
-            int fillHr = _searchBrowser.FillFromObject(null, 0);
-            if (fillHr != ShellConstants.S_OK)
-            {
-                _isFillSearchTransition = false;
-                DestroySearchBrowserOnly();
-                return false;
-            }
-
-            if (_browseHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_HIDE);
-            NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_SHOW);
-            SyncBrowserRect();
-            return true;
-        }
-
-        public async Task<int> StartSearchAsync(string rawQuery, IntPtr currentFolderPidl, string? folderFileSystemPath)
-        {
-            if (_isDestroyed || _browser == null)
-                return 0;
-
-            string query = (rawQuery ?? string.Empty).Trim();
-            if (string.IsNullOrEmpty(query))
-            {
-                ExitSearchMode();
-                return 0;
-            }
-
-            if (!_isShowingSearchResults && currentFolderPidl != IntPtr.Zero)
-            {
-                PidlManager.Free(ref _preSearchFolderPidl);
-                _preSearchFolderPidl = PidlManager.Clone(currentFolderPidl);
-            }
-
-            // Snapshot virtual folder children BEFORE switching view if there is no filesystem path
-            List<byte[]>? virtualCandidates = null;
-            bool virtualTruncated = false;
-            if (string.IsNullOrWhiteSpace(folderFileSystemPath) || !Directory.Exists(folderFileSystemPath))
-            {
-                IntPtr sourceFolder = _preSearchFolderPidl != IntPtr.Zero ? _preSearchFolderPidl : currentFolderPidl;
-                (virtualCandidates, virtualTruncated) = CollectMatchingVirtualChildren(sourceFolder, query);
-            }
-
-            CancelSearchWorkerOnly();
-            _searchCts = new CancellationTokenSource();
-            CancellationToken token = _searchCts.Token;
-            int myGen = ++_searchGeneration;
-
-            bool firstInit = _searchBrowser == null;
-            if (!EnsureSearchBrowserReady() || _searchBrowser == null)
-            {
-                _isSearchRunning = false;
-                _isSearchTruncated = false;
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                return 0;
-            }
-
-            _isShowingSearchResults = true;
-            _isSearchRunning = true;
-            _isSearchTruncated = false;
-            _searchMatchCount = 0;
-            InvalidateSelectionCache();
-            _searchBrowser.SetEmptyText($"正在搜索“{query}”…");
-            SearchStateChanged?.Invoke(this, EventArgs.Empty);
-
-            // Wait until the ResultsFolder IShellView is mounted and ready to accept items
-            for (int waitIdx = 0; waitIdx < (firstInit ? 16 : 6); waitIdx++)
-            {
-                if (_isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
-                    return 0;
-
-                if (IsResultsFolderReady())
-                    break;
-
-                await Task.Delay(18).ConfigureAwait(true);
-            }
-            _isFillSearchTransition = false;
-            if (_isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
-                return 0;
-
-            AttachDirectUiSubclassIfNeeded();
-            TrySetViewStyle(ExplorerViewStyle.Details);
-
-            const int MaxResults = 400;
-
-            if (virtualCandidates != null)
-            {
-                int added = AddPidlBatchToResultsFolder(virtualCandidates);
-                _searchMatchCount = added;
-                _isSearchTruncated = virtualTruncated;
-                _isSearchRunning = false;
-                _searchBrowser.SetEmptyText(added == 0 ? "没有与搜索条件匹配的项。" : string.Empty);
-                InvalidateSelectionCache();
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                return added;
-            }
-
-            string rootDir = folderFileSystemPath!;
-            (_, bool includeHidden) = PidlManager.GetShellVisibilityFlags();
-            Func<string, bool> predicate = BuildFileNameMatcher(query);
-            bool fsTruncated = false;
-
-            try
-            {
-                await Task.Run(async () =>
-                {
-                    var pendingBatch = new List<string>(32);
-                    var dirStack = new Stack<string>();
-                    dirStack.Push(rootDir);
-                    int totalMatched = 0;
-                    bool stopScan = false;
-
-                    while (dirStack.Count > 0 && !token.IsCancellationRequested && !stopScan)
-                    {
-                        string currentDir = dirStack.Pop();
-                        IEnumerable<string> entries;
-                        try
-                        {
-                            entries = Directory.EnumerateFileSystemEntries(currentDir);
-                        }
-                        catch
-                        {
-                            continue;
-                        }
-
-                        var childDirsToVisit = new List<string>();
-                        try
-                        {
-                            foreach (string fullPath in entries)
-                            {
-                                if (token.IsCancellationRequested)
-                                {
-                                    stopScan = true;
-                                    break;
-                                }
-
-                                string name = Path.GetFileName(fullPath);
-                                if (string.IsNullOrEmpty(name))
-                                    continue;
-
-                                FileAttributes attrs;
-                                try
-                                {
-                                    attrs = File.GetAttributes(fullPath);
-                                }
-                                catch
-                                {
-                                    continue;
-                                }
-
-                                if (!includeHidden && (attrs & FileAttributes.Hidden) != 0)
-                                    continue;
-
-                                if (predicate(name))
-                                {
-                                    if (totalMatched >= MaxResults)
-                                    {
-                                        fsTruncated = true;
-                                        stopScan = true;
-                                        break;
-                                    }
-
-                                    pendingBatch.Add(fullPath);
-                                    totalMatched++;
-
-                                    if (pendingBatch.Count >= 32)
-                                    {
-                                        string[] snapshot = pendingBatch.ToArray();
-                                        pendingBatch.Clear();
-                                        await DispatchSearchBatchAsync(snapshot, myGen, token).ConfigureAwait(false);
-                                    }
-                                }
-
-                                bool isSubDir = (attrs & FileAttributes.Directory) != 0 &&
-                                                (attrs & FileAttributes.ReparsePoint) == 0;
-                                if (isSubDir)
-                                {
-                                    childDirsToVisit.Add(fullPath);
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            // Ignore transient IO/permission errors mid-enumeration
-                        }
-
-                        if (!stopScan)
-                        {
-                            for (int i = childDirsToVisit.Count - 1; i >= 0; i--)
-                            {
-                                dirStack.Push(childDirsToVisit[i]);
-                            }
-                        }
-                    }
-
-                    if (pendingBatch.Count > 0 && !token.IsCancellationRequested)
-                    {
-                        await DispatchSearchBatchAsync(pendingBatch.ToArray(), myGen, token).ConfigureAwait(false);
-                    }
-                }, token).ConfigureAwait(true);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-
-            if (!_isDestroyed && myGen == _searchGeneration && !token.IsCancellationRequested)
-            {
-                _isSearchTruncated = fsTruncated;
-                _isSearchRunning = false;
-                _searchBrowser?.SetEmptyText(_searchMatchCount == 0 ? "没有与搜索条件匹配的项。" : string.Empty);
-                InvalidateSelectionCache();
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-            }
-
-            return _searchMatchCount;
-        }
-
-        private Task DispatchSearchBatchAsync(string[] paths, int expectedGen, CancellationToken token)
-        {
-            return Dispatcher.InvokeAsync(() =>
-            {
-                if (_isDestroyed || token.IsCancellationRequested || expectedGen != _searchGeneration || !_isShowingSearchResults)
-                    return;
-
-                int added = AddPathBatchToResultsFolder(paths);
-                if (added > 0)
-                {
-                    _searchMatchCount += added;
-                    InvalidateSelectionCache();
-                    SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                }
-            }, DispatcherPriority.Normal).Task;
-        }
-
-        private int AddPathBatchToResultsFolder(string[] paths)
-        {
-            IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf);
-            if (rf == null)
-                return 0;
-
-            int added = 0;
-            Guid iidShellItem = ShellConstants.IID_IShellItem;
-            try
-            {
-                foreach (string path in paths)
-                {
-                    if (NativeMethods.SHCreateItemFromParsingName(path, IntPtr.Zero, ref iidShellItem, out IShellItem? item) == ShellConstants.S_OK &&
-                        item != null)
-                    {
-                        try
-                        {
-                            if (rf.AddItem(item) == ShellConstants.S_OK)
-                                added++;
-                        }
-                        finally
-                        {
-                            Marshal.ReleaseComObject(item);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                Marshal.ReleaseComObject(rf);
-                if (prf != IntPtr.Zero) Marshal.Release(prf);
-            }
-
-            return added;
-        }
-
-        private int AddPidlBatchToResultsFolder(List<byte[]> pidlBytesList)
-        {
-            IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf);
-            if (rf == null)
-                return 0;
-
-            int added = 0;
-            try
-            {
-                foreach (byte[] raw in pidlBytesList)
-                {
-                    IntPtr pidl = PidlManager.FromBytes(raw);
-                    if (pidl != IntPtr.Zero)
-                    {
-                        try
-                        {
-                            if (rf.AddIDList(pidl, out IntPtr addedChild) == ShellConstants.S_OK)
-                            {
-                                PidlManager.Free(ref addedChild);
-                                added++;
-                            }
-                        }
-                        finally
-                        {
-                            PidlManager.Free(ref pidl);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                Marshal.ReleaseComObject(rf);
-                if (prf != IntPtr.Zero) Marshal.Release(prf);
-            }
-
-            return added;
-        }
-
-        private bool IsResultsFolderReady()
-        {
-            IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf);
-            if (rf == null)
-                return false;
-
-            Marshal.ReleaseComObject(rf);
-            if (prf != IntPtr.Zero)
-                Marshal.Release(prf);
-            return true;
-        }
-
-        private IResultsFolder? AcquireResultsFolder(out IntPtr prf)
-        {
-            prf = IntPtr.Zero;
-            if (_isDestroyed || _searchBrowser == null)
-                return null;
-
-            Guid iidFv = ShellConstants.IID_IFolderView;
-            if (_searchBrowser.GetCurrentView(ref iidFv, out IntPtr pfv) != ShellConstants.S_OK || pfv == IntPtr.Zero)
-                return null;
-
-            var fv = (IFolderView)Marshal.GetObjectForIUnknown(pfv);
-            try
-            {
-                Guid iidRf = ShellConstants.IID_IResultsFolder;
-                if (fv.GetFolder(ref iidRf, out prf) == ShellConstants.S_OK && prf != IntPtr.Zero)
-                {
-                    return (IResultsFolder)Marshal.GetObjectForIUnknown(prf);
-                }
-                return null;
-            }
-            finally
-            {
-                Marshal.ReleaseComObject(fv);
-                Marshal.Release(pfv);
-            }
-        }
-
-        private static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(IntPtr folderPidl, string query)
-        {
-            var matched = new List<byte[]>();
-            bool truncated = false;
-            if (folderPidl == IntPtr.Zero)
-                return (matched, false);
-
-            Func<string, bool> matcher = BuildFileNameMatcher(query);
-            Guid iidShellItem = ShellConstants.IID_IShellItem;
-            if (NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? folderItem) != ShellConstants.S_OK || folderItem == null)
-                return (matched, false);
-
-            IntPtr pSf = IntPtr.Zero;
-            IShellFolder? sf = null;
-            IntPtr pEnum = IntPtr.Zero;
-            IEnumIDList? enumList = null;
-
-            try
-            {
-                Guid bhid = new Guid("3981e224-f559-11d3-8e3a-00c04f6837d5");
-                Guid iidSf = ShellConstants.IID_IShellFolder;
-                if (folderItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidSf, out pSf) != ShellConstants.S_OK || pSf == IntPtr.Zero)
-                    return (matched, false);
-
-                sf = (IShellFolder)Marshal.GetObjectForIUnknown(pSf);
-                uint flags = ShellConstants.SHCONTF_FOLDERS | ShellConstants.SHCONTF_NONFOLDERS;
-                if (sf.EnumObjects(IntPtr.Zero, flags, out pEnum) != ShellConstants.S_OK || pEnum == IntPtr.Zero)
-                    return (matched, false);
-
-                enumList = (IEnumIDList)Marshal.GetObjectForIUnknown(pEnum);
-                while (enumList.Next(1, out IntPtr childRel, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRel != IntPtr.Zero)
-                {
-                    IntPtr fullChild = IntPtr.Zero;
-                    try
-                    {
-                        if (NativeMethods.SHCreateItemWithParent(folderPidl, sf, childRel, ref iidShellItem, out IShellItem? item) == ShellConstants.S_OK && item != null)
-                        {
-                            try
-                            {
-                                string? name = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
-                                if (!string.IsNullOrEmpty(name) && matcher(name!))
-                                {
-                                    if (matched.Count >= 200)
-                                    {
-                                        truncated = true;
-                                        break;
-                                    }
-
-                                    fullChild = PidlManager.Combine(folderPidl, childRel);
-                                    if (fullChild != IntPtr.Zero)
-                                        matched.Add(PidlManager.ToBytes(fullChild));
-                                }
-                            }
-                            finally
-                            {
-                                Marshal.ReleaseComObject(item);
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        PidlManager.Free(ref fullChild);
-                        PidlManager.Free(ref childRel);
-                    }
-                }
-            }
-            catch
-            {
-            }
-            finally
-            {
-                if (enumList != null) Marshal.ReleaseComObject(enumList);
-                if (pEnum != IntPtr.Zero) Marshal.Release(pEnum);
-                if (sf != null) Marshal.ReleaseComObject(sf);
-                if (pSf != IntPtr.Zero) Marshal.Release(pSf);
-                Marshal.ReleaseComObject(folderItem);
-            }
-
-            return (matched, truncated);
-        }
-
-        private static Func<string, bool> BuildFileNameMatcher(string query)
-        {
-            if (query.IndexOf('*') >= 0 || query.IndexOf('?') >= 0)
-            {
-                string pattern = "^" + Regex.Escape(query).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
-                var rx = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-                return name => rx.IsMatch(name);
-            }
-
-            return name => name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        public bool ExitSearchMode() => ExitSearchModeInternal(notifyChanged: true);
-
-        private bool ExitSearchModeInternal(bool notifyChanged)
-        {
-            if (_isDestroyed || _browser == null || !_isShowingSearchResults)
-                return false;
-
-            CancelSearchStateInternal(freeSavedPidl: true);
-            _searchBrowser?.RemoveAll();
-            _searchBrowser?.SetEmptyText(string.Empty);
-
-            if (_searchHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_HIDE);
-            if (_browseHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_SHOW);
-
-            SyncBrowserRect();
-            AttachDirectUiSubclassIfNeeded();
-            InvalidateSelectionCache();
-
-            if (notifyChanged)
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-
-            return true;
-        }
-
-        private void CancelSearchWorkerOnly()
-        {
-            _searchGeneration++;
-            if (_searchCts != null)
-            {
-                try { _searchCts.Cancel(); } catch { }
-                _searchCts.Dispose();
-                _searchCts = null;
-            }
-            _isSearchRunning = false;
-        }
-
-        private void CancelSearchStateInternal(bool freeSavedPidl)
-        {
-            CancelSearchWorkerOnly();
-            _isShowingSearchResults = false;
-            _isFillSearchTransition = false;
-            _isSearchTruncated = false;
-            _searchMatchCount = 0;
-
-            if (freeSavedPidl)
-            {
-                PidlManager.Free(ref _preSearchFolderPidl);
             }
         }
 
@@ -2650,70 +2170,6 @@ namespace LeafTab.Controls
                     owner.OnNativeNavigationFailed(pidlFolder);
                 return ShellConstants.S_OK;
             }
-        }
-
-        private sealed class SearchBrowserEventSink : IExplorerBrowserEvents
-        {
-            private const int E_ABORT = unchecked((int)0x80004004);
-            private WeakReference<ExplorerBrowserHost>? _ownerRef;
-
-            public SearchBrowserEventSink(ExplorerBrowserHost owner) =>
-                _ownerRef = new WeakReference<ExplorerBrowserHost>(owner);
-
-            public void Detach() => _ownerRef = null;
-
-            public int OnNavigationPending(IntPtr pidlFolder)
-            {
-                if (_ownerRef == null || !_ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
-                    return ShellConstants.S_OK;
-
-                // Allow initial FillFromObject(null, 0) ResultsFolder creation
-                if (owner._isFillSearchTransition)
-                    return ShellConstants.S_OK;
-
-                // User double-clicked a subfolder or clicked a location in left NavPane while viewing search results:
-                // keep _searchBrowser in ResultsFolder mode and route navigation to the primary _browser!
-                if (pidlFolder != IntPtr.Zero)
-                {
-                    IntPtr cloned = PidlManager.Clone(pidlFolder);
-                    if (cloned != IntPtr.Zero)
-                    {
-                        owner.Dispatcher.BeginInvoke(new Action(() =>
-                        {
-                            try
-                            {
-                                if (!owner._isDestroyed)
-                                    owner.NavigateToPidl(cloned);
-                            }
-                            finally
-                            {
-                                PidlManager.Free(ref cloned);
-                            }
-                        }));
-                    }
-                }
-
-                return E_ABORT;
-            }
-
-            public int OnViewCreated(IntPtr psv)
-            {
-                if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
-                    owner.OnNativeViewCreated();
-                return ShellConstants.S_OK;
-            }
-
-            public int OnNavigationComplete(IntPtr pidlFolder)
-            {
-                if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
-                {
-                    owner._isFillSearchTransition = false;
-                    owner.OnNativeViewCreated();
-                }
-                return ShellConstants.S_OK;
-            }
-
-            public int OnNavigationFailed(IntPtr pidlFolder) => ShellConstants.S_OK;
         }
     }
 }

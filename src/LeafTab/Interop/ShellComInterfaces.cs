@@ -90,11 +90,14 @@ namespace LeafTab.Interop
     internal static class PropertyKeys
     {
         private static readonly Guid StorageFmtId = new Guid("B725F130-47EF-101A-A5F1-02608C9EEBAC");
+        private static readonly Guid FolderPathDisplayFmtId = new Guid("E3E0584C-B788-4A5A-BB20-7F5A44C9ACDD");
 
         public static readonly PROPERTYKEY ItemTypeText = new PROPERTYKEY(StorageFmtId, 4);
         public static readonly PROPERTYKEY ItemNameDisplay = new PROPERTYKEY(StorageFmtId, 10);
         public static readonly PROPERTYKEY Size = new PROPERTYKEY(StorageFmtId, 12);
         public static readonly PROPERTYKEY DateModified = new PROPERTYKEY(StorageFmtId, 14);
+        // Verified against Windows SDK propkey.h line 2188 (PKEY_ItemFolderPathDisplay, pid = 6)
+        public static readonly PROPERTYKEY ItemFolderPathDisplay = new PROPERTYKEY(FolderPathDisplayFmtId, 6);
     }
 
     internal enum SIGDN : int
@@ -164,8 +167,11 @@ namespace LeafTab.Interop
         public static readonly Guid IID_IEnumIDList = new Guid("000214F2-0000-0000-C000-000000000046");
         public static readonly Guid IID_IContextMenu = new Guid("000214e4-0000-0000-c000-000000000046");
         public static readonly Guid IID_IResultsFolder = new Guid("96E5AE6D-6AE1-4b1c-900C-C6480EAA8828");
+        public static readonly Guid IID_IColumnManager = new Guid("d8ec27bb-3f3b-4042-b10a-4acfd924d453");
         public static readonly Guid IID_IShellBrowser = new Guid("000214E2-0000-0000-C000-000000000046");
         public static readonly Guid SID_STopLevelBrowser = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
+
+        public const string STR_FILE_SYS_BIND_DATA = "File System Bind Data";
     }
 
     // Verified slot-for-slot against Windows SDK ShObjIdl_core.h lines 16447-16553
@@ -719,5 +725,85 @@ namespace LeafTab.Interop
         [PreserveSig] int SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, uint dwReserved);
         [PreserveSig] int Resolve(IntPtr hwnd, uint fFlags);
         [PreserveSig] int SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+    }
+
+    // Verified against Windows SDK ShObjIdl_core.h lines 7490-7585
+    [Flags]
+    internal enum CM_MASK : uint
+    {
+        CM_MASK_WIDTH = 0x1,
+        CM_MASK_DEFAULTWIDTH = 0x2,
+        CM_MASK_IDEALWIDTH = 0x4,
+        CM_MASK_NAME = 0x8,
+        CM_MASK_STATE = 0x10
+    }
+
+    [Flags]
+    internal enum CM_STATE : uint
+    {
+        CM_STATE_NONE = 0x0,
+        CM_STATE_VISIBLE = 0x1,
+        CM_STATE_FIXEDWIDTH = 0x2,
+        CM_STATE_NOSORTBYFOLDERNESS = 0x4,
+        CM_STATE_ALWAYSVISIBLE = 0x8
+    }
+
+    [Flags]
+    internal enum CM_ENUM_FLAGS : uint
+    {
+        CM_ENUM_ALL = 0x1,
+        CM_ENUM_VISIBLE = 0x2
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct CM_COLUMNINFO
+    {
+        public uint cbSize;
+        public CM_MASK dwMask;
+        public CM_STATE dwState;
+        public uint uWidth;
+        public uint uDefaultWidth;
+        public uint uIdealWidth;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+        public string wszName;
+    }
+
+    [ComImport]
+    [Guid("d8ec27bb-3f3b-4042-b10a-4acfd924d453")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IColumnManager
+    {
+        [PreserveSig]
+        int SetColumnInfo([In] ref PROPERTYKEY propkey, [In] ref CM_COLUMNINFO pcmci);
+
+        [PreserveSig]
+        int GetColumnInfo([In] ref PROPERTYKEY propkey, [In, Out] ref CM_COLUMNINFO pcmci);
+
+        [PreserveSig]
+        int GetColumnCount(CM_ENUM_FLAGS dwFlags, out uint puCount);
+
+        [PreserveSig]
+        int GetColumns(
+            CM_ENUM_FLAGS dwFlags,
+            [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 2)] PROPERTYKEY[] rgkeyOrder,
+            uint cColumns);
+
+        [PreserveSig]
+        int SetColumns(
+            [In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] PROPERTYKEY[] rgkeyOrder,
+            uint cVisible);
+    }
+
+    // Verified against Windows SDK ShObjIdl_core.h lines 26843-26853
+    [ComImport]
+    [Guid("01E18D10-4D8B-11d2-855D-006008059367")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IFileSystemBindData
+    {
+        [PreserveSig]
+        int SetFindData([In] ref WIN32_FIND_DATAW pfd);
+
+        [PreserveSig]
+        int GetFindData(out WIN32_FIND_DATAW pfd);
     }
 }

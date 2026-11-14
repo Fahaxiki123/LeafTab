@@ -47,6 +47,20 @@ namespace LeafTab.Shared
             return clsid == null ? string.IsNullOrEmpty(actual) : string.Equals(actual, clsid, StringComparison.OrdinalIgnoreCase);
         }
 
+        internal static bool HasOwnedContextMenu(string exe, string classes = ClassesRoot)
+        {
+            return OwnsCommand(classes + @"\Directory\shell\OpenInLeafTab\command", exe, null, "\"%V \"");
+        }
+
+        internal static bool HasOwnedDefaultExplorer(string exe, string classes = ClassesRoot)
+        {
+            using var dirShell = Registry.CurrentUser.OpenSubKey(classes + @"\Directory\shell");
+            if (!string.Equals(dirShell?.GetValue("") as string, "LeafTabOpen", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            return OwnsCommand(classes + @"\Directory\shell\LeafTabOpen\command", exe, ExecuteClsid, "\"%V \"");
+        }
+
         internal static void RestoreContextMenu(string exe, string classes = ClassesRoot)
         {
             foreach (string parent in new[] { @"Directory\shell", @"Directory\Background\shell", @"Drive\shell" })

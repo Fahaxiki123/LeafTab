@@ -11,6 +11,7 @@ using LeafTab.Diagnostics;
 using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
+using LeafTab.Shared;
 using LeafTab.Views;
 
 namespace LeafTab
@@ -46,18 +47,68 @@ namespace LeafTab
             }
         }
 
+        internal static string DiagnosticLogDirectoryPath
+        {
+            get => DiagnosticLog.DirectoryPath;
+            set => DiagnosticLog.DirectoryPath = value;
+        }
+
+        internal static bool HandleDispatcherUnhandledExceptionCore(
+            Exception exception,
+            bool isSelfTest,
+            int visibleWindowsCount,
+            Action? resetHiddenStandbyHosts = null)
+        {
+            DiagnosticLog.Write("dispatcher-unhandled", exception);
+            if (isSelfTest || visibleWindowsCount <= 0)
+            {
+                try { resetHiddenStandbyHosts?.Invoke(); } catch { }
+                return true; // suppressed modal dialog
+            }
+            return false; // caller should display user-visible warning dialog
+        }
+
         protected override async void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
+            AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+            {
+                DiagnosticLog.Write("appdomain-unhandled", args.ExceptionObject as Exception);
+            };
+
+            TaskScheduler.UnobservedTaskException += (_, args) =>
+            {
+                DiagnosticLog.Write("task-unobserved", args.Exception);
+                args.SetObserved();
+            };
+
             DispatcherUnhandledException += (_, args) =>
             {
-                MessageBox.Show(
-                    $"LeafTab 遇到未处理异常：\n{args.Exception.Message}",
-                    "LeafTab",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
+                bool suppressed = HandleDispatcherUnhandledExceptionCore(
+                    args.Exception,
+                    _isSelfTest,
+                    GetVisibleWindowsCount(),
+                    () =>
+                    {
+                        foreach (MainWindow w in _windows.ToArray())
+                        {
+                            if (!w.IsVisible)
+                            {
+                                try { w.DiscardPrewarmedHost(); } catch { }
+                            }
+                        }
+                    });
+
+                if (!suppressed)
+                {
+                    MessageBox.Show(
+                        $"LeafTab 遇到未处理异常：\n{args.Exception.Message}\n\n已记录诊断日志至：\n{DiagnosticLog.DirectoryPath}",
+                        "LeafTab",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                }
                 args.Handled = true;
             };
 
@@ -163,15 +214,23 @@ namespace LeafTab
 
             SessionEnding += (_, _) =>
             {
-                foreach (MainWindow w in _windows.ToArray())
+                MainWindow[] snapshot = _windows.ToArray();
+                Views.MainWindow.SaveUnifiedSessionBeforeExit(snapshot, GetPreferredTargetWindow());
+                foreach (MainWindow w in snapshot)
                 {
-                    w.PrepareForForceExit();
+                    w.PrepareForForceExit(skipPerWindowSave: true);
                 }
             };
 
             bool isSilentWarmup = !_isSelfTest && req.IsBackgroundWarmup && req.Targets.Count == 0;
+            bool hasRestorableTabs = !_isSelfTest &&
+                                     !req.IsBackgroundWarmup &&
+                                     req.Targets.Count == 0 &&
+                                     !req.IsComServerLaunch &&
+                                     AppConfigStore.Current.Settings.RestorePreviousTabs &&
+                                     AppConfigStore.Current.Settings.OpenTabs.Count > 0;
             bool deferFallbackTab = !_isSelfTest &&
-                                    (isSilentWarmup || req.Targets.Count > 0 || req.IsComServerLaunch || earlyBufferedRequests.Count > 0);
+                                    (isSilentWarmup || hasRestorableTabs || req.Targets.Count > 0 || req.IsComServerLaunch || earlyBufferedRequests.Count > 0);
 
             var mainWindow = new MainWindow(
                 skipSessionPersistence: _isSelfTest,
@@ -247,6 +306,11 @@ namespace LeafTab
                         }
                         await RouteExternalLaunchRequestAsync(buffered);
                     }
+                }
+
+                if (hasRestorableTabs && mainWindow.Tabs.Count == 0 && req.Targets.Count == 0 && earlyBufferedRequests.Count == 0)
+                {
+                    await mainWindow.TryRestoreSavedTabsIfEnabledAsync();
                 }
 
                 mainWindow.EnsureAtLeastOneTabOpen(markAsAutoFallback: true);
@@ -536,9 +600,11 @@ namespace LeafTab
                 return;
 
             _isShuttingDownAll = true;
-            foreach (MainWindow w in _windows.ToArray())
+            MainWindow[] snapshot = _windows.ToArray();
+            Views.MainWindow.SaveUnifiedSessionBeforeExit(snapshot, GetPreferredTargetWindow());
+            foreach (MainWindow w in snapshot)
             {
-                w.PrepareForForceExit();
+                w.PrepareForForceExit(skipPerWindowSave: true);
                 try { w.Close(); } catch { }
             }
             Shutdown();

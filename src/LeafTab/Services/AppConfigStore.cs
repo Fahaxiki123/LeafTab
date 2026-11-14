@@ -35,14 +35,60 @@ namespace LeafTab.Services
             Bookmarks.CollectionChanged += (_, _) => { ScheduleSave(); Changed?.Invoke(this, EventArgs.Empty); };
         }
 
-        internal void UpdatePreferences(bool bookmarkBar, bool previewPane, bool warmStandby)
+        internal void UpdatePreferences(bool bookmarkBar, bool previewPane, bool warmStandby) =>
+            UpdatePreferences(bookmarkBar, previewPane, warmStandby, _config.PreviewPaneWidthDip, _config.RestorePreviousTabs);
+
+        internal void UpdatePreferences(
+            bool bookmarkBar,
+            bool previewPane,
+            bool warmStandby,
+            double previewPaneWidthDip,
+            bool restorePreviousTabs)
         {
-            bool changed = _config.ShowBookmarkBar != bookmarkBar || _config.ShowPreviewPane != previewPane || _config.EnableWarmStandby != warmStandby;
+            double sanitizedWidth = (double.IsNaN(previewPaneWidthDip) || double.IsInfinity(previewPaneWidthDip) || previewPaneWidthDip < 220.0)
+                ? 340.0
+                : Math.Min(1600.0, previewPaneWidthDip);
+
+            bool changed =
+                _config.ShowBookmarkBar != bookmarkBar ||
+                _config.ShowPreviewPane != previewPane ||
+                _config.EnableWarmStandby != warmStandby ||
+                Math.Abs(_config.PreviewPaneWidthDip - sanitizedWidth) >= 0.5 ||
+                _config.RestorePreviousTabs != restorePreviousTabs;
+
             _config.ShowBookmarkBar = bookmarkBar;
             _config.ShowPreviewPane = previewPane;
             _config.EnableWarmStandby = warmStandby;
+            _config.PreviewPaneWidthDip = sanitizedWidth;
+            _config.RestorePreviousTabs = restorePreviousTabs;
+            if (!restorePreviousTabs)
+            {
+                _config.OpenTabs.Clear();
+                _config.SelectedTabIndex = 0;
+            }
+
             ScheduleSave();
             if (changed) Changed?.Invoke(this, EventArgs.Empty);
+        }
+
+        internal void UpdateSavedTabs(IReadOnlyList<SavedTabConfigItem>? openTabs, int selectedTabIndex)
+        {
+            _config.OpenTabs.Clear();
+            if (_config.RestorePreviousTabs && openTabs != null && openTabs.Count > 0)
+            {
+                foreach (SavedTabConfigItem item in openTabs)
+                {
+                    if (item != null && !string.IsNullOrWhiteSpace(item.CurrentPath))
+                    {
+                        _config.OpenTabs.Add(item);
+                    }
+                }
+                _config.SelectedTabIndex = Math.Max(0, Math.Min(selectedTabIndex, Math.Max(0, _config.OpenTabs.Count - 1)));
+            }
+            else
+            {
+                _config.SelectedTabIndex = 0;
+            }
         }
 
         internal void UpdatePlacement(Rect bounds, bool maximized)
@@ -64,8 +110,12 @@ namespace LeafTab.Services
             _config.BookmarksInitialized = true;
             _config.Bookmarks = Bookmarks.Select(b => new BookmarkConfigItem { Title = b.Title, TargetPath = b.TargetPath }).ToList();
             _config.RecentFolders = new List<string>(RecentFolders);
-            // Closing a window intentionally closes its tabs. Do not promise restart recovery.
-            _config.OpenTabs.Clear();
+            if (!_config.RestorePreviousTabs)
+            {
+                // Closing a window intentionally closes its tabs unless opt-in tab restore is enabled.
+                _config.OpenTabs.Clear();
+                _config.SelectedTabIndex = 0;
+            }
             bool saved = _save(_config);
             if (!saved) DiagnosticLog.Write("config-save-failed");
             return saved;
