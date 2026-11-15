@@ -50,20 +50,48 @@ namespace LeafTab.RegressionTests
                 finally { window.PrepareForForceExit(); window.Close(); }
             });
 
-            Test("Silent Shell commands stay silent and explicit folder opens still route", () =>
+            Test("Suppressing Shell error UI still opens folders while SW_HIDE remains hidden", () =>
             {
-                int routed = 0;
-                LaunchActionRequest? last = null;
-                var command = new LeafTabExecuteCommand(r => { routed++; last=r; }, forceNewWindow:true);
-                command.SetParameters(Root);
-                command.SetNoShowUI(true);
-                Check(command.Execute() == ShellConstants.S_OK && routed == 0);
-                command.SetNoShowUI(false);
-                command.SetShowWindow(NativeMethods.SW_HIDE);
-                Check(command.Execute() == ShellConstants.S_OK && routed == 0);
-                command.SetShowWindow(NativeMethods.SW_SHOWNORMAL);
-                Check(command.Execute() == ShellConstants.S_OK && routed == 1);
-                Check(last!.OpenInNewWindow && last.Targets.Count == 1 && last.Targets[0].FolderOrAlias == Root);
+                foreach (bool newWindow in new[] { false, true })
+                {
+                    int routed = 0;
+                    LaunchActionRequest? last = null;
+                    var command = new LeafTabExecuteCommand(r => { routed++; last=r; }, newWindow);
+                    command.SetParameters(Root);
+                    command.SetShowWindow(NativeMethods.SW_SHOWNORMAL);
+                    command.SetNoShowUI(true);
+                    Check(command.Execute() == ShellConstants.S_OK && routed == 1,
+                        "SetNoShowUI(true) must not discard a visible folder-open command.");
+                    Check(last!.OpenInNewWindow == newWindow && last.Targets.Count == 1 && last.Targets[0].FolderOrAlias == Root);
+
+                    command.SetNoShowUI(false);
+                    Check(command.Execute() == ShellConstants.S_OK && routed == 2);
+                    command.SetShowWindow(NativeMethods.SW_HIDE);
+                    foreach (bool noErrorUi in new[] { false, true })
+                    {
+                        command.SetNoShowUI(noErrorUi);
+                        Check(command.Execute() == ShellConstants.S_OK && routed == 2,
+                            "An explicitly hidden invocation must not activate a folder window.");
+                    }
+                    command.SetShowWindow(NativeMethods.SW_SHOWNORMAL);
+                    Check(command.Execute() == ShellConstants.S_OK && routed == 3);
+                }
+            });
+
+            Test("Explorer launcher opens This PC even when Shell error UI is suppressed", () =>
+            {
+                foreach (bool newWindow in new[] { false, true })
+                {
+                    LaunchActionRequest? request = null;
+                    var command = new LeafTabExecuteCommand(r => request = r, newWindow);
+                    command.SetParameters("::{52205FD8-5DFB-447D-801A-D0B52F2E83E1}");
+                    command.SetShowWindow(NativeMethods.SW_SHOWNORMAL);
+                    command.SetNoShowUI(true);
+                    Check(command.Execute() == ShellConstants.S_OK && request != null,
+                        "The taskbar File Explorer launch must reach window routing.");
+                    Check(request!.OpenInNewWindow == newWindow && request.Targets.Count == 1 &&
+                          request.Targets[0].FolderOrAlias == "此电脑");
+                }
             });
 
             Test("A COM factory probe does not open a window but its later Execute still forwards", () =>

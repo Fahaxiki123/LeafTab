@@ -2649,7 +2649,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.4";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.5";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",

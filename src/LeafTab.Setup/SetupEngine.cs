@@ -43,7 +43,7 @@ namespace LeafTab.Setup
 
     internal static class SetupEngine
     {
-        public const string AppVersion = "0.6.4";
+        public const string AppVersion = "0.6.5";
         public const string PayloadResourceName = "LeafTab.Payload.gz";
         public const string UninstallRegistryKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\LeafTab";
         public const string ShortcutFileName = "LeafTab（一叶）.lnk";

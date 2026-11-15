@@ -1,3 +1,16 @@
+# LeafTab 0.6.5 资源管理器快捷入口回归修复验证（2026-11-15）
+
+- 根因：0.6.4 将 `SetNoShowUI(true)` 与 `SW_HIDE` 一并视为丢弃打开命令的条件。真实任务栏 `File Explorer.lnk` 调用已进入 `Execute`，却记录 `shell-open-suppressed-silent` 后返回成功，导致窗口未打开。
+- 修复：`SetNoShowUI` 继续保存并传给原生系统组件，但不再阻断正常文件夹打开；仅保留显式 `SW_HIDE` 的隐藏处理。后台 COM 启动隔离、空闲退出守卫、焦点保护、IPC 权限与系统关联配置保持现有逻辑。
+- 回归验证：新增与修正的两项用例先在旧实现上失败；修复后 **71 项全部通过**。覆盖普通/新窗口打开、提示开关、显式隐藏、资源管理器启动 CLSID，以及已有的 COM 生命周期与焦点保护。
+- 隔离 `Release|x64` 构建 **0 警告、0 错误**，原生自检 `RESULT: PASS`；最小化/后台输入焦点保持和主动打开恢复窗口断言均通过。
+- 本机安装器升级退出码为 0，安装后主程序版本为 `0.6.5.0` 且 SHA-256 与验证构建一致。通过 Windows Shell 调用任务栏使用的原始 `File Explorer.lnk`，成功打开「此电脑」并记录 `shell-open-request-no-error-ui`；普通文件夹 `.lnk` 同样打开正确目录。用户随后实际点击任务栏按钮确认恢复正常。COM 探测保持隐藏并空闲退出，主窗口继续运行；书签、驻留和会话恢复偏好核对未变。
+- 安装包 `artifacts/latest/LeafTab-v0.6.5-Setup-x64.exe`：338,432 字节，SHA-256 `400E5C42793291F46695D16AC86C1D94184425BFD99508552A41F128092D3F42`。主程序 SHA-256 `B04CE4D1B6DB435B63BC4E5F0094A3191BBEB14C0E941C0FF6657B647F76E520`。
+- 构建、失败复现、回归、原生自检与安装后快捷方式日志位于 `artifacts/verification/v0.6.5-20261115`；旧发布包与本机安装/配置备份一并保留在该目录。
+- 本轮未专项复测 Windows 10、混合 DPI 多屏及完整 UAC 权限组合；未通过自动化按键实测 Win+E。
+
+---
+
 # LeafTab 0.6.4 后台激活与焦点修复验证（2026-11-15）
 
 - 修复前隔离复现：空目标 `--com-server` 经 IPC 解码后变为普通启动请求，最小化窗口恢复并新增标签；`SetNoShowUI(true)` 仍路由前台打开；延迟 `FocusNativeView` 会清除另一个 WPF 文本框的输入焦点。运行中安装版的命令行为 `--com-server -Embedding`，父进程为 `DcomLaunch`。

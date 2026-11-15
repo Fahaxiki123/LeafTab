@@ -881,11 +881,12 @@ namespace LeafTab.Services
                     return ShellConstants.S_OK;
                 }
 
-                // A silent Shell invocation must not be turned into a foreground open.
-                // In-place navigation above remains available to embedded file dialogs.
-                if (_noShowUi || _nShow == NativeMethods.SW_HIDE)
+                // SetNoShowUI suppresses handler/error prompts; Shell shortcuts can set it
+                // even for an explicit visible open. Only SW_HIDE requests a hidden launch.
+                // Passive COM startup is filtered separately, before Execute is invoked.
+                if (_nShow == NativeMethods.SW_HIDE)
                 {
-                    DiagnosticLog.Write("shell-open-suppressed-silent");
+                    DiagnosticLog.Write("shell-open-suppressed-hidden");
                     return ShellConstants.S_OK;
                 }
 
@@ -897,7 +898,7 @@ namespace LeafTab.Services
                 {
                     req.OpenInNewWindow = true;
                 }
-                DiagnosticLog.Write("shell-open-request");
+                DiagnosticLog.Write(_noShowUi ? "shell-open-request-no-error-ui" : "shell-open-request");
                 _onLaunchRequest(req);
 
                 return ShellConstants.S_OK;
