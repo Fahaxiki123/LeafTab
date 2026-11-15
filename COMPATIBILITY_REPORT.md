@@ -1,3 +1,23 @@
+# LeafTab 0.6.4 后台激活与焦点修复验证（2026-11-15）
+
+- 修复前隔离复现：空目标 `--com-server` 经 IPC 解码后变为普通启动请求，最小化窗口恢复并新增标签；`SetNoShowUI(true)` 仍路由前台打开；延迟 `FocusNativeView` 会清除另一个 WPF 文本框的输入焦点。运行中安装版的命令行为 `--com-server -Embedding`，父进程为 `DcomLaunch`。
+- 修复与复核收尾：
+  1. **基础设施启动静默隔离与冷启动空闲退出保护**（`App.xaml.cs` / `SingleInstanceService.cs`）：`--com-server` / `-Embedding` / `--background` 保持隐藏启动，不再编码为 `ACTIVATE_NEW_TAB`；存在主实例时注册隐藏 COM 转发服务，仅转发实际 `Execute` 请求；补充 `_hasHandledExternalOpen` 与 `ShouldExitOnComIdle` 守卫，并将主实例空闲计时器置于 `EnsureHandle` 早期缓冲请求消费之后启动，确保任何存在可见窗口或已处理过实际打开请求（含后续进入后台热驻留）的主实例绝不被 30 秒空闲计时器误关。
+  2. **跨完整性命名管道转发与本地回退**（`NativeMethods.cs` / `SingleInstanceService.cs` / `App.xaml.cs`）：命名管道服务端在仅授权当前用户 SID 的 DACL 基础上附加 `S:(ML;;NW;;;ME)` Medium 完整性标签，进程路径校验改用 `PROCESS_QUERY_LIMITED_INFORMATION`（`QueryFullProcessImageNameW`），并在隐藏 COM 转发超时/失败时自动降级本地打开窗口，避免标准 UAC 下普通权限 `explorer.exe` 向提权主实例转发失败导致打开文件夹无响应。
+  3. **静默 Shell 请求拦截、原生焦点守卫与最小前台授权**（`ExplorerVerbComServer.cs` / `ExplorerBrowserHost.cs` / `MainWindow.xaml.cs` / `MainWindow.AddressAndSearch.cs`）：尊重 `SetNoShowUI(true)` 与 `SW_HIDE`；原生焦点操作统一核对可见性、非最小化、窗口激活与全局前台 HWND；IPC 仅对实际接收进程 PID 授予前台唤醒权限。
+- `scripts/verify.ps1` 项目外副本隔离 `Release|x64` 构建 **0 警告、0 错误**，**70 项回归测试全部通过**（`RESULT: 70 passed, 0 failed`，含冷启动/热驻留 COM 空闲退出守卫、Medium 完整性标签命名管道真实连接与进程路径校验）。
+- 原生 `--self-test` 全部断言通过（`## RESULT: PASS`）：
+  - `[冷启动首屏资源基准]`（1 标签 `此电脑`、零前序操作）：`WorkingSet=158.9 MB`，`PrivateBytes=100.4 MB`，`GDI=137`，`USER=132`。
+  - 后台焦点保护断言：`MinimizedWindowPreservesTypingFocus`（`TypingReady=True, Preserved=True, NoAddedTabs=True`）、`InactiveWindowPreservesTypingFocus`（`Preserved=True`）、`ExplicitOpenStillRestoresWindow`（`Restored=True`）。
+  - `NativeSelectAll1000`：1,000 个测试文件全选通过（本次记录耗时 **426 ms**，测试目录已清理）；`NarrowWindowTabOverflow` 通过（72.0 DIP）。
+- 当前交付主程序 `LeafTab.exe`（525,824 字节 / 513.5 KB）SHA-256：`D94A29D02E0086B3FC61B14C8A9FA0ED71A158622E5FED881F8B36A52CCEA626`。
+- 当前安装包 `LeafTab-v0.6.4-Setup-x64.exe`（338,432 字节 / 330.5 KB）SHA-256：`73720B8DF7E9A2CDF218EBA3E46108EE95DD1DFABCAC68142340904C19BF153B`，已同步至 `artifacts/latest`，原始验证日志归档于 `artifacts/verification/v0.6.4-20261115`。
+- 已静默更新本机 `%LOCALAPPDATA%\Programs\LeafTab` 至最终 `0.6.4` 构建并后台启动，保留用户原有配置、系统接管与开始菜单快捷方式，未新增桌面快捷方式；审查临时目录 `LeafTab-Review` 已彻底清理。
+
+尚未执行：Windows 10 实机、混合 DPI 多屏及断网共享/移动盘热插拔专项实测。
+
+---
+
 # LeafTab 0.6.3 搜索完善、预览复杂度限制与复审边界收尾验证（2026-11-15）
 
 - 围绕四轮审查建议与高 ROI 体验优化收敛至 **`v0.6.3`**，含复审 5 项组合边界修复，全部改动已落地并完成项目外隔离构建与回归验证：

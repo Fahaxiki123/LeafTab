@@ -1,12 +1,18 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.3 极速搜索增强、预览保护与工作区偏好完善版**（2026-11-15）。
+当前最新版本：**v0.6.4 后台激活与焦点保护完善版**（2026-11-15）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（`LeafTab-v0.6.3-Setup-x64.exe`，326.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 330.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.4 更新内容
+
+- **后台 `--com-server` 静默隔离与跨权限转发加固**：`--com-server` / `-Embedding` 仅启动隐藏 COM 服务，不再编码为打开新标签页请求；已有主进程时以隐藏 COM 转发进程接收实际 `Execute`（为当前用户专属命名管道附加 Medium 完整性标签支持标准 UAC 下普通权限向提权主实例平滑转发，转发失败时自动降级本地打开），无实际打开请求且无可见窗口时于空闲约 30 秒后自动退出，修复输入法或后台组件探测文件夹关联导致已最小化窗口弹出抢焦点的问题。
+- **静默 Shell 请求拦截与延迟原生焦点守卫**：尊重系统 `SetNoShowUI(true)` 与 `SW_HIDE` 静默调用；窗口处于最小化、隐藏或非当前前台激活窗口时，延迟焦点回调不再清除外部输入焦点或调用 Win32 `SetFocus` / `UIActivate` 激活窗口。
+- **最小权限前台授权与生命周期诊断**：IPC 仅为实际打开请求向目标接收进程 PID 授予前台唤醒权限，并在诊断日志补充启动、转发与激活事件名（不记录用户路径与输入内容）。
 
 ## 0.6.3 更新内容
 
@@ -41,9 +47,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.3`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.4`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.3-Setup-x64.exe`（326.5 KB / 334,336 字节）
+- **图形化一键安装包**：`LeafTab-v0.6.4-Setup-x64.exe`（约 330.5 KB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -142,7 +148,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.3-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.4-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---

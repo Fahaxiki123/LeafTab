@@ -19,7 +19,7 @@ namespace LeafTab.Services
             var text = new StringBuilder("LEAFTAB_IPC_V1\n");
             if (request.OpenInNewWindow) text.AppendLine("OPEN_NEW_WINDOW");
             if (request.IsQuitProcess) text.AppendLine("QUIT_PROCESS");
-            else if (request.IsBackgroundWarmup && request.Targets.Count == 0) text.AppendLine("BACKGROUND_NOOP");
+            else if (request.IsPassiveStartup) text.AppendLine("BACKGROUND_NOOP");
             else if (request.Targets.Count == 0) text.AppendLine("ACTIVATE_NEW_TAB");
             else foreach (var target in request.Targets)
             {

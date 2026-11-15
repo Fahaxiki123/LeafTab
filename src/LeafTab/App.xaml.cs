@@ -4,9 +4,11 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using LeafTab.Diagnostics;
 using LeafTab.Interop;
 using LeafTab.Models;
@@ -26,6 +28,9 @@ namespace LeafTab
         private ComShellExecuteServer? _comServer;
         private bool _isSelfTest;
         private bool _isShuttingDownAll;
+        private DispatcherTimer? _comRelayIdleTimer;
+        private long _lastComActivityTimestamp;
+        private bool _hasHandledExternalOpen;
 
         internal static App? CurrentApp => Current as App;
 
@@ -164,20 +169,22 @@ namespace LeafTab
 
             _isSelfTest = req.IsSelfTest;
             var earlyBufferedRequests = new List<LaunchActionRequest>();
-            var firstExternalArrivalTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             bool initialWindowReady = false;
 
             Action<LaunchActionRequest> routeIncomingRequest = incoming =>
             {
-                firstExternalArrivalTcs.TrySetResult(true);
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
+                    if (incoming.IsPassiveStartup)
+                        return;
+                    _comRelayIdleTimer?.Stop();
                     if (incoming.IsQuitProcess)
                     {
                         ForceExitAllWindows();
                         return;
                     }
 
+                    _hasHandledExternalOpen = true;
                     if (initialWindowReady)
                     {
                         _ = RouteExternalLaunchRequestAsync(incoming);
@@ -195,6 +202,12 @@ namespace LeafTab
                 int acquireWaitMs = req.WaitMutexHandoff ? 2000 : 0;
                 if (!_singleInstance.TryAcquirePrimaryInstance(acquireWaitMs))
                 {
+                    if (req.IsComServerLaunch && req.Targets.Count == 0 && !req.IsQuitProcess)
+                    {
+                        StartHiddenComRelay();
+                        return;
+                    }
+
                     bool forwarded = _singleInstance.TryForwardToPrimary(req, timeoutMs: 2500);
                     _singleInstance.Dispose();
                     _singleInstance = null;
@@ -207,7 +220,7 @@ namespace LeafTab
                 else
                 {
                     _singleInstance.StartListening(routeIncomingRequest);
-                    _comServer = new ComShellExecuteServer(routeIncomingRequest);
+                    _comServer = new ComShellExecuteServer(routeIncomingRequest, TouchComActivity);
                     _comServer.Start();
                 }
             }
@@ -222,7 +235,9 @@ namespace LeafTab
                 }
             };
 
-            bool isSilentWarmup = !_isSelfTest && req.IsBackgroundWarmup && req.Targets.Count == 0;
+            bool isSilentWarmup = !_isSelfTest && req.IsPassiveStartup;
+            if (isSilentWarmup)
+                DiagnosticLog.Write(req.IsComServerLaunch ? "startup-com-hidden" : "startup-background-hidden");
             bool hasRestorableTabs = !_isSelfTest &&
                                      !req.IsBackgroundWarmup &&
                                      req.Targets.Count == 0 &&
@@ -263,6 +278,13 @@ namespace LeafTab
                         await RouteExternalLaunchRequestAsync(buffered);
                     }
                 }
+
+                // Start the idle exit timer ONLY AFTER draining any requests that arrived during EnsureHandle(),
+                // and ONLY if this COM server remained purely passive with zero visible windows.
+                if (req.IsComServerLaunch && !_hasHandledExternalOpen && GetVisibleWindowsCount() == 0)
+                {
+                    StartComIdleTimer(isPrimaryInstance: true);
+                }
             }
             else
             {
@@ -287,12 +309,6 @@ namespace LeafTab
                 {
                     await mainWindow.HandleExternalLaunchRequestAsync(req, isInitialLaunch: true);
                 }
-                else if (req.IsComServerLaunch && earlyBufferedRequests.Count == 0)
-                {
-                    await Task.WhenAny(firstExternalArrivalTcs.Task, Task.Delay(150));
-                    await Dispatcher.InvokeAsync(() => { });
-                }
-
                 while (earlyBufferedRequests.Count > 0)
                 {
                     var batch = earlyBufferedRequests.ToArray();
@@ -481,11 +497,17 @@ namespace LeafTab
 
         internal async Task RouteExternalLaunchRequestAsync(LaunchActionRequest incoming)
         {
+            if (incoming.IsPassiveStartup)
+                return;
+
             if (incoming.IsQuitProcess)
             {
                 ForceExitAllWindows();
                 return;
             }
+
+            _hasHandledExternalOpen = true;
+            _comRelayIdleTimer?.Stop();
 
             if (incoming.OpenInNewWindow)
             {
@@ -652,8 +674,88 @@ namespace LeafTab
             ForceExitAllWindows();
         }
 
+        private void StartHiddenComRelay()
+        {
+            // DCOM may start a server at another integrity level while our instance mutex
+            // is owned. Keep its COM endpoint alive for Execute, without forwarding the
+            // empty bootstrap as a user request to restore the primary window.
+            TouchComActivity();
+            _comServer = new ComShellExecuteServer(incoming =>
+            {
+                TouchComActivity();
+                if (incoming.IsPassiveStartup)
+                    return;
+                DiagnosticLog.Write("com-relay-open-request");
+                if (_singleInstance?.TryForwardToPrimary(incoming, timeoutMs: 1200) != true)
+                {
+                    DiagnosticLog.Write("com-relay-forward-failed-fallback-local");
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        _hasHandledExternalOpen = true;
+                        _comRelayIdleTimer?.Stop();
+                        _ = RouteExternalLaunchRequestAsync(incoming);
+                    }));
+                }
+            }, onActivity: TouchComActivity);
+
+            if (!_comServer.Start())
+            {
+                DiagnosticLog.Write("com-relay-registration-failed");
+                Shutdown(1);
+                return;
+            }
+
+            DiagnosticLog.Write("com-relay-started-hidden");
+            StartComIdleTimer(isPrimaryInstance: false);
+        }
+
+        private void TouchComActivity() =>
+            Interlocked.Exchange(ref _lastComActivityTimestamp, Stopwatch.GetTimestamp());
+
+        internal static bool ShouldExitOnComIdle(
+            bool isPrimaryInstance,
+            int visibleWindowsCount,
+            bool hasHandledExternalOpen,
+            long idleStopwatchTicks)
+        {
+            if (visibleWindowsCount > 0)
+                return false;
+            if (isPrimaryInstance && hasHandledExternalOpen)
+                return false;
+            return idleStopwatchTicks >= 30L * Stopwatch.Frequency;
+        }
+
+        private void StartComIdleTimer(bool isPrimaryInstance)
+        {
+            TouchComActivity();
+            _comRelayIdleTimer?.Stop();
+            _comRelayIdleTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromSeconds(5)
+            };
+            _comRelayIdleTimer.Tick += (_, _) =>
+            {
+                int visibleCount = GetVisibleWindowsCount();
+                if (visibleCount > 0 || (isPrimaryInstance && _hasHandledExternalOpen))
+                {
+                    _comRelayIdleTimer.Stop();
+                    return;
+                }
+
+                long idleTicks = Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastComActivityTimestamp);
+                if (!ShouldExitOnComIdle(isPrimaryInstance, visibleCount, _hasHandledExternalOpen, idleTicks))
+                    return;
+
+                DiagnosticLog.Write("com-server-idle-exit");
+                _comRelayIdleTimer.Stop();
+                Shutdown();
+            };
+            _comRelayIdleTimer.Start();
+        }
+
         protected override void OnExit(ExitEventArgs e)
         {
+            _comRelayIdleTimer?.Stop();
             _comServer?.Dispose();
             _singleInstance?.Dispose();
             UiaGestureDetector.Shared.Dispose();

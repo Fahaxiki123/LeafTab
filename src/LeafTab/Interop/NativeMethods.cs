@@ -649,6 +649,209 @@ namespace LeafTab.Interop
             GET_FILEEX_INFO_LEVELS fInfoLevelId,
             out WIN32_FILE_ATTRIBUTE_DATA lpFileInformation);
 
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(
+            uint dwDesiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+            uint dwProcessId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool QueryFullProcessImageNameW(
+            IntPtr hProcess,
+            uint dwFlags,
+            System.Text.StringBuilder lpExeName,
+            ref uint lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint SDDL_REVISION_1 = 1;
+        private const uint LABEL_SECURITY_INFORMATION = 0x00000010;
+        private const uint PIPE_ACCESS_INBOUND = 0x00000001;
+        private const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+        private const uint WRITE_DAC = 0x00040000;
+        private const uint PIPE_TYPE_BYTE = 0x00000000;
+        private const uint PIPE_READMODE_BYTE = 0x00000000;
+        private const uint PIPE_WAIT = 0x00000000;
+        private const uint PIPE_UNLIMITED_INSTANCES = 255;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            public int bInheritHandle;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern Microsoft.Win32.SafeHandles.SafePipeHandle CreateNamedPipeW(
+            string lpName,
+            uint dwOpenMode,
+            uint dwPipeMode,
+            uint nMaxInstances,
+            uint nOutBufferSize,
+            uint nInBufferSize,
+            uint nDefaultTimeOut,
+            ref SECURITY_ATTRIBUTES lpSecurityAttributes);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string StringSecurityDescriptor,
+            uint StringSDRevision,
+            out IntPtr SecurityDescriptor,
+            out uint SecurityDescriptorSize);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetKernelObjectSecurity(
+            IntPtr Handle,
+            uint RequestedInformation,
+            IntPtr pSecurityDescriptor,
+            uint nLength,
+            out uint lpnLengthNeeded);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            IntPtr SecurityDescriptor,
+            uint RequestedStringSDRevision,
+            uint SecurityInformation,
+            out IntPtr StringSecurityDescriptor,
+            IntPtr StringSecurityDescriptorLen);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+
+        public static Microsoft.Win32.SafeHandles.SafePipeHandle? TryCreateCurrentUserMediumIntegrityInboundPipe(string pipeName, string userSid)
+        {
+            if (string.IsNullOrWhiteSpace(pipeName) || string.IsNullOrWhiteSpace(userSid))
+                return null;
+
+            IntPtr pSd = IntPtr.Zero;
+            try
+            {
+                string sddl = $"D:P(A;;GA;;;{userSid})S:(ML;;NW;;;ME)";
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, out pSd, out _) ||
+                    pSd == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                var sa = new SECURITY_ATTRIBUTES
+                {
+                    nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(),
+                    lpSecurityDescriptor = pSd,
+                    bInheritHandle = 0
+                };
+
+                Microsoft.Win32.SafeHandles.SafePipeHandle handle = CreateNamedPipeW(
+                    @"\\.\pipe\" + pipeName,
+                    PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | WRITE_DAC,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    4096,
+                    4096,
+                    0,
+                    ref sa);
+
+                if (handle == null || handle.IsInvalid)
+                {
+                    handle?.Dispose();
+                    return null;
+                }
+
+                return handle;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (pSd != IntPtr.Zero)
+                    LocalFree(pSd);
+            }
+        }
+
+        public static string? TryGetMandatoryLabelSddl(SafeHandle? handle)
+        {
+            if (handle == null || handle.IsInvalid || handle.IsClosed)
+                return null;
+
+            IntPtr pBuf = IntPtr.Zero;
+            IntPtr pStr = IntPtr.Zero;
+            try
+            {
+                GetKernelObjectSecurity(handle.DangerousGetHandle(), LABEL_SECURITY_INFORMATION, IntPtr.Zero, 0, out uint needed);
+                if (needed == 0)
+                    return null;
+
+                pBuf = Marshal.AllocHGlobal((int)needed);
+                if (!GetKernelObjectSecurity(handle.DangerousGetHandle(), LABEL_SECURITY_INFORMATION, pBuf, needed, out _))
+                    return null;
+
+                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        pBuf,
+                        SDDL_REVISION_1,
+                        LABEL_SECURITY_INFORMATION,
+                        out pStr,
+                        IntPtr.Zero) || pStr == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                return Marshal.PtrToStringUni(pStr);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (pStr != IntPtr.Zero) LocalFree(pStr);
+                if (pBuf != IntPtr.Zero) Marshal.FreeHGlobal(pBuf);
+            }
+        }
+
+        public static string? TryGetProcessImagePath(uint processId)
+        {
+            if (processId == 0)
+                return null;
+
+            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (hProc != IntPtr.Zero)
+            {
+                try
+                {
+                    var sb = new System.Text.StringBuilder(1024);
+                    uint cap = (uint)sb.Capacity;
+                    if (QueryFullProcessImageNameW(hProc, 0, sb, ref cap) && cap > 0)
+                    {
+                        return sb.ToString(0, (int)cap);
+                    }
+                }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+            }
+
+            try
+            {
+                using var proc = System.Diagnostics.Process.GetProcessById(checked((int)processId));
+                return proc.MainModule?.FileName;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         public static POINT PointFromLParam(IntPtr lParam)
         {
             long raw = lParam.ToInt64();

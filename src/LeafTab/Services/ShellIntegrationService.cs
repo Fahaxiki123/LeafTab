@@ -658,6 +658,7 @@ namespace LeafTab.Services
     internal sealed class ComShellExecuteServer : IDisposable
     {
         private readonly Action<LaunchActionRequest> _onLaunchRequest;
+        private readonly Action? _onActivity;
         private LeafTabExecuteClassFactory? _factory;
         private LeafTabExecuteClassFactory? _newWindowFactory;
         private uint _cookie;
@@ -666,9 +667,10 @@ namespace LeafTab.Services
         private bool _newWindowRegistered;
         private bool _disposed;
 
-        public ComShellExecuteServer(Action<LaunchActionRequest> onLaunchRequest)
+        public ComShellExecuteServer(Action<LaunchActionRequest> onLaunchRequest, Action? onActivity = null)
         {
             _onLaunchRequest = onLaunchRequest;
+            _onActivity = onActivity;
         }
 
         public bool Start()
@@ -678,7 +680,7 @@ namespace LeafTab.Services
 
             try
             {
-                _factory = new LeafTabExecuteClassFactory(_onLaunchRequest, forceNewWindow: false);
+                _factory = new LeafTabExecuteClassFactory(_onLaunchRequest, forceNewWindow: false, _onActivity);
                 Guid clsid = ShellIntegrationService.LeafTabExecuteClsid;
                 int hr = NativeMethods.CoRegisterClassObject(
                     ref clsid,
@@ -689,7 +691,7 @@ namespace LeafTab.Services
 
                 _registered = hr >= 0;
 
-                _newWindowFactory = new LeafTabExecuteClassFactory(_onLaunchRequest, forceNewWindow: true);
+                _newWindowFactory = new LeafTabExecuteClassFactory(_onLaunchRequest, forceNewWindow: true, _onActivity);
                 Guid newWinClsid = ShellIntegrationService.LeafTabNewWindowExecuteClsid;
                 int hr2 = NativeMethods.CoRegisterClassObject(
                     ref newWinClsid,
@@ -744,11 +746,13 @@ namespace LeafTab.Services
         private const int CLASS_E_NOAGGREGATION = unchecked((int)0x80040110);
         private readonly Action<LaunchActionRequest> _onLaunchRequest;
         private readonly bool _forceNewWindow;
+        private readonly Action? _onActivity;
 
-        public LeafTabExecuteClassFactory(Action<LaunchActionRequest> onLaunchRequest, bool forceNewWindow)
+        public LeafTabExecuteClassFactory(Action<LaunchActionRequest> onLaunchRequest, bool forceNewWindow, Action? onActivity = null)
         {
             _onLaunchRequest = onLaunchRequest;
             _forceNewWindow = forceNewWindow;
+            _onActivity = onActivity;
         }
 
         public int CreateInstance(IntPtr pUnkOuter, ref Guid riid, out IntPtr ppvObject)
@@ -757,7 +761,8 @@ namespace LeafTab.Services
             if (pUnkOuter != IntPtr.Zero)
                 return CLASS_E_NOAGGREGATION;
 
-            var cmd = new LeafTabExecuteCommand(_onLaunchRequest, _forceNewWindow);
+            _onActivity?.Invoke();
+            var cmd = new LeafTabExecuteCommand(_onLaunchRequest, _forceNewWindow, _onActivity);
             IntPtr punk = Marshal.GetIUnknownForObject(cmd);
             try
             {
@@ -781,19 +786,22 @@ namespace LeafTab.Services
 
         private readonly Action<LaunchActionRequest> _onLaunchRequest;
         private readonly bool _forceNewWindow;
+        private readonly Action? _onActivity;
         private object? _site;
         private IShellItemArray? _selection;
         private string? _parameters;
         private string? _directory;
 
-        public LeafTabExecuteCommand(Action<LaunchActionRequest> onLaunchRequest, bool forceNewWindow)
+        public LeafTabExecuteCommand(Action<LaunchActionRequest> onLaunchRequest, bool forceNewWindow, Action? onActivity = null)
         {
             _onLaunchRequest = onLaunchRequest;
             _forceNewWindow = forceNewWindow;
+            _onActivity = onActivity;
         }
 
         public int SetSite(object? pUnkSite)
         {
+            _onActivity?.Invoke();
             _site = pUnkSite;
             return ShellConstants.S_OK;
         }
@@ -817,6 +825,7 @@ namespace LeafTab.Services
 
         public int SetSelection(IShellItemArray? psia)
         {
+            _onActivity?.Invoke();
             _selection = psia;
             return ShellConstants.S_OK;
         }
@@ -846,16 +855,18 @@ namespace LeafTab.Services
         private uint _keyState;
         private POINT _position;
         private int _nShow = NativeMethods.SW_SHOWNORMAL;
+        private bool _noShowUi;
 
         public int SetKeyState(uint grfKeyState) { _keyState = grfKeyState; return ShellConstants.S_OK; }
         public int SetParameters(string? pszParameters) { _parameters = pszParameters; return ShellConstants.S_OK; }
         public int SetPosition(POINT pt) { _position = pt; return ShellConstants.S_OK; }
         public int SetShowWindow(int nShow) { _nShow = nShow; return ShellConstants.S_OK; }
-        public int SetNoShowUI(bool fNoShowUI) => ShellConstants.S_OK;
+        public int SetNoShowUI(bool fNoShowUI) { _noShowUi = fNoShowUI; return ShellConstants.S_OK; }
         public int SetDirectory(string? pszDirectory) { _directory = pszDirectory; return ShellConstants.S_OK; }
 
         public int Execute()
         {
+            _onActivity?.Invoke();
             try
             {
                 // 1. Control Panel / System Applets / Settings: forward directly to Windows native CLSID_ExecuteFolder
@@ -870,6 +881,14 @@ namespace LeafTab.Services
                     return ShellConstants.S_OK;
                 }
 
+                // A silent Shell invocation must not be turned into a foreground open.
+                // In-place navigation above remains available to embedded file dialogs.
+                if (_noShowUi || _nShow == NativeMethods.SW_HIDE)
+                {
+                    DiagnosticLog.Write("shell-open-suppressed-silent");
+                    return ShellConstants.S_OK;
+                }
+
                 // 3. Otherwise (Desktop double-click, This PC, Recycle Bin, Win+E, Taskbar File Explorer,
                 //    opennewwindow, Chrome/Edge/WeChat/VSCode ShellExecute / SHOpenFolderAndSelectItems, etc.),
                 //    route into LeafTab.
@@ -878,6 +897,7 @@ namespace LeafTab.Services
                 {
                     req.OpenInNewWindow = true;
                 }
+                DiagnosticLog.Write("shell-open-request");
                 _onLaunchRequest(req);
 
                 return ShellConstants.S_OK;
@@ -964,6 +984,7 @@ namespace LeafTab.Services
                     if (_parameters != null) exec.SetParameters(_parameters);
                     exec.SetPosition(_position);
                     exec.SetShowWindow(_nShow);
+                    exec.SetNoShowUI(_noShowUi);
                     if (_directory != null) exec.SetDirectory(_directory);
                     return exec.Execute();
                 }

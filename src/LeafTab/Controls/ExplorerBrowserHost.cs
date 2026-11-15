@@ -1454,7 +1454,7 @@ namespace LeafTab.Controls
 
         public void ClearUnselectedItemFocusBoxIfNeeded()
         {
-            if (_isDestroyed || _hostHwnd == IntPtr.Zero || _isMouseDownInView || _isKeyboardFocusActive)
+            if (!CanReceiveKeyboardFocus || _isMouseDownInView || _isKeyboardFocusActive)
                 return;
 
             IntPtr focused = NativeMethods.GetFocus();
@@ -1468,9 +1468,26 @@ namespace LeafTab.Controls
             }
         }
 
+        internal bool CanReceiveKeyboardFocus
+        {
+            get
+            {
+                if (_isDestroyed || _hostHwnd == IntPtr.Zero || !IsVisible)
+                    return false;
+                Window? owner = Window.GetWindow(this);
+                if (owner == null || !owner.IsActive || owner.WindowState == WindowState.Minimized)
+                    return false;
+                IntPtr root = NativeMethods.GetAncestor(_hostHwnd, NativeMethods.GA_ROOT);
+                return root != IntPtr.Zero && NativeMethods.IsWindowVisible(root) &&
+                       !NativeMethods.IsIconic(root) && NativeMethods.GetForegroundWindow() == root;
+            }
+        }
+
         public void FocusNativeView()
         {
-            if (_isDestroyed || _hostHwnd == IntPtr.Zero) return;
+            // Delayed callbacks must not clear another window's WPF focus or activate
+            // a hidden/minimized host via Win32 SetFocus/UIActivate.
+            if (!CanReceiveKeyboardFocus) return;
 
             _isKeyboardFocusActive = false;
             System.Windows.Input.Keyboard.ClearFocus();
@@ -1528,7 +1545,7 @@ namespace LeafTab.Controls
         public bool TryTranslateShellAccelerator(ref MSG wpfMsg)
         {
             IExplorerBrowser? active = ActiveBrowser;
-            if (_isDestroyed || active == null || !IsNativeFocusInside())
+            if (!CanReceiveKeyboardFocus || active == null || !IsNativeFocusInside())
                 return false;
 
             bool parkedOnHost = NativeMethods.GetFocus() == _hostHwnd;

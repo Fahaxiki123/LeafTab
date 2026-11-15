@@ -170,8 +170,8 @@ namespace LeafTab.RegressionTests
             }));
             Test("Setup version metadata matches main executable version", () =>
             {
-                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.3");
-                Check(typeof(LeafTab.App).Assembly.GetName().Version == new Version(0, 6, 3, 0));
+                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.4");
+                Check(typeof(LeafTab.App).Assembly.GetName().Version == Version.Parse(LeafTab.Setup.SetupEngine.AppVersion + ".0"));
             });
             Test("Breadcrumb blank hit filter distinguishes blank chrome from interactive buttons", () =>
             {

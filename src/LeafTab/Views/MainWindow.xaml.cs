@@ -732,6 +732,7 @@ namespace LeafTab.Views
             if (_isClosingWindow)
                 return;
 
+            DiagnosticLog.Write("window-foreground-request");
             if (!IsVisible)
             {
                 Show();
@@ -826,7 +827,7 @@ namespace LeafTab.Views
 
         public async Task HandleExternalLaunchRequestAsync(LaunchActionRequest request, bool isInitialLaunch)
         {
-            if (_isClosingWindow || request == null)
+            if (_isClosingWindow || request == null || request.IsPassiveStartup)
                 return;
 
             if (request.IsQuitProcess)
@@ -2648,7 +2649,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.3";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.4";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",

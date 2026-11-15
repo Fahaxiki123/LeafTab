@@ -23,6 +23,63 @@ namespace LeafTab.Diagnostics
 {
     internal static class SelfTestRunner
     {
+        private static async Task VerifyBackgroundActivationAsync(MainWindow window, StringBuilder log, Action<bool, string> assert)
+        {
+            if (window.SelectedTab == null) { assert(false, "ActivationGuardTabMissing"); return; }
+            var editor = new TextBox { Text = "Isolated typing target", AcceptsReturn = true };
+            var typingWindow = new Window { Title = "LeafTab focus regression", Content = editor, Width = 480, Height = 180 };
+            WindowState previousState = window.WindowState;
+            try
+            {
+                window.WindowState = WindowState.Minimized;
+                typingWindow.Show();
+                await Task.Delay(150);
+                typingWindow.Activate();
+                IntPtr typingHwnd = new System.Windows.Interop.WindowInteropHelper(typingWindow).Handle;
+                editor.Focus();
+                await Task.Delay(120);
+                bool typingReady = editor.IsKeyboardFocusWithin && typingWindow.IsActive;
+                IntPtr foregroundBefore = NativeMethods.GetForegroundWindow();
+                log.AppendLine($"- ActivationProbeSetup: EditorActive={typingWindow.IsActive}, EditorFocus={editor.IsKeyboardFocusWithin}, EditorIsForeground={foregroundBefore == typingHwnd}");
+                int tabsBefore = window.Tabs.Count;
+
+                window.ActivateTab(window.SelectedTab, focusNativeView:true);
+                await Task.Delay(100);
+                window.SelectedTab.BrowserHost.FocusNativeView();
+                await window.HandleExternalLaunchRequestAsync(new LaunchActionRequest { IsComServerLaunch=true }, false);
+                await window.HandleExternalLaunchRequestAsync(new LaunchActionRequest { IsBackgroundWarmup=true }, false);
+                await Task.Delay(100);
+                bool minimizedSafe = window.WindowState == WindowState.Minimized && window.Tabs.Count == tabsBefore &&
+                                     editor.IsKeyboardFocusWithin && NativeMethods.GetForegroundWindow() == foregroundBefore;
+                assert(typingReady && minimizedSafe, "MinimizedWindowPreservesTypingFocus");
+                log.AppendLine($"- MinimizedWindowPreservesTypingFocus: TypingReady={typingReady}, Preserved={minimizedSafe}, NoAddedTabs={window.Tabs.Count == tabsBefore}");
+
+                window.WindowState = WindowState.Normal;
+                await Task.Delay(120);
+                typingWindow.Activate();
+                editor.Focus();
+                await Task.Delay(100);
+                foregroundBefore = NativeMethods.GetForegroundWindow();
+                window.SelectedTab.BrowserHost.FocusNativeView();
+                bool inactiveSafe = editor.IsKeyboardFocusWithin && NativeMethods.GetForegroundWindow() == foregroundBefore;
+                assert(inactiveSafe, "InactiveWindowPreservesTypingFocus");
+                log.AppendLine($"- InactiveWindowPreservesTypingFocus: Preserved={inactiveSafe}");
+
+                window.WindowState = WindowState.Minimized;
+                await window.HandleExternalLaunchRequestAsync(new LaunchActionRequest(), false);
+                await Task.Delay(120);
+                bool explicitOpenWorks = window.WindowState != WindowState.Minimized && window.Tabs.Count == tabsBefore + 1;
+                assert(explicitOpenWorks, "ExplicitOpenStillRestoresWindow");
+                log.AppendLine($"- ExplicitOpenStillRestoresWindow: Restored={explicitOpenWorks}");
+            }
+            finally
+            {
+                typingWindow.Close();
+                window.WindowState = previousState == WindowState.Minimized ? WindowState.Normal : previousState;
+                window.BringWindowToFront();
+            }
+        }
+
         private sealed class ResourceSnapshot
         {
             public string Label { get; set; } = string.Empty;
@@ -53,7 +110,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab v0.6.3 Native Regression Diagnostics");
+                log.AppendLine("# LeafTab v0.6.4 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -630,6 +687,8 @@ namespace LeafTab.Diagnostics
                 await Task.Delay(80);
                 log.AppendLine($"- MinimizedStatusPollingThrottle: PausedWhenMinimized={pausedWhenMinimized}");
                 AssertCheck(pausedWhenMinimized, "MinimizedStatusPollingThrottle");
+
+                await VerifyBackgroundActivationAsync(window, log, AssertCheck);
 
                 // Isolated HKCU sandbox test (strictly NEVER touches real Software\Classes!)
                 string sandboxBase = $@"Software\LeafTab\SelfTestSandbox_{Guid.NewGuid():N}";

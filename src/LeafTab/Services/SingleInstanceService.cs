@@ -42,6 +42,10 @@ namespace LeafTab.Services
         public bool OpenInNewWindow { get; set; }
         public bool WaitMutexHandoff { get; set; }
         public List<LaunchTargetItem> Targets { get; } = new List<LaunchTargetItem>();
+
+        // Starting infrastructure is not a request to open a user-facing window.
+        internal bool IsPassiveStartup => !IsQuitProcess && Targets.Count == 0 &&
+                                          (IsBackgroundWarmup || IsComServerLaunch);
     }
 
     internal static class LaunchRequestParser
@@ -329,9 +333,6 @@ namespace LeafTab.Services
 
         public bool TryForwardToPrimary(LaunchActionRequest request, int timeoutMs = 2500, string? expectedExecutablePath = null)
         {
-            // Grant the primary LeafTab process permission to bring itself to the foreground
-            NativeMethods.AllowSetForegroundWindow(NativeMethods.ASFW_ANY);
-
             var sw = System.Diagnostics.Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
@@ -344,8 +345,15 @@ namespace LeafTab.Services
                     if (expectedExecutablePath != null)
                     {
                         if (!NativeMethods.GetNamedPipeServerProcessId(client.SafePipeHandle, out uint serverPid)) return false;
-                        using var serverProcess = System.Diagnostics.Process.GetProcessById(checked((int)serverPid));
-                        if (!ShellAssociationRecovery.PathsEqual(serverProcess.MainModule?.FileName, expectedExecutablePath)) return false;
+                        string? serverExe = NativeMethods.TryGetProcessImagePath(serverPid);
+                        if (!ShellAssociationRecovery.PathsEqual(serverExe, expectedExecutablePath)) return false;
+                    }
+
+                    // Only an actual open request may grant foreground rights, and only to its receiver.
+                    if (!request.IsPassiveStartup && !request.IsQuitProcess &&
+                        NativeMethods.GetNamedPipeServerProcessId(client.SafePipeHandle, out uint foregroundPid))
+                    {
+                        NativeMethods.AllowSetForegroundWindow(unchecked((int)foregroundPid));
                     }
 
                     byte[] payload = LaunchRequestCodec.Encode(request);
@@ -377,13 +385,7 @@ namespace LeafTab.Services
                     NamedPipeServerStream? server = null;
                     try
                     {
-                        server = new NamedPipeServerStream(
-                            _pipeName,
-                            PipeDirection.In,
-                            NamedPipeServerStream.MaxAllowedServerInstances,
-                            PipeTransmissionMode.Byte,
-                            PipeOptions.Asynchronous,
-                            4096, 4096, CreateCurrentUserPipeSecurity());
+                        server = CreatePipeServerStream(_pipeName);
 
                         await server.WaitForConnectionAsync(token).ConfigureAwait(false);
                         NamedPipeServerStream connectedServer = server;
@@ -410,6 +412,34 @@ namespace LeafTab.Services
             }, token);
         }
 
+        internal static NamedPipeServerStream CreatePipeServerStream(string pipeName)
+        {
+            string userSid = WindowsIdentity.GetCurrent().User!.Value;
+            Microsoft.Win32.SafeHandles.SafePipeHandle? nativeHandle =
+                NativeMethods.TryCreateCurrentUserMediumIntegrityInboundPipe(pipeName, userSid);
+            if (nativeHandle != null)
+            {
+                try
+                {
+                    return new NamedPipeServerStream(PipeDirection.In, isAsync: true, isConnected: false, safePipeHandle: nativeHandle);
+                }
+                catch
+                {
+                    nativeHandle.Dispose();
+                }
+            }
+
+            return new NamedPipeServerStream(
+                pipeName,
+                PipeDirection.In,
+                NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous,
+                4096,
+                4096,
+                CreateCurrentUserPipeSecurity());
+        }
+
         internal static PipeSecurity CreateCurrentUserPipeSecurity()
         {
             var security = new PipeSecurity();
@@ -427,7 +457,10 @@ namespace LeafTab.Services
                     byte[] payload = await LaunchRequestCodec.ReadBoundedAsync(stream, 3000, token).ConfigureAwait(false);
                     var incoming = LaunchRequestCodec.Decode(payload);
                     if (incoming != null && !token.IsCancellationRequested)
+                    {
+                        DiagnosticLog.Write(incoming.IsQuitProcess ? "ipc-quit-request" : "ipc-open-request");
                         Application.Current?.Dispatcher?.BeginInvoke(new Action(() => onReceived(incoming)));
+                    }
                 }
             }
             catch (OperationCanceledException) { }
