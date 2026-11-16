@@ -70,14 +70,14 @@ namespace LeafTab.Views
             if (e.Handled)
                 return;
 
-            Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(RestoreNativeFocusFromPreviewChrome));
+            // A click on non-text preview content explicitly leaves the previous
+            // editor. Handle it now, before a later input can choose another target.
+            RestoreNativeFocusFromPreviewChrome();
         }
 
         private void RestoreNativeFocusFromPreviewChrome()
         {
             if (!_isClosingWindow &&
-                !AddressTextBox.IsKeyboardFocusWithin &&
-                !SearchTextBox.IsKeyboardFocusWithin &&
                 !IsPreviewContentFocused())
             {
                 _selectedTab?.BrowserHost.FocusNativeView();

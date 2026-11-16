@@ -1482,8 +1482,15 @@ namespace LeafTab.Controls
             // a hidden/minimized host via Win32 SetFocus/UIActivate.
             if (!CanReceiveKeyboardFocus) return;
 
+            RememberNativeFocus();
+            FocusNativeViewCore();
+        }
+
+        private void FocusNativeViewCore()
+        {
+            if (!CanReceiveKeyboardFocus) return;
+
             _isKeyboardFocusActive = false;
-            System.Windows.Input.Keyboard.ClearFocus();
             SuppressNativeFocusRect();
 
             IExplorerBrowser? active = ActiveBrowser;
@@ -1838,6 +1845,12 @@ namespace LeafTab.Controls
             }
 
             IntPtr result = NativeMethods.DefSubclassProc(hWnd, uMsg, wParam, lParam);
+            if (uMsg == NativeMethods.WM_LBUTTONDOWN ||
+                uMsg == NativeMethods.WM_RBUTTONDOWN ||
+                uMsg == NativeMethods.WM_MBUTTONDOWN ||
+                uMsg == NativeMethods.WM_SETFOCUS)
+                RememberFocusAfterNativeInput();
+
             if (checkFocusParkAfter && !_isDestroyed)
             {
                 ClearUnselectedItemFocusBoxIfNeeded();

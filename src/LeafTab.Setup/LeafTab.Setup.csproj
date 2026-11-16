@@ -12,10 +12,10 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>..\LeafTab\Assets\LeafTab.ico</ApplicationIcon>
-    <AssemblyName>LeafTab-v0.6.6-Setup-x64</AssemblyName>
+    <AssemblyName>LeafTab-v0.6.7-Setup-x64</AssemblyName>
     <RootNamespace>LeafTab.Setup</RootNamespace>
-    <Version>0.6.6</Version>
-    <AssemblyTitle>LeafTab（一叶）v0.6.6 安装向导</AssemblyTitle>
+    <Version>0.6.7</Version>
+    <AssemblyTitle>LeafTab（一叶）v0.6.7 安装向导</AssemblyTitle>
     <Product>LeafTab（一叶）</Product>
     <Company>LeafTab</Company>
     <Copyright>Copyright © LeafTab</Copyright>

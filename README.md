@@ -1,12 +1,18 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.6 搜索导航与预览焦点修复版**（2026-11-16）。
+当前最新版本：**v0.6.7 图片方向键与焦点同步修复版**（2026-11-16）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 333.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 336 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.7 更新内容
+
+- 修复点击预览图片后，方向键把焦点移回搜索框、无法继续切图的问题；补齐 WPF 与原生文件列表的焦点同步和键盘输入接口。
+- 搜索框、地址栏和行内重命名中的方向键仍用于文本编辑；保留后台、最小化窗口的防抢焦点保护。
+- 前台实测大图标左右切图、详情视图上下切图、点击预览和拖动分隔条后的切图、切回窗口后继续切图；预览栏实际宽度在默认 340 和拖动后的 420 下均保持不变。
 
 ## 0.6.6 更新内容
 
@@ -61,9 +67,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.6`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.7`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.6-Setup-x64.exe`（约 333.5 KB）
+- **图形化一键安装包**：`LeafTab-v0.6.7-Setup-x64.exe`（约 336 KB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -162,7 +168,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.6-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.7-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---
@@ -182,3 +188,4 @@ pwsh -NoProfile -File scripts/verify.ps1
 - [兼容性与资源压测记录 (COMPATIBILITY_REPORT.md)](./COMPATIBILITY_REPORT.md)
 
 搜索导航专项原生回归：构建 `tests/LeafTab.RegressionTests` 后运行 `LeafTab.RegressionTests.exe --search-navigation-native`。该测试使用隐藏原生父窗口，不启动主应用或修改系统关联。
+交互焦点验收：为 `--self-test-ui <测试目录>` 设置环境变量 `LEAFTAB_UI_TEST_LOG` 后，程序会只读记录前台归属、实际选中项、预览标题和实际宽度。记录器不注入按键、不改变焦点、不读取输入框内容；无该环境变量时不启用。

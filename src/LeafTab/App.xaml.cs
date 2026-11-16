@@ -255,8 +255,8 @@ namespace LeafTab
             if (req.IsUiPreview)
             {
                 mainWindow.Title = "LeafTab · 验证副本";
-                mainWindow.Width = 720;
-                mainWindow.Height = 620;
+                mainWindow.Width = 1160;
+                mainWindow.Height = 760;
             }
 
             if (isSilentWarmup && earlyBufferedRequests.Count == 0)
@@ -331,6 +331,13 @@ namespace LeafTab
 
                 mainWindow.EnsureAtLeastOneTabOpen(markAsAutoFallback: true);
                 initialWindowReady = true;
+            }
+
+            if (req.IsUiPreview)
+            {
+                string? interactiveLogPath = Environment.GetEnvironmentVariable("LEAFTAB_UI_TEST_LOG");
+                if (!string.IsNullOrWhiteSpace(interactiveLogPath))
+                    InteractiveFocusRecorder.Attach(mainWindow, interactiveLogPath!);
             }
 
             if (!_isSelfTest)

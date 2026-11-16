@@ -1596,11 +1596,12 @@ namespace LeafTab.Views
 
             int vk = (int)msg.wParam.ToInt64();
             ModifierKeys mods = Keyboard.Modifiers;
-            bool inWpfTextBox = AddressTextBox.IsKeyboardFocusWithin ||
+            bool inWpfTextBox = !(_selectedTab?.BrowserHost.IsNativeFocusInside() ?? false) &&
+                               (AddressTextBox.IsKeyboardFocusWithin ||
                                 SearchTextBox.IsKeyboardFocusWithin ||
-                                IsPreviewContentFocused();
+                                IsPreviewContentFocused());
 
-            if (mods == ModifierKeys.None && vk == 0x1B && IsPreviewContentFocused())
+            if (mods == ModifierKeys.None && vk == 0x1B && inWpfTextBox && IsPreviewContentFocused())
             {
                 _selectedTab?.BrowserHost.FocusNativeView();
                 handled = true;
@@ -2680,7 +2681,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.6";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.7";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",
