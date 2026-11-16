@@ -26,6 +26,9 @@ namespace LeafTab
         private MainWindow? _lastActiveWindow;
         private SingleInstanceService? _singleInstance;
         private ComShellExecuteServer? _comServer;
+        private ExplorerWindowRedirectService? _explorerRedirect;
+        private bool _isPrimaryInstance;
+        private volatile bool _shellInterceptionEnabled;
         private bool _isSelfTest;
         private bool _isShuttingDownAll;
         private DispatcherTimer? _comRelayIdleTimer;
@@ -161,7 +164,8 @@ namespace LeafTab
                 return;
             }
 
-            if (req.IsBackgroundWarmup && req.Targets.Count == 0 && !AppConfigService.Load().EnableWarmStandby)
+            if (req.IsBackgroundWarmup && req.Targets.Count == 0 && !AppConfigService.Load().EnableWarmStandby &&
+                !ShellIntegrationService.IsDefaultExplorerEnabled())
             {
                 Environment.Exit(0);
                 return;
@@ -219,9 +223,11 @@ namespace LeafTab
                 }
                 else
                 {
+                    _isPrimaryInstance = true;
                     _singleInstance.StartListening(routeIncomingRequest);
                     _comServer = new ComShellExecuteServer(routeIncomingRequest, TouchComActivity);
-                    _comServer.Start();
+                    if (!_comServer.Start())
+                        DiagnosticLog.Write("com-primary-registration-failed");
                 }
             }
 
@@ -342,6 +348,8 @@ namespace LeafTab
 
             if (!_isSelfTest)
             {
+                ShellIntegrationService.DefaultExplorerChanged += OnDefaultExplorerChanged;
+                RefreshExternalShellIntegration();
                 _ = Task.Run(async () =>
                 {
                     await Task.Delay(800).ConfigureAwait(false);
@@ -386,7 +394,7 @@ namespace LeafTab
                     MainWindow = _lastActiveWindow;
                 }
 
-                if (_windows.Count == 0 && !_isShuttingDownAll)
+                if (_windows.Count == 0 && !_isShuttingDownAll && !_shellInterceptionEnabled)
                 {
                     Shutdown();
                 }
@@ -502,15 +510,15 @@ namespace LeafTab
             return null;
         }
 
-        internal async Task RouteExternalLaunchRequestAsync(LaunchActionRequest incoming)
+        internal async Task<bool> RouteExternalLaunchRequestAsync(LaunchActionRequest incoming)
         {
             if (incoming.IsPassiveStartup)
-                return;
+                return false;
 
             if (incoming.IsQuitProcess)
             {
                 ForceExitAllWindows();
-                return;
+                return false;
             }
 
             _hasHandledExternalOpen = true;
@@ -524,27 +532,61 @@ namespace LeafTab
                     MainWindow? standby = GetPreferredTargetWindow();
                     if (standby != null)
                     {
-                        await standby.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
-                        return;
+                        return await standby.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
                     }
                 }
 
                 MainWindow newWin = await CreateSecondaryWindowCoreAsync(
                     cascadeFrom: GetPreferredTargetWindow(),
                     screenTopLeftDip: null);
-                await newWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
-                return;
+                return await newWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
             }
 
             MainWindow? targetWin = GetPreferredTargetWindow();
             if (targetWin == null)
             {
                 targetWin = await CreateSecondaryWindowCoreAsync(cascadeFrom: null, screenTopLeftDip: null);
-                await targetWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
-                return;
+                return await targetWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: true);
             }
 
-            await targetWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: false);
+            return await targetWin.HandleExternalLaunchRequestAsync(incoming, isInitialLaunch: false);
+        }
+
+        private void OnDefaultExplorerChanged(object? sender, EventArgs args) =>
+            Dispatcher.BeginInvoke(new Action(RefreshExternalShellIntegration));
+
+        private void RefreshExternalShellIntegration()
+        {
+            bool enabled = !_isSelfTest && _isPrimaryInstance && !_isShuttingDownAll &&
+                ShellIntegrationService.IsDefaultExplorerEnabled();
+            _shellInterceptionEnabled = enabled;
+            if (enabled && _explorerRedirect == null)
+            {
+                var redirect = new ExplorerWindowRedirectService(
+                    incoming => Dispatcher.InvokeAsync(() =>
+                        _shellInterceptionEnabled && !_isShuttingDownAll
+                            ? RouteExternalLaunchRequestAsync(incoming)
+                            : Task.FromResult(false)).Task.Unwrap(),
+                    () => _shellInterceptionEnabled && !_isShuttingDownAll &&
+                        ShellIntegrationService.IsDefaultExplorerEnabled());
+                if (redirect.Start())
+                {
+                    _explorerRedirect = redirect;
+                    DiagnosticLog.Write("explorer-redirect-started");
+                }
+                else
+                {
+                    redirect.Dispose();
+                    DiagnosticLog.Write("explorer-redirect-start-failed");
+                }
+            }
+            else if (!enabled && _explorerRedirect != null)
+            {
+                _explorerRedirect.Dispose();
+                _explorerRedirect = null;
+            }
+            foreach (MainWindow window in _windows.ToArray())
+                window.RefreshShellViewRegistration();
         }
 
         internal async Task<MainWindow> OpenNewIndependentWindowAsync(
@@ -661,6 +703,8 @@ namespace LeafTab
             }
 
             // Release COM class object & single-instance mutex BEFORE spawning installed copy
+            _shellInterceptionEnabled = false;
+            try { _explorerRedirect?.Dispose(); _explorerRedirect = null; } catch { }
             try { _comServer?.Dispose(); _comServer = null; } catch { }
             try { _singleInstance?.Dispose(); _singleInstance = null; } catch { }
 
@@ -743,7 +787,7 @@ namespace LeafTab
             _comRelayIdleTimer.Tick += (_, _) =>
             {
                 int visibleCount = GetVisibleWindowsCount();
-                if (visibleCount > 0 || (isPrimaryInstance && _hasHandledExternalOpen))
+                if (visibleCount > 0 || (isPrimaryInstance && (_hasHandledExternalOpen || _shellInterceptionEnabled)))
                 {
                     _comRelayIdleTimer.Stop();
                     return;
@@ -762,6 +806,9 @@ namespace LeafTab
 
         protected override void OnExit(ExitEventArgs e)
         {
+            _shellInterceptionEnabled = false;
+            ShellIntegrationService.DefaultExplorerChanged -= OnDefaultExplorerChanged;
+            _explorerRedirect?.Dispose();
             _comRelayIdleTimer?.Stop();
             _comServer?.Dispose();
             _singleInstance?.Dispose();

@@ -17,13 +17,21 @@ namespace LeafTab.Services
     public sealed class LaunchTargetItem
     {
         public string FolderOrAlias { get; }
-        public string? SelectItemName { get; }
+        public string? SelectItemName => SelectItemNames.Count == 0 ? null : SelectItemNames[0];
+        public IReadOnlyList<string> SelectItemNames { get; }
         public byte[]? PidlBytes { get; }
 
-        public LaunchTargetItem(string folderOrAlias, string? selectItemName = null, byte[]? pidlBytes = null)
+        public LaunchTargetItem(string folderOrAlias, string? selectItemName = null, byte[]? pidlBytes = null,
+            IEnumerable<string>? selectItemNames = null)
         {
             FolderOrAlias = folderOrAlias ?? string.Empty;
-            SelectItemName = string.IsNullOrWhiteSpace(selectItemName) ? null : selectItemName;
+            var names = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(selectItemName) && seen.Add(selectItemName!)) names.Add(selectItemName!);
+            if (selectItemNames != null)
+                foreach (string name in selectItemNames)
+                    if (!string.IsNullOrWhiteSpace(name) && seen.Add(name)) names.Add(name);
+            SelectItemNames = names.AsReadOnly();
             PidlBytes = pidlBytes;
         }
     }
@@ -46,6 +54,35 @@ namespace LeafTab.Services
         // Starting infrastructure is not a request to open a user-facing window.
         internal bool IsPassiveStartup => !IsQuitProcess && Targets.Count == 0 &&
                                           (IsBackgroundWarmup || IsComServerLaunch);
+
+        // Multiple /select arguments and V1 IPC target frames for one directory
+        // represent one selection, rather than repeatedly clearing earlier items.
+        internal void AddOrMergeSelectionTarget(LaunchTargetItem target)
+        {
+            if (target.SelectItemNames.Count > 0)
+            {
+                for (int i = 0; i < Targets.Count; i++)
+                {
+                    LaunchTargetItem existing = Targets[i];
+                    if (existing.SelectItemNames.Count == 0 ||
+                        !string.Equals(existing.FolderOrAlias, target.FolderOrAlias, StringComparison.OrdinalIgnoreCase) ||
+                        !SamePidl(existing.PidlBytes, target.PidlBytes)) continue;
+                    var names = new List<string>(existing.SelectItemNames);
+                    names.AddRange(target.SelectItemNames);
+                    Targets[i] = new LaunchTargetItem(existing.FolderOrAlias, pidlBytes: existing.PidlBytes, selectItemNames: names);
+                    return;
+                }
+            }
+            Targets.Add(target);
+        }
+
+        private static bool SamePidl(byte[]? first, byte[]? second)
+        {
+            int length = first?.Length ?? 0;
+            if (length != (second?.Length ?? 0)) return false;
+            for (int i = 0; i < length; i++) if (first![i] != second![i]) return false;
+            return true;
+        }
     }
 
     internal static class LaunchRequestParser
@@ -182,6 +219,7 @@ namespace LeafTab.Services
                     {
                         selectThisItem = true;
                         working = working.Substring(8).TrimStart();
+                        if (working.Length == 0) pendingSelectNextArg = true;
                         continue;
                     }
 
@@ -265,7 +303,7 @@ namespace LeafTab.Services
                     if (parent!.Length == 2 && char.IsLetter(parent[0]) && parent[1] == ':')
                         parent += "\\";
 
-                    req.Targets.Add(new LaunchTargetItem(parent, leaf));
+                    req.AddOrMergeSelectionTarget(new LaunchTargetItem(parent, leaf));
                     return;
                 }
             }

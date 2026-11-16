@@ -1015,30 +1015,11 @@ namespace LeafTab.Controls
             }
         }
 
-        public async Task<bool> SelectChildItemWhenReadyAsync(string childFileName)
-        {
-            if (string.IsNullOrWhiteSpace(childFileName))
-                return false;
+        public Task<bool> SelectChildItemWhenReadyAsync(string childFileName) =>
+            SelectChildItemsWhenReadyAsync(new[] { childFileName });
 
-            for (int attempt = 0; attempt < 18; attempt++)
-            {
-                if (_isDestroyed)
-                    return false;
-
-                if (TrySelectChildByName(childFileName, beginRename: false))
-                {
-                    InvalidateSelectionCache();
-                    FocusNativeView();
-                    return true;
-                }
-
-                await Task.Delay(40).ConfigureAwait(true);
-            }
-
-            return false;
-        }
-
-        private bool TrySelectChildByName(string childFileName, bool beginRename)
+        private bool TrySelectChildByName(string childFileName, bool beginRename,
+            bool deselectOthers = true, bool focusItem = true)
         {
             IExplorerBrowser? active = ActiveBrowser;
             if (_isDestroyed || active == null || string.IsNullOrWhiteSpace(childFileName))
@@ -1046,9 +1027,8 @@ namespace LeafTab.Controls
 
             uint modeFlag = beginRename ? ShellConstants.SVSI_EDIT : ShellConstants.SVSI_SELECT;
             uint flags = modeFlag |
-                         ShellConstants.SVSI_DESELECTOTHERS |
-                         ShellConstants.SVSI_ENSUREVISIBLE |
-                         ShellConstants.SVSI_FOCUSED;
+                         (deselectOthers ? ShellConstants.SVSI_DESELECTOTHERS : 0) |
+                         (focusItem ? ShellConstants.SVSI_ENSUREVISIBLE | ShellConstants.SVSI_FOCUSED : 0);
 
             Guid iidSv = ShellConstants.IID_IShellView;
             Guid iidFv = ShellConstants.IID_IFolderView;
@@ -1643,6 +1623,7 @@ namespace LeafTab.Controls
         private void OnNativeNavigationComplete(IntPtr pidlFolder)
         {
             if (_isDestroyed) return;
+            TrackExternalNavigationComplete(pidlFolder);
             _viewGeneration++;
             _isKeyboardFocusActive = false;
             _isMouseDownInView = false;
@@ -1687,6 +1668,9 @@ namespace LeafTab.Controls
         private void OnNativeNavigationFailed(IntPtr pidlFolder)
         {
             if (_isDestroyed) return;
+            _externalNavigationPending = false;
+            _externalNavigationFailed = true;
+            _externalSelectionSerial++;
             FolderDisplayInfo info = PidlManager.GetDisplayInfo(pidlFolder);
             Dispatcher.BeginInvoke(new Action(() =>
             {
@@ -2107,6 +2091,7 @@ namespace LeafTab.Controls
         protected override void DestroyWindowCore(HandleRef hwnd)
         {
             _isDestroyed = true;
+            DisposeExternalNavigationTracking();
             CancelSearchStateInternal(freeSavedPidl: true);
             DetachDirectUiSubclass();
 
@@ -2192,7 +2177,12 @@ namespace LeafTab.Controls
 
             public void Detach() => _ownerRef = null;
 
-            public int OnNavigationPending(IntPtr pidlFolder) => ShellConstants.S_OK;
+            public int OnNavigationPending(IntPtr pidlFolder)
+            {
+                if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
+                    owner.TrackExternalNavigationPending(pidlFolder);
+                return ShellConstants.S_OK;
+            }
 
             public int OnViewCreated(IntPtr psv)
             {

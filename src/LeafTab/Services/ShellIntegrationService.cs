@@ -33,6 +33,7 @@ namespace LeafTab.Services
         private const string AutoRunValueName = "LeafTab";
         internal const string ContextMenuVerbKeyName = "OpenInLeafTab";
         internal const string DefaultVerbKeyName = "LeafTabOpen";
+        internal static event EventHandler? DefaultExplorerChanged;
 
         private static readonly string[] s_contextMenuTargets =
         {
@@ -175,16 +176,47 @@ namespace LeafTab.Services
 
                 using RegistryKey? verbKey = dirShell.OpenSubKey(DefaultVerbKeyName);
                 using RegistryKey? command = verbKey?.OpenSubKey("command");
-                return verbKey != null &&
+                bool ownsDefault = verbKey != null &&
                        string.Equals(verbKey.GetValue("LeafTabManaged") as string, "1", StringComparison.Ordinal) &&
                        (expectedExePath == null ||
                         (ShellAssociationRecovery.IsExpectedCommand(command?.GetValue(null) as string, expectedExePath, "\"%V \"") &&
                          string.Equals(command?.GetValue("DelegateExecute") as string, LeafTabExecuteClsidString, StringComparison.OrdinalIgnoreCase)));
+                // The path-free probe is intentionally only an ownership/discovery probe
+                // for conservative repair. UI and interception require the full contract.
+                if (!ownsDefault || expectedExePath == null) return ownsDefault;
+                foreach (string parent in new[] { "Directory", "Drive", "Folder" })
+                {
+                    using RegistryKey? shell = Registry.CurrentUser.OpenSubKey($@"{classesRoot}\{parent}\shell");
+                    if (!string.Equals(shell?.GetValue(null) as string, DefaultVerbKeyName, StringComparison.OrdinalIgnoreCase)) return false;
+                    if (!HasExpectedCommand(classesRoot, $@"{parent}\shell\{DefaultVerbKeyName}\command", expectedExePath, "\"%V \"", LeafTabExecuteClsidString)) return false;
+                    if (!HasExpectedCommand(classesRoot, $@"{parent}\shell\open\command", expectedExePath, "\"%V \"", LeafTabExecuteClsidString)) return false;
+                }
+                return HasExpectedCommand(classesRoot, @"Folder\shell\explore\command", expectedExePath, "\"%V \"", LeafTabExecuteClsidString) &&
+                       HasExpectedCommand(classesRoot, @"Folder\shell\opennewwindow\command", expectedExePath, "--new-window \"%V \"", LeafTabNewWindowExecuteClsidString) &&
+                       HasExpectedCommand(classesRoot, $@"CLSID\{WinExplorerClsidKeyName}\shell\open\command", expectedExePath, "\"此电脑\"", LeafTabExecuteClsidString) &&
+                       HasExpectedCommand(classesRoot, $@"CLSID\{WinExplorerClsidKeyName}\shell\opennewwindow\command", expectedExePath, "--new-window \"此电脑\"", LeafTabNewWindowExecuteClsidString) &&
+                       HasExpectedCommand(classesRoot, $@"CLSID\{LeafTabExecuteClsidString}\LocalServer32", expectedExePath, "--com-server", null) &&
+                       HasExpectedCommand(classesRoot, $@"CLSID\{LeafTabNewWindowExecuteClsidString}\LocalServer32", expectedExePath, "--com-server", null);
             }
             catch
             {
                 return false;
             }
+        }
+
+        private static bool HasExpectedCommand(string classesRoot, string path, string exe, string arguments, string? clsid)
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(classesRoot + "\\" + path);
+            return key != null && ShellAssociationRecovery.IsExpectedCommand(key.GetValue(null) as string, exe, arguments) &&
+                   (clsid == null ? string.IsNullOrEmpty(key.GetValue("DelegateExecute") as string) :
+                    string.Equals(key.GetValue("DelegateExecute") as string, clsid, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static void NotifyDefaultExplorerChanged(string classesRoot)
+        {
+            if (!string.Equals(classesRoot, DefaultClassesRoot, StringComparison.OrdinalIgnoreCase)) return;
+            try { DefaultExplorerChanged?.Invoke(null, EventArgs.Empty); }
+            catch (Exception ex) { DiagnosticLog.Write("shell-integration-refresh-failed", ex); }
         }
 
         internal static (bool Ok, string Message) SetDefaultExplorerEnabledCore(
@@ -285,12 +317,14 @@ namespace LeafTab.Services
                     if (notifyShell)
                         NotifyShellAssociationsChanged();
 
+                    NotifyDefaultExplorerChanged(classesRoot);
                     return (true, "已设为默认资源管理器（已接管文件夹、此电脑、任务栏入口与 Win+E；卸载软件时将自动恢复系统默认）");
                 }
                 else
                 {
                     ShellAssociationRecovery.RestoreDefault(exePath, classesRoot, backupRoot);
                     if (notifyShell) NotifyShellAssociationsChanged();
+                    NotifyDefaultExplorerChanged(classesRoot);
                     return (true, "已恢复仍属于此安装位置的资源管理器关联；其他程序的修改已保留");
                 }
             }
@@ -345,7 +379,14 @@ namespace LeafTab.Services
                 string? curNewWinDel = folderNewWinCmdKey?.GetValue("DelegateExecute") as string;
 
                 string? registeredExe = ShellAssociationRecovery.CommandExecutable(curVerbCmd);
-                if (registeredExe == null || !string.Equals(Path.GetFileName(registeredExe), Path.GetFileName(currentExePath), StringComparison.OrdinalIgnoreCase) ||
+                bool otherDefaultOwner = false;
+                foreach (string parent in new[] { "Drive", "Folder" })
+                {
+                    using RegistryKey? shell = Registry.CurrentUser.OpenSubKey($@"{classesRoot}\{parent}\shell");
+                    string? verb = shell?.GetValue(null) as string;
+                    otherDefaultOwner |= !string.IsNullOrEmpty(verb) && !string.Equals(verb, DefaultVerbKeyName, StringComparison.OrdinalIgnoreCase);
+                }
+                if (registeredExe == null || otherDefaultOwner || !string.Equals(Path.GetFileName(registeredExe), Path.GetFileName(currentExePath), StringComparison.OrdinalIgnoreCase) ||
                     !ShellAssociationRecovery.CanRepairDefault(classesRoot, registeredExe, currentExePath))
                 {
                     DiagnosticLog.Write("shell-repair-preserved-modified-association");
@@ -355,7 +396,8 @@ namespace LeafTab.Services
                 string expectedFolderCmd = $"\"{effectiveExe}\" \"%V \"";
                 string expectedComCmd = $"\"{effectiveExe}\" --com-server";
 
-                if (!string.Equals(curSrv, expectedComCmd, StringComparison.OrdinalIgnoreCase) ||
+                if (!IsDefaultExplorerEnabledCore(classesRoot, effectiveExe) ||
+                    !string.Equals(curSrv, expectedComCmd, StringComparison.OrdinalIgnoreCase) ||
                     !string.Equals(curNewWinSrv, expectedComCmd, StringComparison.OrdinalIgnoreCase) ||
                     !string.Equals(curVerbCmd, expectedFolderCmd, StringComparison.OrdinalIgnoreCase) ||
                     !string.Equals(curFolderDel, LeafTabExecuteClsidString, StringComparison.OrdinalIgnoreCase) ||
@@ -675,8 +717,8 @@ namespace LeafTab.Services
 
         public bool Start()
         {
-            if (_registered || _disposed)
-                return _registered;
+            if ((_registered && _newWindowRegistered) || _disposed)
+                return _registered && _newWindowRegistered;
 
             try
             {
@@ -701,10 +743,15 @@ namespace LeafTab.Services
                     out _newWindowCookie);
 
                 _newWindowRegistered = hr2 >= 0;
-                return _registered;
+                if (_registered && _newWindowRegistered) return true;
+                DiagnosticLog.Write("shell-com-registration-failed", new COMException("Shell command registration failed.", hr < 0 ? hr : hr2));
+                RevokeRegistrations();
+                return false;
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.Write("shell-com-registration-failed", ex);
+                RevokeRegistrations();
                 return false;
             }
         }
@@ -714,7 +761,11 @@ namespace LeafTab.Services
             if (_disposed)
                 return;
             _disposed = true;
+            RevokeRegistrations();
+        }
 
+        private void RevokeRegistrations()
+        {
             if (_registered)
             {
                 try
@@ -890,9 +941,8 @@ namespace LeafTab.Services
                     return ShellConstants.S_OK;
                 }
 
-                // 3. Otherwise (Desktop double-click, This PC, Recycle Bin, Win+E, Taskbar File Explorer,
-                //    opennewwindow, Chrome/Edge/WeChat/VSCode ShellExecute / SHOpenFolderAndSelectItems, etc.),
-                //    route into LeafTab.
+                // Route verbs that reach DelegateExecute. Direct Explorer launches are
+                // handled separately; API selection completes via ShellViewRegistration.
                 LaunchActionRequest req = BuildLaunchRequestFromShellInvocation();
                 if (_forceNewWindow)
                 {
@@ -903,9 +953,10 @@ namespace LeafTab.Services
 
                 return ShellConstants.S_OK;
             }
-            catch
+            catch (Exception ex)
             {
-                return ShellConstants.S_OK;
+                DiagnosticLog.Write("shell-open-failed", ex);
+                return Marshal.GetHRForException(ex);
             }
             finally
             {
@@ -964,10 +1015,11 @@ namespace LeafTab.Services
         {
             Guid clsid = s_clsidExecuteFolder;
             Guid iid = s_iidExecuteCommand;
-            if (NativeMethods.CoCreateInstance(ref clsid, IntPtr.Zero, NativeMethods.CLSCTX_INPROC_SERVER, ref iid, out IntPtr pCmd) != ShellConstants.S_OK ||
+            int createResult = NativeMethods.CoCreateInstance(ref clsid, IntPtr.Zero, NativeMethods.CLSCTX_INPROC_SERVER, ref iid, out IntPtr pCmd);
+            if (createResult != ShellConstants.S_OK ||
                 pCmd == IntPtr.Zero)
             {
-                return ShellConstants.S_OK;
+                return createResult < 0 ? createResult : unchecked((int)0x80004005);
             }
 
             object nativeObj = Marshal.GetObjectForIUnknown(pCmd);
@@ -1113,6 +1165,12 @@ namespace LeafTab.Services
                             string? display = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
                             string? fsPath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
 
+                            if (!string.IsNullOrWhiteSpace(fsPath) && File.Exists(fsPath))
+                            {
+                                req.Targets.AddRange(LaunchRequestParser.Parse(new[] { "/select," + fsPath }).Targets);
+                                continue;
+                            }
+
                             // Redirect Windows File Explorer launcher CLSID {52205fd8-5dfb-447d-801a-d0b52f2e83e1} cleanly to "此电脑"
                             if (PidlManager.IsExplorerLauncherTarget(parsing) || PidlManager.IsExplorerLauncherTarget(display))
                             {
@@ -1145,13 +1203,7 @@ namespace LeafTab.Services
 
             if (req.Targets.Count == 0 && !string.IsNullOrWhiteSpace(_parameters))
             {
-                string norm = LaunchRequestParser.NormalizePathToken(_parameters!);
-                if (!string.IsNullOrWhiteSpace(norm))
-                {
-                    req.Targets.Add(PidlManager.IsExplorerLauncherTarget(norm)
-                        ? new LaunchTargetItem("此电脑")
-                        : new LaunchTargetItem(norm));
-                }
+                req.Targets.AddRange(LaunchRequestParser.Parse(new[] { _parameters! }).Targets);
             }
 
             if (req.Targets.Count == 0 && !string.IsNullOrWhiteSpace(_directory) && Directory.Exists(_directory))

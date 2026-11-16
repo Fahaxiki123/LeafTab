@@ -41,6 +41,11 @@ try {
 }
 finally { $env:LEAFTAB_TEST_ROOT = $previousTestRoot }
 if (-not $SkipNative) {
+    foreach ($suite in @('external-selection-native', 'shell-selection-native', 'search-navigation-native')) {
+        & (Join-Path $output 'tests\LeafTab.RegressionTests\bin\x64\Release\net48\LeafTab.RegressionTests.exe') ("--" + $suite) 2>&1 |
+            Tee-Object -FilePath (Join-Path $output ($suite + '.log'))
+        if ($LASTEXITCODE -ne 0) { throw "Native suite $suite failed. Evidence: $output" }
+    }
     $report = Join-Path $output 'native-selftest.md'
     $process = Start-Process -FilePath (Join-Path $output 'src\LeafTab\bin\x64\Release\net48\LeafTab.exe') `
         -ArgumentList ('--self-test "{0}"' -f $report) -WorkingDirectory $output -WindowStyle Hidden -PassThru

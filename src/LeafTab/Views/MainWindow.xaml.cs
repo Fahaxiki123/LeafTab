@@ -106,6 +106,7 @@ namespace LeafTab.Views
         private bool _skipSaveOnForceClose;
         private bool _isLoadedCompleted;
         private bool _isClosingWindow;
+        private readonly ShellViewRegistration _shellViewRegistration = new ShellViewRegistration();
 
         public ObservableCollection<ExplorerTabItem> Tabs => _tabs;
         public ExplorerTabItem? SelectedTab => _selectedTab;
@@ -174,6 +175,7 @@ namespace LeafTab.Views
             if (_sharedStore != null) _sharedStore.Changed += SharedConfigurationChanged;
 
             SourceInitialized += MainWindow_SourceInitialized;
+            IsVisibleChanged += (_, _) => RefreshShellViewRegistration();
             Loaded += MainWindow_Loaded;
             StateChanged += MainWindow_StateChanged;
             LocationChanged += (_, _) => AddressSuggestPopup.IsOpen = false;
@@ -833,15 +835,15 @@ namespace LeafTab.Views
             return true;
         }
 
-        public async Task HandleExternalLaunchRequestAsync(LaunchActionRequest request, bool isInitialLaunch)
+        public async Task<bool> HandleExternalLaunchRequestAsync(LaunchActionRequest request, bool isInitialLaunch)
         {
             if (_isClosingWindow || request == null || request.IsPassiveStartup)
-                return;
+                return false;
 
             if (request.IsQuitProcess)
             {
                 ForceExitApplication();
-                return;
+                return true;
             }
 
             if (!_isLoadedCompleted)
@@ -876,10 +878,11 @@ namespace LeafTab.Views
                     BringWindowToFront();
                     _selectedTab?.BrowserHost.FocusNativeView();
                 }
-                return;
+                return true;
             }
 
             bool anyOpenedHere = false;
+            bool allTargetsSucceeded = true;
             foreach (LaunchTargetItem item in request.Targets)
             {
                 IntPtr pidl = item.PidlBytes != null && item.PidlBytes.Length > 0
@@ -894,6 +897,8 @@ namespace LeafTab.Views
 
                 if (pidl == IntPtr.Zero)
                 {
+                    allTargetsSucceeded = false;
+                    DiagnosticLog.Write("external-open-path-unavailable");
                     if (!wakingFromStandby) BringWindowToFront();
                     SetTransientStatus(parseErr ?? $"无法打开路径：{item.FolderOrAlias}");
                     continue;
@@ -913,13 +918,9 @@ namespace LeafTab.Views
                             ownerWin.BringWindowToFront();
                             ownerWin.ActivateTab(existingTab, focusNativeView: true);
 
-                            if (!string.IsNullOrWhiteSpace(item.SelectItemName))
-                            {
-                                existingTab.BrowserHost.ClearSelection();
-                                await existingTab.BrowserHost.SelectChildItemWhenReadyAsync(item.SelectItemName!);
-                                ownerWin.UpdateCommandBarAndStatus(computeBytes: true);
-                            }
-                            else
+                            bool succeeded = await ownerWin.CompleteExternalTargetAsync(existingTab, pidl, item);
+                            allTargetsSucceeded &= succeeded;
+                            if (succeeded && item.SelectItemNames.Count == 0)
                             {
                                 ownerWin.SetTransientStatus($"已定位到已打开的标签页：{existingTab.Title}");
                             }
@@ -953,23 +954,25 @@ namespace LeafTab.Views
                         bool shouldAnimate = !_skipSessionPersistence && !wakingFromStandby && _tabs.Count > 0;
                         targetTab = AddNewTab(pidl, activate: true, animateOpen: shouldAnimate);
                     }
+
+                    if (wakingFromStandby)
+                    {
+                        wakingFromStandby = false;
+                        BringWindowToFront();
+                        targetTab.BrowserHost.FocusNativeView();
+                    }
+
+                    allTargetsSucceeded &= await CompleteExternalTargetAsync(targetTab, pidl, item);
+                }
+                catch (Exception ex)
+                {
+                    allTargetsSucceeded = false;
+                    DiagnosticLog.Write("external-open-failed", ex);
+                    if (!_isClosingWindow) SetTransientStatus("打开所在位置失败，请重试。");
                 }
                 finally
                 {
                     PidlManager.Free(ref pidl);
-                }
-
-                if (wakingFromStandby)
-                {
-                    wakingFromStandby = false;
-                    BringWindowToFront();
-                    targetTab.BrowserHost.FocusNativeView();
-                }
-
-                if (!string.IsNullOrWhiteSpace(item.SelectItemName))
-                {
-                    await targetTab.BrowserHost.SelectChildItemWhenReadyAsync(item.SelectItemName!);
-                    UpdateCommandBarAndStatus(computeBytes: true);
                 }
             }
 
@@ -983,6 +986,32 @@ namespace LeafTab.Views
             {
                 _selectedTab.BrowserHost.FocusNativeView();
             }
+            return allTargetsSucceeded;
+        }
+
+        private async Task<bool> CompleteExternalTargetAsync(ExplorerTabItem tab, IntPtr expectedFolderPidl,
+            LaunchTargetItem item)
+        {
+            if (_isClosingWindow || !_tabs.Contains(tab) ||
+                !await tab.BrowserHost.WaitForFolderNavigationAsync(expectedFolderPidl))
+            {
+                DiagnosticLog.Write("external-open-navigation-unconfirmed");
+                return false;
+            }
+            if (!ReferenceEquals(_selectedTab, tab) || !IsVisible || _isClosingWindow) return false;
+            if (item.SelectItemNames.Count > 0)
+            {
+                bool selected = await tab.BrowserHost.SelectChildItemsWhenReadyAsync(item.SelectItemNames);
+                if (!selected)
+                {
+                    DiagnosticLog.Write("external-open-selection-unconfirmed");
+                    if (!_isClosingWindow) SetTransientStatus("已打开文件夹，但未能选中全部目标项目。");
+                    return false;
+                }
+                UpdateCommandBarAndStatus(computeBytes: true);
+            }
+            return !_isClosingWindow && IsVisible && _tabs.Contains(tab) && ReferenceEquals(_selectedTab, tab) &&
+                tab.BrowserHost.IsFolderNavigationComplete(expectedFolderPidl);
         }
 
         private void MainWindow_StateChanged(object? sender, EventArgs e)
@@ -1109,8 +1138,14 @@ namespace LeafTab.Views
                     if (ReferenceEquals(tab, _selectedTab))
                     {
                         SyncChromeWithSelectedTab(computeBytes: false);
+                        RefreshShellViewRegistration();
                     }
                     ScheduleSessionSave();
+                };
+
+                host.NavigationStarting += (_, _) =>
+                {
+                    if (ReferenceEquals(tab, _selectedTab)) _shellViewRegistration.Dispose();
                 };
 
                 host.NavigationFailed += (_, message) =>
@@ -1157,6 +1192,7 @@ namespace LeafTab.Views
                         UpdateNavigationButtonsState();
                         SyncStatusTimerState();
                         UpdateCommandBarAndStatus(computeBytes: false);
+                        RefreshShellViewRegistration();
                     }
                 };
 
@@ -1230,6 +1266,7 @@ namespace LeafTab.Views
             }
 
             _selectedTab = tab;
+            RefreshShellViewRegistration();
             EnsureActiveTabVisible();
 
             foreach (ExplorerTabItem item in _tabs)
@@ -1287,6 +1324,21 @@ namespace LeafTab.Views
             UpdateCommandBarAndStatus(computeBytes);
         }
 
+        internal void RefreshShellViewRegistration()
+        {
+            ExplorerTabItem? tab = _selectedTab;
+            if (_skipSessionPersistence || _isClosingWindow || !IsVisible || tab == null ||
+                string.IsNullOrWhiteSpace(tab.FileSystemPath) ||
+                !ShellIntegrationService.IsDefaultExplorerEnabled() ||
+                !tab.BrowserHost.IsFolderNavigationComplete(tab.CurrentPidl))
+            {
+                _shellViewRegistration.Dispose();
+                return;
+            }
+            _shellViewRegistration.Update(new WindowInteropHelper(this).Handle, tab.CurrentPidl,
+                tab.BrowserHost.AcquireShellViewPointer, isEnabled: () => ShellIntegrationService.IsDefaultExplorerEnabled());
+        }
+
         private void PushClosedTabSnapshot(ExplorerTabItem tab)
         {
             if (_closedTabs.Count >= MaxClosedTabSnapshots)
@@ -1308,6 +1360,7 @@ namespace LeafTab.Views
             ClearDragHoverState();
 
             bool wasSelected = ReferenceEquals(tab, _selectedTab);
+            if (wasSelected) _shellViewRegistration.Dispose();
             _tabs.RemoveAt(index);
             BrowserStackGrid.Children.Remove(tab.BrowserHost);
             tab.Dispose();
@@ -2621,7 +2674,7 @@ namespace LeafTab.Views
 
             var miWarmStandby = new MenuItem
             {
-                Header = "关闭窗口后驻留极速热启动",
+                Header = "关闭窗口后保留预热视图",
                 IsChecked = _enableWarmStandby
             };
             miWarmStandby.Click += (_, _) =>
@@ -2629,8 +2682,8 @@ namespace LeafTab.Views
                 _enableWarmStandby = !_enableWarmStandby;
                 SaveConfigurationSnapshot();
                 SetTransientStatus(_enableWarmStandby
-                    ? "已开启关闭窗口后后台极速热启动（打开文件夹毫秒级响应）"
-                    : "已关闭后台热启动（关闭窗口后将完全退出进程）");
+                    ? "已开启后台预热，下次打开文件夹时复用预热视图。"
+                    : "已关闭后台预热；设为默认资源管理器时仍保留轻量接管监听，可通过「彻底退出」结束。");
             };
             menu.Items.Add(miWarmStandby);
 
@@ -2681,7 +2734,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.7";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.8";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",
@@ -3110,6 +3163,7 @@ namespace LeafTab.Views
 
         private void EnterWarmStandby()
         {
+            _shellViewRegistration.Dispose();
             SaveConfigurationSnapshot(isWindowClosing: true);
 
             _statusRefreshTimer.Stop();
@@ -3143,6 +3197,7 @@ namespace LeafTab.Views
 
         private void MainWindow_Closed(object? sender, EventArgs e)
         {
+            _shellViewRegistration.Dispose();
             if (_sharedStore != null) _sharedStore.Changed -= SharedConfigurationChanged;
             AddressSuggestPopup.IsOpen = false;
             if (!_skipSaveOnForceClose)

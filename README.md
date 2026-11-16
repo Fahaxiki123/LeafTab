@@ -1,12 +1,21 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.7 图片方向键与焦点同步修复版**（2026-11-16）。
+当前最新版本：**v0.6.8 外部文件定位与系统接管完善版**（2026-11-16）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 336 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 350 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.8 更新内容
+
+- 补齐浏览器下载、聊天软件文件等“打开所在位置”的 Windows 原生选择协议：打开目标目录后选中对应文件，支持单文件、多文件和选中文件夹项目。
+- 新增对运行期间新出现的 `explorer.exe /select` 普通文件夹窗口的转接；保留中文、空格、逗号路径及选择信息，确认 LeafTab 导航和选择成功后才关闭原窗口。
+- 文件定位等待实际导航和目录就绪；用户切换目录、关闭标签或发起新的定位请求时取消旧请求，失败时给出状态提示。
+- 补齐默认关联及两个 COM 服务的健康检查、缺失关联修复和失败诊断；已有其他管理器接管的关联予以保留。
+- 关闭预热后，启用默认接管时仍保留轻量监听；“彻底退出”会结束监听。启用前已有的原生窗口、原生多标签窗口、系统组件及打开/保存对话框不会被批量关闭或转接。
+- 直接启动 Explorer 的兼容方式可能短暂显示原生窗口；完全退出 LeafTab 后，此类绕过系统关联的请求仍由 Windows 处理。
 
 ## 0.6.7 更新内容
 
@@ -67,9 +76,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.7`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.8`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.7-Setup-x64.exe`（约 336 KB）
+- **图形化一键安装包**：`LeafTab-v0.6.8-Setup-x64.exe`（约 350 KB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -89,7 +98,7 @@
   - **跨进程单实例汇聚（`NamedPipe` + `Mutex` + `AllowSetForegroundWindow`）**：当 LeafTab 已在运行时，无论是从桌面/外部软件打开文件夹、双击 `LeafTab.exe` 还是传入 `LeafTab.exe /select,"文件路径"`，都会自动唤醒现有窗口到前台、在**新标签页**中打开目标目录，并自动在列表中高亮定位目标文件（同时自动修复盘符根目录 `"D:\"` 反斜杠引号转义与带逗号路径）；
   - **`⋯` 菜单一键可选系统集成（纯 `HKCU` 用户态，无需管理员权限，默认关闭）**：
     1. **右键菜单添加「在 LeafTab 中打开」**：在文件夹、目录空白背景与磁盘分区右键菜单一键添加/移除入口；
-    2. **设为默认资源管理器（接管文件夹与 `Win + E`）**：全面覆盖 `Directory\shell`、`Drive\shell`、`Folder\shell`（含显式 `open` / `explore` / `opennewwindow` 动词）以及任务栏/开始菜单「文件资源管理器」与 `Win + E` 入口；内置进程级 `IExecuteCommand`（`DelegateExecute`）本地 COM 服务——对控制面板/网络连接等系统组件自动原位转交原生 `CLSID_ExecuteFolder`，在 LeafTab 内部双击子目录或在第三方软件「打开/保存文件对话框（`#32770`）」内双击目录保持 **`0ms` 原位跳转**，而在桌面、`此电脑`、任务栏、`Win + E` 或外部软件打开文件夹时 100% 汇入 LeafTab；
+    2. **设为默认资源管理器（接管文件夹与 `Win + E`）**：全面覆盖 `Directory\shell`、`Drive\shell`、`Folder\shell`（含显式 `open` / `explore` / `opennewwindow` 动词）以及任务栏/开始菜单「文件资源管理器」与 `Win + E` 入口；内置进程级 `IExecuteCommand`（`DelegateExecute`）本地 COM 服务——对控制面板/网络连接等系统组件自动原位转交原生 `CLSID_ExecuteFolder`，在 LeafTab 内部双击子目录或在第三方软件「打开/保存文件对话框（`#32770`）」内双击目录保持 **`0ms` 原位跳转**，桌面、`此电脑`、任务栏、`Win + E` 和常规 Shell 打开请求会转入 LeafTab；原生“打开所在位置”通过注册的 Shell 视图传递文件选择，直接 `explorer.exe /select` 则由运行中的接管监听转接；
     3. **关闭窗口后驻留极速热启动（默认开启，可在 `⋯` 菜单随时切换或点击「彻底退出 LeafTab」）**：对齐 Windows 11 原生资源管理器生命周期——关闭窗口即干净关闭全部标签（下次打开任意文件夹不再意外带出旧窗口残留标签），同时保持零 CPU 静默热驻留与 1 个后台预热宿主，再次打开任意文件夹毫秒级秒开；
     4. **备份校验锁与路径/版本自愈**：写入前自动备份原注册表键值，取消勾选时先校验归属权防止误伤其他工具；若移动了 `LeafTab.exe` 存放位置或升级版本，启动时自动静默修复与补全注册表项（亦支持命令行 `LeafTab.exe --unregister-shell` 一键清理并退出）。
 - **「极简云雾」分区液态玻璃 UI 与 SF 双色调图标体系**：
@@ -168,7 +177,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.7-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.8-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---

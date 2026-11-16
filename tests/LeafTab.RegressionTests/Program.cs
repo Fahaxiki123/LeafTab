@@ -20,6 +20,7 @@ namespace LeafTab.RegressionTests
         [STAThread]
         private static int Main(string[] args)
         {
+            if (args.Contains("--inspect-shell-selection")) return InspectShellSelection(args);
             if (args.Contains("--child-fail")) return 7;
             if (args.Contains("--child-slow")) { System.Threading.Thread.Sleep(1500); return 0; }
             Directory.CreateDirectory(Root);
@@ -27,6 +28,9 @@ namespace LeafTab.RegressionTests
                 assembly.GetType("LeafTab.Shared.DiagnosticLog")!.GetProperty("DirectoryPath", BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, Path.Combine(Root, "logs"));
             Console.WriteLine("Fixtures: " + Root);
             if (args.Contains("--search-navigation-native")) return RunSearchNavigationNativeTests();
+            if (args.Contains("--explorer-redirect-native")) return RunExplorerRedirectNativeTests();
+            if (args.Contains("--shell-selection-native")) return RunShellSelectionNativeTests();
+            if (args.Contains("--external-selection-native")) return RunExternalSelectionNativeTests();
             Test("Preserve a changed external open command", () => RegistrySandbox((classes, backup) =>
             {
                 string keyPath = classes + @"\Directory\shell\open\command";
@@ -76,6 +80,9 @@ namespace LeafTab.RegressionTests
                 Check(rejected);
             });
             RunAdditionalTests();
+            RunExplorerRedirectTests();
+            RunShellProtocolTests();
+            RunExternalSelectionTests();
             Console.WriteLine($"RESULT: {_passed} passed, {_failed} failed");
             return _failed == 0 ? 0 : 1;
         }
