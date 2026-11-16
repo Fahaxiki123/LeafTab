@@ -402,15 +402,6 @@ namespace LeafTab.Diagnostics
                             IntPtr mainHwnd = new WindowInteropHelper(window).Handle;
                             hasForeground = imgProbeTab.BrowserHost.CanReceiveKeyboardFocus;
 
-                            NativeMethods.SetFocus(mainHwnd);
-                            previewSidebar.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
-                            {
-                                RoutedEvent = UIElement.MouseLeftButtonDownEvent,
-                                Source = previewSidebar
-                            });
-                            await Task.Delay(80);
-                            clickRestoredFocus = !hasForeground || imgProbeTab.BrowserHost.IsNativeFocusInside();
-
                             var downMsg = new MSG
                             {
                                 hwnd = mainHwnd,
@@ -420,6 +411,15 @@ namespace LeafTab.Diagnostics
                             };
                             if (hasForeground)
                             {
+                                NativeMethods.SetFocus(mainHwnd);
+                                previewSidebar.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+                                {
+                                    RoutedEvent = UIElement.MouseLeftButtonDownEvent,
+                                    Source = previewSidebar
+                                });
+                                await Task.Delay(80);
+                                clickRestoredFocus = imgProbeTab.BrowserHost.IsNativeFocusInside();
+
                                 NativeMethods.SetFocus(mainHwnd);
                                 window.SimulatePreprocessMessageForSelfTest(ref downMsg);
 
@@ -438,9 +438,9 @@ namespace LeafTab.Diagnostics
                             }
                             else
                             {
-                                // Background headless run: verify SimulatePreprocessMessageForSelfTest does not alter splitter width, then switch to img_02.png
+                                // A background run can check selection-to-preview updates,
+                                // but cannot verify foreground clicks or keyboard routing.
                                 window.SimulatePreprocessMessageForSelfTest(ref downMsg);
-                                arrowMovedToSecondImg = true;
                                 await imgProbeTab.BrowserHost.SelectChildItemWhenReadyAsync("img_02.png");
                                 imgProbeTab.BrowserHost.InvalidateSelectionCache();
                                 window.SyncSelectionAndPreviewForSelfTest();
@@ -462,10 +462,11 @@ namespace LeafTab.Diagnostics
                                               splitterRefusedFocus &&
                                               previewUpdatedToImg1 &&
                                               previewUpdatedToImg2 &&
-                                              clickRestoredFocus &&
-                                              arrowMovedToSecondImg &&
+                                              (!hasForeground || (clickRestoredFocus && arrowMovedToSecondImg)) &&
                                               widthUnchanged;
-                            log.AppendLine($"- PreviewImageArrowNavigationKeepsWidth: NonFocusableChrome={nonFocusableChromeOk}, SplitterRefusedFocus={splitterRefusedFocus}, Img1={previewUpdatedToImg1}, Img2={previewUpdatedToImg2}, ForegroundOwned={hasForeground}, ClickRestoredFocus={clickRestoredFocus}, ArrowMovedToNext={arrowMovedToSecondImg}, WidthBefore={widthBeforeKey}, WidthAfter={widthAfterKey}, Passed={previewImgNavOk}");
+                            string clickCheck = hasForeground ? clickRestoredFocus.ToString() : "Skipped";
+                            string arrowCheck = hasForeground ? arrowMovedToSecondImg.ToString() : "Skipped";
+                            log.AppendLine($"- PreviewImageArrowNavigationKeepsWidth: NonFocusableChrome={nonFocusableChromeOk}, SplitterRefusedFocus={splitterRefusedFocus}, Img1={previewUpdatedToImg1}, Img2={previewUpdatedToImg2}, ForegroundOwned={hasForeground}, ClickRestoredFocus={clickCheck}, ArrowMovedToNext={arrowCheck}, WidthBefore={widthBeforeKey}, WidthAfter={widthAfterKey}, Passed={previewImgNavOk}");
                         }
                         else
                         {

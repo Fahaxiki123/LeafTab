@@ -1,32 +1,30 @@
-# LeafTab 0.6.6 搜索导航修复验证（2026-11-16，未发布）
+# LeafTab 0.6.6 搜索导航与预览焦点修复验证（2026-11-16）
 
-- 修复搜索中出现空白导航项、点击左侧位置不切换的问题。主浏览器继续提供原生导航树；无框架的搜索结果视图只覆盖文件列表区域，覆盖期间隐藏原目录列表，防止键盘或无障碍访问到被遮挡内容。
-- 本机真实 Shell 的 `GetOptions` 显示，`FillFromObject` 创建结果视图后会带上 `EBO_NAVIGATEONCE`。旧版同时开启 `EBO_SHOWFRAMES`，将不可继续导航的临时容器连同导航树一起展示；修复后搜索视图不再创建导航树。
-- 主导航完成时统一退出搜索、隐藏覆盖层并恢复目标目录。覆盖层跟随原生文件视图的位置变化；单个搜索结果文件夹通过 `ICommDlgBrowser.OnDefaultCommand` 转交主浏览器，文件默认打开仍交给 Windows Shell。
-- Release/x64 构建通过，0 警告、0 错误。新增隐藏原生专项测试 12 项通过：包括真实 `SysTreeView32` 选择并收到导航回调、无搜索导航树、覆盖层边界、外层缩放和原生布局变化、目录跳转、同目标导航、重复/清除搜索、默认打开回调及测试不抢前台。
-- 同一基础专项对照原版 v0.6.5：2 项通过、7 项失败，复现搜索树与显示状态问题。最终常规回归 70 项通过、1 项失败：已有的 20,000 行 Markdown 手动渲染性能用例要求小于 450 ms，本次为 519 ms，复查曾为 469/470 ms；原版同机亦失败（495 ms）。未修改该性能阈值或 Markdown 实现。
-- 此次使用隐藏原生父窗口，未操作桌面鼠标/键盘，未执行完整前台 GUI 自检、安装升级或 Windows 10 实机验证。实际同事机器的空白节点外观尚待升级后确认；原生控件测试已确认搜索视图不再包含该导航树。
-- 本地安装包：`artifacts/fixes/v0.6.6/LeafTab-v0.6.6-Setup-x64.exe`，339,968 字节，SHA-256 `08827679864478DEF0C52AE6502830C784B675B00A07A78EF11CE9F98A271E43`。主程序 SHA-256 `4EC8036A1CA69D3D4C177798F3F801A6500A91D7B88C5FCB12EBBEBEA161E29C`。
-- 验证日志：`artifacts/verification/v0.6.6-search-navigation-20261116/`；包含修复版专项、常规回归及原版对照日志。没有替换当前安装，也没有发布到 GitHub。
-- 构建完成后（本机记录 17:53:06），工作区于 17:54 后新增预览/键盘焦点相关改动；保留这些并发改动，本安装包及上述验证结论不包含它们。
+## 发布状态与修复范围
 
----
+- GitHub 已发布 [v0.6.6](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.6)，版本标签对应 `e8c028b29eaebafe22dadf823e396eb63fdfbcfe`。
+- 搜索时保留普通目录的原生左侧导航树，搜索结果仅覆盖右侧文件列表；隐藏被覆盖的源列表，防止键盘或无障碍操作到背后的内容。目录导航完成时统一退出搜索，结果文件夹默认打开转交主浏览器，覆盖层跟随原生布局变化。
+- 预览分隔条及外层滚动容器不再捕获键盘焦点；预览相关交互后恢复文件列表焦点，并刷新方向键引起的选择变化。
+- Markdown 连续普通文本与硬换行合并为少量 WPF `Run`，仍保留 AST 预算、样式边界、截断范围和提示。性能测试将控件预热和测试自身的节点遍历移出计时，保留 450 ms 阈值。
 
-# LeafTab 0.6.6 搜索导航与预览窗格焦点修复验证（2026-11-16）
+## 发布产物复核
 
-- 根因与修复：
-  1. **搜索期保留原生左侧导航树与跳转闭环**（`ExplorerBrowserHost.cs` / `ExplorerBrowserHost.Search.cs` / `ExplorerBrowserHost.SearchCommands.cs` / `ExplorerBrowserHost.SearchPresentation.cs`）：搜索时保留普通目录的原生左侧导航树，仅将无框 `ResultsFolder` 覆盖右侧文件列表并跟随窗口与原生分隔条布局；搜索期间点击左侧导航树目录、导航到源目录或打开搜索结果文件夹时自动退出搜索、清除搜索覆盖层并还原 `EBO_ALWAYSNAVIGATE` 选项。
-  2. **预览图片方向键切图与焦点保护**（`MainWindow.xaml` / `MainWindow.Preview.cs` / `MainWindow.xaml.cs` / `ExplorerBrowserHost.cs`）：为 `PreviewGridSplitter`、`PreviewMetadataScroll`、`TabsScrollViewer`、`TabsItemsControl`、`BreadcrumbScrollViewer` 及书签栏滚动/列表容器统一设置 `Focusable="False" IsTabStop="False"`，彻底禁止方向键或 `Tab` 落到分隔条并触发 `KeyboardMoveSplitter` 缩放预览区；点击预览侧栏非文本区域、结束分隔条拖拽、切换 Markdown「渲染 / 源码」、从文本/Markdown 预览切至图片/卡片或按 `Esc` 时自动将焦点归还原生文件列表；当焦点滞留激活主窗口根句柄时自动接力方向键并在 `WM_KEYDOWN` 派发后异步刷新预览，消除长按方向键切图延迟。
-  3. **长文档渲染冷初始化基准隔离**（`ReviewRegressionTests.cs`）：在 `Markdown 20000-line hard-break document...` 计时前执行 `FlowDocumentScrollViewer` 一次性控件模板与 DirectWrite 预热（`36 ms` 完成，保持 `< 450 ms` 严格预算不变）。
-- 隔离验证：
-  - `scripts/verify.ps1` 项目外隔离 `Release|x64` 构建：**0 警告、0 错误**。
-  - 常规回归测试（`LeafTab.RegressionTests.exe`）：**73 项全部通过**（`RESULT: 73 passed, 0 failed`，含 `Preview splitter and chrome scroll viewers disable keyboard focus`）。
-  - 搜索导航原生回归（`LeafTab.RegressionTests.exe --search-navigation-native`）：**12 项全部通过**（`RESULT: 12 passed, 0 failed`）。
-  - 原生界面自检（`LeafTab.exe --self-test`）：**`## RESULT: PASS`**（含 `PreviewImageArrowNavigationKeepsWidth`: `NonFocusableChrome=True, SplitterRefusedFocus=True, Img1=True, Img2=True, ClickRestoredFocus=True, ArrowMovedToNext=True, WidthBefore=628, WidthAfter=628, Passed=True`，以及 `MinimizedWindowPreservesTypingFocus` / `InactiveWindowPreservesTypingFocus` / `NativeSelectAll1000` 332 ms）。
-- 交付产物：
-  - 安装包 `artifacts/latest/LeafTab-v0.6.6-Setup-x64.exe`：`341,504` 字节（`333.5 KB`），SHA-256 `6B6828608353F9E8B64AB901E521EE87B732E2B69FC7F128BB80921C41A4CD2A`。
-  - 主程序 `LeafTab.exe`：`535,552` 字节（`523.0 KB`），SHA-256 `8927C84D10D8FBD7B6E4C82E91137949D9312FED4457AC8CD29202E5B510F77C`。
-- 本机安装校验：通过 `LeafTab-v0.6.6-Setup-x64.exe --silent --launch` 静默安装至 `%LOCALAPPDATA%\Programs\LeafTab`，安装后 `LeafTab.exe` 文件版本为 `0.6.6.0`、字节数与 SHA-256 与验证构建完全一致，卸载注册表 `DisplayVersion` 为 `0.6.6` 且主程序正常启动运行。
+- 本轮使用 `v0.6.6` 标签源码构建测试程序，加载实际已安装的发布版 `LeafTab.exe` 和 GitHub 对应安装包执行回归，而非只验证重新构建的主程序。
+- 常规回归：**73 项通过、0 失败**。密集硬换行 Markdown 构建与布局 **60 ms**、WPF Inline 节点 **2**，语义测试覆盖硬换行、粗体/链接边界与截断提示。
+- 搜索导航原生回归：**12 项通过、0 失败**，包含真实原生导航树选择与导航完成回调、搜索视图无导航树、覆盖层几何/缩放/原生布局变化、重复搜索、退出搜索、结果默认打开回调及后台测试不抢前台。
+- Release/x64 构建通过，0 警告、0 错误。
+- 本轮审计记录位于 `D:\临时\LeafTab-v0.6.6-published-audit-20261116`。此前候选包的 70 通过/1 性能失败及旧哈希已被本节发布版复核结果取代。
+
+## 安装包与本机状态
+
+- 安装包 `LeafTab-v0.6.6-Setup-x64.exe`：**341,504 字节**，SHA-256 `6B6828608353F9E8B64AB901E521EE87B732E2B69FC7F128BB80921C41A4CD2A`；与 GitHub Release 资产 digest 一致。
+- 本机 `%LOCALAPPDATA%\Programs\LeafTab\LeafTab.exe`：版本 **0.6.6.0**，**535,552 字节**，SHA-256 `8927C84D10D8FBD7B6E4C82E91137949D9312FED4457AC8CD29202E5B510F77C`，已运行。
+
+## 验证边界与自检记录修正
+
+- 无前台权限时，原生自检通过程序选择第二张图片来验证选择与预览同步。这不能证明前台鼠标焦点恢复或真实方向键切图。
+- 原自检在该分支把点击和方向键结果直接记为 `True`，已在后续源码中改为 `Skipped`；只有测试窗口拥有前台时才执行并判定相应操作。此修正仅涉及自检与记录，已发布的 v0.6.6 安装包及版本标签保持原样。
+- 本轮未重新执行前台交互自检，也未验证 Windows 10 实机、混合 DPI 多屏。结果文件夹测试调用默认打开回调，并非物理双击；同目标导航测试不等同于重复点击当前选中的树节点。
 
 ---
 
