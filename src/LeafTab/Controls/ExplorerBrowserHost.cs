@@ -203,6 +203,7 @@ namespace LeafTab.Controls
             _pendingInitialPidl = PidlManager.Clone(initialPidl);
             _showPreviewPane = showPreviewPane;
             _directUiSubclassDelegate = DirectUiSubclassProc;
+            _browseViewLayoutSubclassDelegate = BrowseViewLayoutSubclassProc;
             Focusable = true;
         }
 
@@ -354,12 +355,7 @@ namespace LeafTab.Controls
                 NativeMethods.MoveWindow(_browseHostHwnd, 0, 0, rc.Width, rc.Height, true);
             }
 
-            if (_searchHostHwnd != IntPtr.Zero)
-            {
-                NativeMethods.MoveWindow(_searchHostHwnd, 0, 0, rc.Width, rc.Height, true);
-            }
-
-            if (_innerStatusBarClipPx < 0 && !_isShowingSearchResults)
+            if (_innerStatusBarClipPx < 0)
             {
                 IntPtr hdwpProbe = IntPtr.Zero;
                 _browser.SetRect(ref hdwpProbe, rc);
@@ -390,11 +386,7 @@ namespace LeafTab.Controls
                 _browser.SetRect(ref hdwp1, rc);
             }
 
-            if (_searchBrowser != null)
-            {
-                IntPtr hdwp2 = IntPtr.Zero;
-                _searchBrowser.SetRect(ref hdwp2, targetRect);
-            }
+            SyncSearchOverlayRect();
         }
 
         public void SetPreviewPaneVisible(bool visible)
@@ -407,6 +399,7 @@ namespace LeafTab.Controls
 
         private void DestroyPrimaryBrowserOnly()
         {
+            DetachBrowseViewLayoutSubclass();
             DetachDirectUiSubclass();
 
             if (_eventSink != null)
@@ -1544,6 +1537,13 @@ namespace LeafTab.Controls
 
         public bool TryTranslateShellAccelerator(ref MSG wpfMsg)
         {
+            // The primary browser owns the navigation tree even while search results
+            // cover its file list. Let that tree process its own keyboard input.
+            IntPtr focusedWindow = NativeMethods.GetFocus();
+            if (_isShowingSearchResults && focusedWindow != IntPtr.Zero &&
+                NativeMethods.IsChild(_browseHostHwnd, focusedWindow))
+                return false;
+
             IExplorerBrowser? active = ActiveBrowser;
             if (!CanReceiveKeyboardFocus || active == null || !IsNativeFocusInside())
                 return false;
@@ -1582,8 +1582,24 @@ namespace LeafTab.Controls
                     pt = new POINT(wpfMsg.pt_x, wpfMsg.pt_y)
                 };
 
+                bool isKeyDownMessage = wpfMsg.message == (int)NativeMethods.WM_KEYDOWN;
+                void NotifyKeyDownInteraction()
+                {
+                    if (isKeyDownMessage)
+                    {
+                        Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() =>
+                        {
+                            if (!_isDestroyed)
+                                ViewInteractionOccurred?.Invoke(this, EventArgs.Empty);
+                        }));
+                    }
+                }
+
                 if (sv.TranslateAccelerator(ref nativeMsg) == ShellConstants.S_OK)
+                {
+                    NotifyKeyDownInteraction();
                     return true;
+                }
 
                 // If focus was parked on _hostHwnd when this keydown began, forward navigation/type-ahead keys directly to DirectUIHWND
                 if (parkedOnHost &&
@@ -1593,6 +1609,7 @@ namespace LeafTab.Controls
                     NativeMethods.IsWindow(_subclassedDirectUiHwnd))
                 {
                     NativeMethods.SendMessageW(_subclassedDirectUiHwnd, (uint)wpfMsg.message, wpfMsg.wParam, wpfMsg.lParam);
+                    NotifyKeyDownInteraction();
                     return true;
                 }
 
@@ -1628,23 +1645,12 @@ namespace LeafTab.Controls
             SuppressNativeFocusRect();
             ClearUnselectedItemFocusBoxIfNeeded();
 
-            // Internal ResultsFolder creation during FillFromObject(null, 0)
-            if (_isFillSearchTransition)
-            {
-                _isFillSearchTransition = false;
-                return;
-            }
-
-            // User double-clicked a subfolder inside search results or clicked left NavPane: exit search mode
+            // The primary browser continues to own the navigation pane during search.
+            // A completed navigation must also remove the search overlay, not just
+            // clear its logical state. ResultsFolder callbacks use a separate sink.
             if (_isShowingSearchResults)
             {
-                CancelSearchStateInternal(freeSavedPidl: true);
-                _browser?.SetEmptyText(string.Empty);
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (!_isDestroyed)
-                        SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                }));
+                ExitSearchModeInternal(notifyChanged: true);
             }
 
             IntPtr cloned = PidlManager.Clone(pidlFolder);
@@ -2043,6 +2049,7 @@ namespace LeafTab.Controls
 
         private void DestroySearchBrowserOnly()
         {
+            PidlManager.Free(ref _searchResultsPidl);
             if (_searchEventSink != null)
             {
                 _searchEventSink.Detach();
@@ -2073,6 +2080,8 @@ namespace LeafTab.Controls
                     _searchBrowser = null;
                 }
             }
+
+            _searchPaneSite = null;
 
             if (_searchHostHwnd != IntPtr.Zero)
             {
@@ -2114,6 +2123,11 @@ namespace LeafTab.Controls
 
         private sealed class ExplorerPaneVisibilitySite : LeafTab.Interop.IServiceProvider, IExplorerPaneVisibility
         {
+            private readonly bool _showNavigationPane;
+
+            public ExplorerPaneVisibilitySite(bool showNavigationPane = true) =>
+                _showNavigationPane = showNavigationPane;
+
             private const uint EPS_DEFAULT_ON = 0x1;
             private const uint EPS_DEFAULT_OFF = 0x2;
             private const uint EPS_INITIALSTATE = 0x10000;
@@ -2144,7 +2158,7 @@ namespace LeafTab.Controls
 
             public int GetPaneState(ref Guid ep, out uint peps)
             {
-                if (ep == EP_NavPane)
+                if (ep == EP_NavPane && _showNavigationPane)
                 {
                     peps = EPS_DEFAULT_ON | EPS_INITIALSTATE;
                     return ShellConstants.S_OK;

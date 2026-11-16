@@ -349,10 +349,15 @@
 
                     <!-- Adaptive Zero-Scrollbar Connected Tabs + [+] Button -->
                     <controls:TabBarTrackPanel Grid.Column="1" VerticalAlignment="Stretch">
-                        <ScrollViewer x:Name="TabsScrollViewer" HorizontalScrollBarVisibility="Hidden"
+                        <ScrollViewer x:Name="TabsScrollViewer"
+                                      Focusable="False"
+                                      IsTabStop="False"
+                                      HorizontalScrollBarVisibility="Hidden"
                                       VerticalScrollBarVisibility="Disabled" CanContentScroll="False"
                                       ClipToBounds="True" ScrollChanged="TabsScrollViewer_ScrollChanged">
                         <ItemsControl x:Name="TabsItemsControl"
+                                      Focusable="False"
+                                      IsTabStop="False"
                                       VerticalAlignment="Stretch"
                                       shell:WindowChrome.IsHitTestVisibleInChrome="True"
                                       PreviewMouseWheel="TabStrip_PreviewMouseWheel">
@@ -709,6 +714,7 @@
                                 <ScrollViewer x:Name="BreadcrumbScrollViewer"
                                               Grid.Column="1"
                                               Focusable="False"
+                                              IsTabStop="False"
                                               HorizontalScrollBarVisibility="Hidden"
                                               VerticalScrollBarVisibility="Disabled"
                                               VerticalAlignment="Stretch"
@@ -1142,10 +1148,14 @@
                     </Button>
 
                     <ScrollViewer Grid.Column="1"
+                                  Focusable="False"
+                                  IsTabStop="False"
                                   HorizontalScrollBarVisibility="Hidden"
                                   VerticalScrollBarVisibility="Disabled"
                                   VerticalAlignment="Center">
-                        <ItemsControl x:Name="BookmarksItemsControl">
+                        <ItemsControl x:Name="BookmarksItemsControl"
+                                      Focusable="False"
+                                      IsTabStop="False">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
                                     <StackPanel Orientation="Horizontal" />
@@ -1198,6 +1208,8 @@
                 <GridSplitter x:Name="PreviewGridSplitter"
                               Grid.Column="1"
                               Width="5"
+                              Focusable="False"
+                              IsTabStop="False"
                               HorizontalAlignment="Stretch"
                               VerticalAlignment="Stretch"
                               ResizeDirection="Columns"
@@ -1212,7 +1224,8 @@
                         Background="#FFFFFF"
                         BorderBrush="#E2E8F0"
                         BorderThickness="1,0,0,0"
-                        Visibility="Collapsed">
+                        Visibility="Collapsed"
+                        MouseLeftButtonDown="PreviewSidebarBorder_MouseLeftButtonDown">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -1368,6 +1381,8 @@
 
                             <!-- Metadata Card (Folders, Drives, Binaries, Office/PDF, etc.) -->
                             <ScrollViewer x:Name="PreviewMetadataScroll"
+                                          Focusable="False"
+                                          IsTabStop="False"
                                           VerticalScrollBarVisibility="Auto"
                                           HorizontalScrollBarVisibility="Disabled"
                                           Visibility="Collapsed">

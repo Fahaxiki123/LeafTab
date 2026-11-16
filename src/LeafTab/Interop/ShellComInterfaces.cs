@@ -245,6 +245,22 @@ namespace LeafTab.Interop
         int OnNavigationFailed(IntPtr pidlFolder);
     }
 
+    // Native IShellView pointers are borrowed for the duration of each callback.
+    [ComImport]
+    [Guid("000214F1-0000-0000-C000-000000000046")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface ICommDlgBrowser
+    {
+        [PreserveSig]
+        int OnDefaultCommand(IntPtr shellView);
+
+        [PreserveSig]
+        int OnStateChange(IntPtr shellView, uint change);
+
+        [PreserveSig]
+        int IncludeObject(IntPtr shellView, IntPtr childPidl);
+    }
+
     // Verified against ShObjIdl_core.h lines 5470-5564 (inherits IOleWindow)
     [ComImport]
     [Guid("000214E3-0000-0000-C000-000000000046")]

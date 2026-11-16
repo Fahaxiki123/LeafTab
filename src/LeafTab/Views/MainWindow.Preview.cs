@@ -6,7 +6,9 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
@@ -49,6 +51,7 @@ namespace LeafTab.Views
             {
                 RenderLoadedPreviewData(_currentPreviewData, _currentPreviewData.HeaderIcon ?? PreviewHeaderIcon.Source);
             }
+            RestoreNativeFocusFromPreviewChrome();
         }
 
         private void PreviewGridSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
@@ -59,6 +62,26 @@ namespace LeafTab.Views
                 ScheduleSessionSave();
             }
             _selectedTab?.BrowserHost.SyncBrowserRect();
+            RestoreNativeFocusFromPreviewChrome();
+        }
+
+        private void PreviewSidebarBorder_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.Handled)
+                return;
+
+            Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(RestoreNativeFocusFromPreviewChrome));
+        }
+
+        private void RestoreNativeFocusFromPreviewChrome()
+        {
+            if (!_isClosingWindow &&
+                !AddressTextBox.IsKeyboardFocusWithin &&
+                !SearchTextBox.IsKeyboardFocusWithin &&
+                !IsPreviewContentFocused())
+            {
+                _selectedTab?.BrowserHost.FocusNativeView();
+            }
         }
 
         private void PreviewOpenDefaultButton_Click(object sender, RoutedEventArgs e)
@@ -180,11 +203,21 @@ namespace LeafTab.Views
 
         private void ShowPreviewBodyElement(UIElement activeElement)
         {
+            bool hadPreviewTextFocus = PreviewTextBox.IsKeyboardFocusWithin || PreviewDocumentViewer.IsKeyboardFocusWithin;
             PreviewEmptyPanel.Visibility = ReferenceEquals(activeElement, PreviewEmptyPanel) ? Visibility.Visible : Visibility.Collapsed;
             PreviewDocumentViewer.Visibility = ReferenceEquals(activeElement, PreviewDocumentViewer) ? Visibility.Visible : Visibility.Collapsed;
             PreviewTextBox.Visibility = ReferenceEquals(activeElement, PreviewTextBox) ? Visibility.Visible : Visibility.Collapsed;
             PreviewImagePanel.Visibility = ReferenceEquals(activeElement, PreviewImagePanel) ? Visibility.Visible : Visibility.Collapsed;
             PreviewMetadataScroll.Visibility = ReferenceEquals(activeElement, PreviewMetadataScroll) ? Visibility.Visible : Visibility.Collapsed;
+
+            if (hadPreviewTextFocus &&
+                !ReferenceEquals(activeElement, PreviewTextBox) &&
+                !ReferenceEquals(activeElement, PreviewDocumentViewer) &&
+                !AddressTextBox.IsKeyboardFocusWithin &&
+                !SearchTextBox.IsKeyboardFocusWithin)
+            {
+                _selectedTab?.BrowserHost.FocusNativeView();
+            }
         }
 
         private void RefreshPreviewPaneForSelection(

@@ -1,12 +1,20 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.5 资源管理器快捷入口修复版**（2026-11-15）。
+当前最新版本：**v0.6.6 搜索导航与预览焦点修复版**（2026-11-16）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 330.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 333.5 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.6 更新内容
+
+- 搜索时保留普通目录的原生左侧导航树，搜索结果仅覆盖右侧文件列表，避免临时搜索容器在导航树底部显示为空白项。
+- 修复搜索期间点击左侧目录不跳转的问题：目录导航完成后统一退出搜索，并同步显示目标目录、地址和历史。
+- 搜索结果区域随窗口、导航分隔条及预览栏布局调整；补充隐藏原生控件回归，验证搜索与目录导航的衔接，不使用桌面鼠标或键盘。
+- 禁用预览分隔条（`PreviewGridSplitter`）及侧栏属性卡、标签栏等外层滚动容器的键盘焦点捕获，修复预览图片时按方向键误调整预览区域宽度而非切换下一张图片的问题。
+- 点击右侧图片/属性卡预览区、拖拽分隔条结束、切换 Markdown「渲染 / 源码」或按 `Esc` 退出文本预览时自动将焦点归还原生文件列表；当焦点偶发滞留主窗口句柄时自动接力方向键，并优化长按方向键连续切图刷新响应。
 
 ## 0.6.5 更新内容
 
@@ -53,9 +61,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.5`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.6`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.5-Setup-x64.exe`（约 330.5 KB）
+- **图形化一键安装包**：`LeafTab-v0.6.6-Setup-x64.exe`（约 333.5 KB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -154,7 +162,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.5-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.6-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---
@@ -172,3 +180,5 @@ pwsh -NoProfile -File scripts/verify.ps1
 ## 文档索引
 - [架构设计与分阶段实施规范 (DESIGN.md)](./DESIGN.md)
 - [兼容性与资源压测记录 (COMPATIBILITY_REPORT.md)](./COMPATIBILITY_REPORT.md)
+
+搜索导航专项原生回归：构建 `tests/LeafTab.RegressionTests` 后运行 `LeafTab.RegressionTests.exe --search-navigation-native`。该测试使用隐藏原生父窗口，不启动主应用或修改系统关联。

@@ -170,7 +170,7 @@ namespace LeafTab.RegressionTests
             }));
             Test("Setup version metadata matches main executable version", () =>
             {
-                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.5");
+                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.6");
                 Check(typeof(LeafTab.App).Assembly.GetName().Version == Version.Parse(LeafTab.Setup.SetupEngine.AppVersion + ".0"));
             });
             Test("Breadcrumb blank hit filter distinguishes blank chrome from interactive buttons", () =>
@@ -946,10 +946,20 @@ namespace LeafTab.RegressionTests
                 Check(data.ParsedMarkdown!.RenderedInlineCount <= FilePreviewService.MaxMarkdownInlineNodes,
                     $"Expected AST RenderedInlineCount <= {FilePreviewService.MaxMarkdownInlineNodes}, got {data.ParsedMarkdown.RenderedInlineCount}");
 
+                // Warm up FlowDocumentScrollViewer control template & DirectWrite font pipeline once outside the stopwatch
+                var warmupViewer = new FlowDocumentScrollViewer
+                {
+                    Width = 360,
+                    Height = 640,
+                    Document = new FlowDocument(new Paragraph(new Run("warmup")))
+                };
+                warmupViewer.Measure(new Size(360, 640));
+                warmupViewer.Arrange(new Rect(0, 0, 360, 640));
+                warmupViewer.UpdateLayout();
+
                 // Simulate manual click on "渲染": materialize FlowDocument + run full WPF FlowDocumentScrollViewer layout
                 var layoutSw = Stopwatch.StartNew();
                 FlowDocument doc = FilePreviewService.BuildMarkdownDocument(data.ParsedMarkdown);
-                int totalWpfInlines = CountFlowDocumentInlines(doc);
                 var viewer = new FlowDocumentScrollViewer
                 {
                     Width = 360,
@@ -961,6 +971,8 @@ namespace LeafTab.RegressionTests
                 viewer.UpdateLayout();
                 layoutSw.Stop();
 
+                int totalWpfInlines = CountFlowDocumentInlines(doc);
+                Console.WriteLine($"Markdown manual render + layout: {layoutSw.ElapsedMilliseconds} ms; WPF inlines: {totalWpfInlines}");
                 Check(totalWpfInlines <= FilePreviewService.MaxMarkdownInlineNodes + 2,
                     $"Expected materialized WPF Inline count <= {FilePreviewService.MaxMarkdownInlineNodes + 2}, got {totalWpfInlines}");
                 Check(layoutSw.ElapsedMilliseconds < 450,
@@ -979,6 +991,100 @@ namespace LeafTab.RegressionTests
                       backslashInlines <= FilePreviewService.MaxMarkdownInlineNodes + 2,
                     $"Expected trailing-backslash hard breaks capped <= {FilePreviewService.MaxMarkdownInlineNodes + 2}, got {backslashInlines}");
             });
+            Test("Markdown hard-break coalescing preserves text, formatting boundaries, and truncation", () =>
+            {
+                string NormalizeText(FlowDocument document) =>
+                    new TextRange(document.ContentStart, document.ContentEnd).Text.Replace("\r\n", "\n");
+
+                foreach (string marker in new[] { "  ", "\\" })
+                {
+                    string markdown = "first" + marker + "\nsecond **bold**" + marker +
+                        "\nthird [link](https://example.com)" + marker + "\nlast";
+                    FlowDocument document = FilePreviewService.BuildMarkdownDocument(markdown);
+                    Check(NormalizeText(document) == "first\nsecond bold\nthird link\nlast\n",
+                        "Coalescing changed Markdown text or hard line breaks.");
+                    var paragraph = document.Blocks.OfType<Paragraph>().Single();
+                    var bold = paragraph.Inlines.OfType<Span>().Single(s => s.FontWeight == FontWeights.SemiBold);
+                    Check(new TextRange(bold.ContentStart, bold.ContentEnd).Text == "bold",
+                        "Plain text or hard breaks acquired the adjacent bold formatting.");
+                    var link = paragraph.Inlines.OfType<Hyperlink>().Single();
+                    Check(new TextRange(link.ContentStart, link.ContentEnd).Text == "link" &&
+                        string.Equals(link.ToolTip as string, "https://example.com/", StringComparison.Ordinal),
+                        "Coalescing changed the hyperlink text or target.");
+                    Check(paragraph.Inlines.OfType<Run>().All(r => r.FontWeight == FontWeights.Normal),
+                        "Unformatted runs inherited bold formatting across a style boundary.");
+                }
+
+                string dense = string.Concat(Enumerable.Repeat("kept  \n", FilePreviewService.MaxMarkdownParagraphLines)) + "omitted-sentinel";
+                MarkdownParsedDocument parsed = FilePreviewService.ParseMarkdownStructure(dense);
+                FlowDocument truncated = FilePreviewService.BuildMarkdownDocument(parsed);
+                string rendered = NormalizeText(truncated);
+                Check(parsed.ExceedsComplexityBudget && parsed.RenderedInlineCount <= FilePreviewService.MaxMarkdownInlineNodes,
+                    "Coalescing bypassed the AST complexity budget.");
+                Check(rendered.Split(new[] { '\n' }).Count(line => line == "kept") == FilePreviewService.MaxMarkdownParagraphLines &&
+                    !rendered.Contains("omitted-sentinel") && rendered.Contains("已仅渲染前部内容"),
+                    "Coalescing changed the retained line count or lost the truncation notice.");
+                Check(CountFlowDocumentInlines(truncated) <= 3,
+                    "Dense plain hard-break paragraphs still allocate per-line WPF elements.");
+            });
+            Test("Preview splitter and chrome scroll viewers disable keyboard focus", () =>
+            {
+                string? xamlPath = FindRepoRelativeFile(@"src\LeafTab\Views\MainWindow.xaml");
+                Check(xamlPath != null && File.Exists(xamlPath), "Could not locate src\\LeafTab\\Views\\MainWindow.xaml.");
+
+                var doc = new System.Xml.XmlDocument();
+                doc.Load(xamlPath!);
+                var nsmgr = new System.Xml.XmlNamespaceManager(doc.NameTable);
+                nsmgr.AddNamespace("x", "http://schemas.microsoft.com/winfx/2006/xaml");
+
+                string[] expectedNonFocusableNames =
+                {
+                    "PreviewGridSplitter",
+                    "PreviewMetadataScroll",
+                    "TabsScrollViewer",
+                    "TabsItemsControl",
+                    "BreadcrumbScrollViewer",
+                    "BookmarksItemsControl"
+                };
+
+                foreach (string name in expectedNonFocusableNames)
+                {
+                    var node = doc.SelectSingleNode($"//*[@x:Name='{name}']", nsmgr) as System.Xml.XmlElement;
+                    Check(node != null, $"Missing element x:Name='{name}' in MainWindow.xaml.");
+                    Check(string.Equals(node!.GetAttribute("Focusable"), "False", StringComparison.OrdinalIgnoreCase),
+                        $"Element '{name}' must declare Focusable=\"False\".");
+                    Check(string.Equals(node.GetAttribute("IsTabStop"), "False", StringComparison.OrdinalIgnoreCase),
+                        $"Element '{name}' must declare IsTabStop=\"False\".");
+                }
+
+                var splitterNode = doc.SelectSingleNode("//*[@x:Name='PreviewGridSplitter']", nsmgr) as System.Xml.XmlElement;
+                Check(splitterNode != null && !splitterNode!.HasAttribute("IsTabStop") == false, "PreviewGridSplitter must exist.");
+                var sidebarNode = doc.SelectSingleNode("//*[@x:Name='PreviewSidebarBorder']", nsmgr) as System.Xml.XmlElement;
+                Check(sidebarNode != null && sidebarNode!.GetAttribute("MouseLeftButtonDown") == "PreviewSidebarBorder_MouseLeftButtonDown",
+                    "PreviewSidebarBorder must attach MouseLeftButtonDown handler to restore native focus.");
+
+                var splitter = new GridSplitter { Focusable = false, IsTabStop = false };
+                Check(!splitter.Focusable && !splitter.IsTabStop, "GridSplitter instance must remain non-focusable.");
+            });
+        }
+
+        private static string? FindRepoRelativeFile(string relativePath)
+        {
+            foreach (string startDir in new[] { AppDomain.CurrentDomain.BaseDirectory, Environment.CurrentDirectory })
+            {
+                if (string.IsNullOrWhiteSpace(startDir))
+                    continue;
+
+                var dir = new DirectoryInfo(startDir);
+                for (int depth = 0; depth < 8 && dir != null; depth++, dir = dir.Parent)
+                {
+                    string candidate = Path.Combine(dir.FullName, relativePath);
+                    if (File.Exists(candidate))
+                        return candidate;
+                }
+            }
+
+            return null;
         }
 
         private static int CountFlowDocumentInlines(FlowDocument doc)

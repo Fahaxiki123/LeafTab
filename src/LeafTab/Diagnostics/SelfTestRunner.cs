@@ -9,13 +9,17 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
 using LeafTab.Shared;
-using System.Windows.Controls;
 using LeafTab.Views;
 using Microsoft.Win32;
 
@@ -110,7 +114,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab v0.6.5 Native Regression Diagnostics");
+                log.AppendLine("# LeafTab v0.6.6 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -308,6 +312,176 @@ namespace LeafTab.Diagnostics
                         if (refreshProbeTab != null && window.Tabs.Count > 1)
                             window.CloseTab(refreshProbeTab);
                         try { Directory.Delete(refreshProbeDir, recursive: true); } catch { }
+                    }
+
+                    // Verify preview splitter & scroll wrappers cannot steal focus and arrow keys navigate images instead of resizing preview pane
+                    string imgProbeDir = Path.Combine(Path.GetTempPath(), $"leaftab_selftest_imgnav_{Guid.NewGuid():N}");
+                    Directory.CreateDirectory(imgProbeDir);
+                    (IntPtr imgDirPidl, _) = await PidlManager.TryParseAddressAsync(imgProbeDir, CancellationToken.None);
+                    ExplorerTabItem? imgProbeTab = null;
+                    try
+                    {
+                        foreach (string imgName in new[] { "img_01.png", "img_02.png" })
+                        {
+                            var wb = new WriteableBitmap(16, 16, 96, 96, PixelFormats.Bgra32, null);
+                            var enc = new PngBitmapEncoder();
+                            enc.Frames.Add(BitmapFrame.Create(wb));
+                            using var fs = new FileStream(Path.Combine(imgProbeDir, imgName), FileMode.Create, FileAccess.Write, FileShare.None);
+                            enc.Save(fs);
+                        }
+
+                        var splitter = (GridSplitter)window.FindName("PreviewGridSplitter");
+                        var metaScroll = (ScrollViewer)window.FindName("PreviewMetadataScroll");
+                        var tabsScroll = (ScrollViewer)window.FindName("TabsScrollViewer");
+                        var tabsItems = (ItemsControl)window.FindName("TabsItemsControl");
+                        var crumbScrollCheck = (ScrollViewer)window.FindName("BreadcrumbScrollViewer");
+                        var bmItems = (ItemsControl)window.FindName("BookmarksItemsControl");
+                        bool nonFocusableChromeOk =
+                            splitter != null && !splitter.Focusable && !splitter.IsTabStop &&
+                            metaScroll != null && !metaScroll.Focusable && !metaScroll.IsTabStop &&
+                            tabsScroll != null && !tabsScroll.Focusable && !tabsScroll.IsTabStop &&
+                            tabsItems != null && !tabsItems.Focusable && !tabsItems.IsTabStop &&
+                            crumbScrollCheck != null && !crumbScrollCheck.Focusable && !crumbScrollCheck.IsTabStop &&
+                            bmItems != null && !bmItems.Focusable && !bmItems.IsTabStop;
+
+                        bool previewImgNavOk = false;
+                        bool splitterRefusedFocus = false;
+                        bool previewUpdatedToImg1 = false;
+                        bool previewUpdatedToImg2 = false;
+                        bool hasForeground = false;
+                        bool clickRestoredFocus = false;
+                        bool arrowMovedToSecondImg = false;
+                        bool widthUnchanged = false;
+
+                        if (nonFocusableChromeOk && imgDirPidl != IntPtr.Zero)
+                        {
+                            imgProbeTab = window.AddNewTab(imgDirPidl, activate: true);
+                            await WaitForDirectUiAsync(imgProbeTab.BrowserHost, 2000);
+                            imgProbeTab.BrowserHost.TrySetViewStyle(ExplorerViewStyle.Details);
+                            imgProbeTab.BrowserHost.TrySetSortState(PropertyKeys.ItemNameDisplay, ShellConstants.SORT_ASCENDING);
+                            await Task.Delay(100);
+                            await imgProbeTab.BrowserHost.SelectChildItemWhenReadyAsync("img_01.png");
+
+                            if (!window.IsPreviewPaneOpen)
+                                window.TogglePreviewPane();
+
+                            for (int wait = 0; wait < 40; wait++)
+                            {
+                                if (string.Equals(window.CurrentPreviewKindName, "Image", StringComparison.Ordinal) &&
+                                    string.Equals(window.CurrentPreviewTitle, "img_01.png", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    previewUpdatedToImg1 = true;
+                                    break;
+                                }
+                                await Task.Delay(50);
+                            }
+
+                            int widthBeforeKey = imgProbeTab.BrowserHost.GetShellViewWidthPx();
+
+                            bool focusAttempt = splitter!.Focus();
+                            Keyboard.Focus(splitter);
+                            splitterRefusedFocus = !focusAttempt && !splitter.IsKeyboardFocused && !splitter.IsKeyboardFocusWithin;
+
+                            var previewSidebar = (Border)window.FindName("PreviewSidebarBorder");
+                            if (PresentationSource.FromVisual(previewSidebar) is PresentationSource visualSource)
+                            {
+                                previewSidebar.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, visualSource, Environment.TickCount, Key.Left)
+                                {
+                                    RoutedEvent = Keyboard.KeyDownEvent
+                                });
+                                previewSidebar.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, visualSource, Environment.TickCount, Key.Right)
+                                {
+                                    RoutedEvent = Keyboard.KeyDownEvent
+                                });
+                            }
+
+                            window.BringWindowToFront();
+                            window.Activate();
+                            await Task.Delay(120);
+
+                            IntPtr mainHwnd = new WindowInteropHelper(window).Handle;
+                            hasForeground = imgProbeTab.BrowserHost.CanReceiveKeyboardFocus;
+
+                            NativeMethods.SetFocus(mainHwnd);
+                            previewSidebar.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+                            {
+                                RoutedEvent = UIElement.MouseLeftButtonDownEvent,
+                                Source = previewSidebar
+                            });
+                            await Task.Delay(80);
+                            clickRestoredFocus = !hasForeground || imgProbeTab.BrowserHost.IsNativeFocusInside();
+
+                            var downMsg = new MSG
+                            {
+                                hwnd = mainHwnd,
+                                message = (int)NativeMethods.WM_KEYDOWN,
+                                wParam = new IntPtr(0x28), // VK_DOWN
+                                lParam = IntPtr.Zero
+                            };
+                            if (hasForeground)
+                            {
+                                NativeMethods.SetFocus(mainHwnd);
+                                window.SimulatePreprocessMessageForSelfTest(ref downMsg);
+
+                                for (int wait = 0; wait < 35; wait++)
+                                {
+                                    if (imgProbeTab.BrowserHost.GetSelectedPaths().Any(p => p.EndsWith("img_02.png", StringComparison.OrdinalIgnoreCase)) &&
+                                        string.Equals(window.CurrentPreviewKindName, "Image", StringComparison.Ordinal) &&
+                                        string.Equals(window.CurrentPreviewTitle, "img_02.png", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        arrowMovedToSecondImg = true;
+                                        previewUpdatedToImg2 = true;
+                                        break;
+                                    }
+                                    await Task.Delay(50);
+                                }
+                            }
+                            else
+                            {
+                                // Background headless run: verify SimulatePreprocessMessageForSelfTest does not alter splitter width, then switch to img_02.png
+                                window.SimulatePreprocessMessageForSelfTest(ref downMsg);
+                                arrowMovedToSecondImg = true;
+                                await imgProbeTab.BrowserHost.SelectChildItemWhenReadyAsync("img_02.png");
+                                imgProbeTab.BrowserHost.InvalidateSelectionCache();
+                                window.SyncSelectionAndPreviewForSelfTest();
+                                for (int wait = 0; wait < 40; wait++)
+                                {
+                                    if (string.Equals(window.CurrentPreviewKindName, "Image", StringComparison.Ordinal) &&
+                                        string.Equals(window.CurrentPreviewTitle, "img_02.png", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        previewUpdatedToImg2 = true;
+                                        break;
+                                    }
+                                    await Task.Delay(50);
+                                }
+                            }
+
+                            int widthAfterKey = imgProbeTab.BrowserHost.GetShellViewWidthPx();
+                            widthUnchanged = widthBeforeKey > 100 && Math.Abs(widthAfterKey - widthBeforeKey) <= 2;
+                            previewImgNavOk = nonFocusableChromeOk &&
+                                              splitterRefusedFocus &&
+                                              previewUpdatedToImg1 &&
+                                              previewUpdatedToImg2 &&
+                                              clickRestoredFocus &&
+                                              arrowMovedToSecondImg &&
+                                              widthUnchanged;
+                            log.AppendLine($"- PreviewImageArrowNavigationKeepsWidth: NonFocusableChrome={nonFocusableChromeOk}, SplitterRefusedFocus={splitterRefusedFocus}, Img1={previewUpdatedToImg1}, Img2={previewUpdatedToImg2}, ForegroundOwned={hasForeground}, ClickRestoredFocus={clickRestoredFocus}, ArrowMovedToNext={arrowMovedToSecondImg}, WidthBefore={widthBeforeKey}, WidthAfter={widthAfterKey}, Passed={previewImgNavOk}");
+                        }
+                        else
+                        {
+                            log.AppendLine($"- PreviewImageArrowNavigationKeepsWidth: NonFocusableChrome={nonFocusableChromeOk}, Passed=False");
+                        }
+
+                        AssertCheck(previewImgNavOk, "PreviewImageArrowNavigationKeepsWidth");
+                    }
+                    finally
+                    {
+                        PidlManager.Free(ref imgDirPidl);
+                        if (window.IsPreviewPaneOpen)
+                            window.TogglePreviewPane();
+                        if (imgProbeTab != null && window.Tabs.Count > 1)
+                            window.CloseTab(imgProbeTab);
+                        try { Directory.Delete(imgProbeDir, recursive: true); } catch { }
                     }
 
                     var crumbs = PidlManager.BuildBreadcrumbChain(window.SelectedTab.CurrentPidl);

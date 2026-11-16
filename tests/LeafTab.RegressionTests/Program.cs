@@ -26,6 +26,7 @@ namespace LeafTab.RegressionTests
             foreach (var assembly in new[] { typeof(LeafTab.App).Assembly, typeof(LeafTab.Setup.SetupOptions).Assembly })
                 assembly.GetType("LeafTab.Shared.DiagnosticLog")!.GetProperty("DirectoryPath", BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, Path.Combine(Root, "logs"));
             Console.WriteLine("Fixtures: " + Root);
+            if (args.Contains("--search-navigation-native")) return RunSearchNavigationNativeTests();
             Test("Preserve a changed external open command", () => RegistrySandbox((classes, backup) =>
             {
                 string keyPath = classes + @"\Directory\shell\open\command";

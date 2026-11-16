@@ -218,6 +218,9 @@ namespace LeafTab.Interop
         public const uint WM_APPCOMMAND = 0x0319;
         public const uint WM_ERASEBKGND = 0x0014;
         public const uint WM_NCDESTROY = 0x0082;
+        public const uint WM_WINDOWPOSCHANGED = 0x0047;
+        public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_SHOWWINDOW = 0x0040;
         public const uint WM_COPYDATA = 0x004A;
         public const uint WM_CLOSE = 0x0010;
         public const uint WM_QUIT = 0x0012;
@@ -326,6 +329,11 @@ namespace LeafTab.Interop
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y,
+            int width, int height, uint flags);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]

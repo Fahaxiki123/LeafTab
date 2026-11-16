@@ -117,9 +117,17 @@ namespace LeafTab.Views
         internal bool RestorePreviousTabs => _restorePreviousTabs;
         internal void SetRestorePreviousTabs(bool enabled) => _restorePreviousTabs = enabled;
         internal string CurrentPreviewKindName => _currentPreviewData?.Kind.ToString() ?? "None";
+        internal string CurrentPreviewTitle => _currentPreviewData?.Title ?? string.Empty;
         internal string CurrentPreviewTextContent => _currentPreviewData?.TextContent ?? string.Empty;
         internal IReadOnlyList<string> RecentFolders => _recentFolders;
         internal void RefreshNavigationChromeState() => UpdateNavigationButtonsState();
+        internal bool SimulatePreprocessMessageForSelfTest(ref MSG msg)
+        {
+            bool handled = false;
+            ComponentDispatcher_ThreadPreprocessMessage(ref msg, ref handled);
+            return handled;
+        }
+        internal void SyncSelectionAndPreviewForSelfTest() => UpdateCommandBarAndStatus(computeBytes: true);
 
         public MainWindow() : this(skipSessionPersistence: false, deferInitialFallbackTab: false)
         {
@@ -1592,6 +1600,13 @@ namespace LeafTab.Views
                                 SearchTextBox.IsKeyboardFocusWithin ||
                                 IsPreviewContentFocused();
 
+            if (mods == ModifierKeys.None && vk == 0x1B && IsPreviewContentFocused())
+            {
+                _selectedTab?.BrowserHost.FocusNativeView();
+                handled = true;
+                return;
+            }
+
             if (mods == ModifierKeys.Control)
             {
                 if (vk == 0x0D && !inWpfTextBox && _selectedTab?.BrowserHost.IsShowingSearchResults == true) // Ctrl + Enter
@@ -1733,9 +1748,25 @@ namespace LeafTab.Views
                 }
             }
 
-            if (!inWpfTextBox && _selectedTab != null && _selectedTab.BrowserHost.TryTranslateShellAccelerator(ref msg))
+            if (!inWpfTextBox && _selectedTab != null)
             {
-                handled = true;
+                if (msg.message == NativeMethods.WM_KEYDOWN &&
+                    !_selectedTab.BrowserHost.IsNativeFocusInside() &&
+                    NativeMethods.GetFocus() == myHwnd &&
+                    vk != 0x10 && vk != 0x11 && vk != 0x12 && vk != 0x5B && vk != 0x5C)
+                {
+                    _selectedTab.BrowserHost.FocusNativeView();
+                    IntPtr newFocus = NativeMethods.GetFocus();
+                    if (newFocus != IntPtr.Zero && _selectedTab.BrowserHost.IsNativeFocusInside())
+                    {
+                        msg.hwnd = newFocus;
+                    }
+                }
+
+                if (_selectedTab.BrowserHost.TryTranslateShellAccelerator(ref msg))
+                {
+                    handled = true;
+                }
             }
         }
 
@@ -2649,7 +2680,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.5";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.6";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",

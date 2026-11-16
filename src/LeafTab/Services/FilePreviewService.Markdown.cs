@@ -1182,14 +1182,26 @@ namespace LeafTab.Services
                 switch (node.Kind)
                 {
                     case MdInlineKind.Plain:
-                        remainingInlines--;
-                        target.Add(new Run(node.Text));
-                        break;
-
                     case MdInlineKind.LineBreak:
-                        remainingInlines--;
-                        target.Add(new LineBreak());
+                    {
+                        // Plain text and hard breaks share formatting. Keep their
+                        // line breaks in one Run instead of creating thousands of
+                        // WPF TextElements for dense, manually rendered paragraphs.
+                        // Still charge each AST node to the original render budget.
+                        var text = new StringBuilder();
+                        do
+                        {
+                            node = nodes[i];
+                            text.Append(node.Kind == MdInlineKind.LineBreak ? "\n" : node.Text);
+                            remainingInlines--;
+                            if (remainingInlines <= 0 || i + 1 >= nodes.Length ||
+                                (nodes[i + 1].Kind != MdInlineKind.Plain && nodes[i + 1].Kind != MdInlineKind.LineBreak))
+                                break;
+                            i++;
+                        } while (true);
+                        target.Add(new Run(text.ToString()));
                         break;
+                    }
 
                     case MdInlineKind.InlineCode:
                         if (remainingInlines < 2)

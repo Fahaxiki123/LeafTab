@@ -23,11 +23,6 @@ namespace LeafTab.Controls
             if (_searchBrowser != null && _searchHostHwnd != IntPtr.Zero)
             {
                 _searchBrowser.RemoveAll();
-                if (_browseHostHwnd != IntPtr.Zero)
-                    NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_HIDE);
-                NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_SHOW);
-                SyncBrowserRect();
-                AttachDirectUiSubclassIfNeeded();
                 return true;
             }
 
@@ -57,12 +52,14 @@ namespace LeafTab.Controls
                 return false;
 
             _searchBrowser = (IExplorerBrowser)Activator.CreateInstance(comType)!;
-            if (_paneSite != null && _searchBrowser is IObjectWithSite withSite)
+            _searchPaneSite = new SearchResultsSite(this);
+            if (_searchBrowser is IObjectWithSite withSite)
             {
-                withSite.SetSite(_paneSite);
+                withSite.SetSite(_searchPaneSite);
             }
 
-            _searchBrowser.SetOptions(EXPLORER_BROWSER_OPTIONS.EBO_SHOWFRAMES | EXPLORER_BROWSER_OPTIONS.EBO_NOBORDER);
+            _searchBrowser.SetOptions(EXPLORER_BROWSER_OPTIONS.EBO_NOBORDER |
+                EXPLORER_BROWSER_OPTIONS.EBO_NOPERSISTVIEWSTATE);
 
             var initRect = new RECT(0, 0, w, h);
             var fs = new FOLDERSETTINGS
@@ -94,10 +91,6 @@ namespace LeafTab.Controls
                 return false;
             }
 
-            if (_browseHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_HIDE);
-            NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_SHOW);
-            SyncBrowserRect();
             return true;
         }
 
@@ -204,6 +197,7 @@ namespace LeafTab.Controls
             }
 
             _isShowingSearchResults = true;
+            ShowSearchPresentation();
             _isSearchRunning = true;
             _isSearchTruncated = false;
             _searchMatchCount = 0;
@@ -706,13 +700,9 @@ namespace LeafTab.Controls
                 return false;
 
             CancelSearchStateInternal(freeSavedPidl: true);
+            HideSearchPresentation();
             _searchBrowser?.RemoveAll();
             _searchBrowser?.SetEmptyText(string.Empty);
-
-            if (_searchHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_searchHostHwnd, NativeMethods.SW_HIDE);
-            if (_browseHostHwnd != IntPtr.Zero)
-                NativeMethods.ShowWindow(_browseHostHwnd, NativeMethods.SW_SHOW);
 
             SyncBrowserRect();
             AttachDirectUiSubclassIfNeeded();
@@ -882,18 +872,23 @@ namespace LeafTab.Controls
                 if (owner._isFillSearchTransition)
                     return ShellConstants.S_OK;
 
-                // User double-clicked a subfolder or clicked a location in left NavPane while viewing search results:
-                // keep _searchBrowser in ResultsFolder mode and route navigation to the primary _browser!
+                if (PidlManager.AreEqual(pidlFolder, owner._searchResultsPidl))
+                    return E_ABORT;
+
+                // Keep the result container in place if the Shell requests a
+                // folder navigation; route that folder to the primary browser.
                 if (pidlFolder != IntPtr.Zero)
                 {
                     IntPtr cloned = PidlManager.Clone(pidlFolder);
                     if (cloned != IntPtr.Zero)
                     {
+                        int generation = owner._searchGeneration;
                         owner.Dispatcher.BeginInvoke(new Action(() =>
                         {
                             try
                             {
-                                if (!owner._isDestroyed)
+                                if (!owner._isDestroyed && owner._isShowingSearchResults &&
+                                    generation == owner._searchGeneration)
                                     owner.NavigateToPidl(cloned);
                             }
                             finally
@@ -918,6 +913,8 @@ namespace LeafTab.Controls
             {
                 if (_ownerRef != null && _ownerRef.TryGetTarget(out ExplorerBrowserHost? owner))
                 {
+                    PidlManager.Free(ref owner._searchResultsPidl);
+                    owner._searchResultsPidl = PidlManager.Clone(pidlFolder);
                     owner._isFillSearchTransition = false;
                     owner.OnNativeViewCreated();
                 }
