@@ -43,7 +43,7 @@ namespace LeafTab.Setup
 
     internal static class SetupEngine
     {
-        public const string AppVersion = "0.6.8";
+        public const string AppVersion = "0.6.9";
         public const string PayloadResourceName = "LeafTab.Payload.gz";
         public const string UninstallRegistryKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\LeafTab";
         public const string ShortcutFileName = "LeafTab（一叶）.lnk";
@@ -533,15 +533,29 @@ namespace LeafTab.Setup
                     try
                     {
                         if (process.HasExited || process.SessionId != sessionId) continue;
-                        path = process.MainModule?.FileName;
+                        path = ProcessLifetimeSignals.TryGetProcessImagePath(unchecked((uint)process.Id));
+                        if (string.IsNullOrWhiteSpace(path))
+                            throw new IOException("无法确认正在运行的 LeafTab 程序路径，请关闭该进程后重试。");
                     }
-                    catch (Exception ex) { DiagnosticLog.Write("process-inspection-skipped", ex); continue; }
-                    // The session-wide primary can be an unregistered portable copy. Run each
-                    // copy's own quit client so older mutex/pipe naming schemes also release COM.
+                    catch (Exception ex)
+                    {
+                        try { if (process.HasExited) continue; } catch { }
+                        DiagnosticLog.Write("process-inspection-failed", ex);
+                        throw new IOException("无法确认正在运行的 LeafTab 程序路径，请关闭该进程后重试。", ex);
+                    }
                     if (!stopAllIfTakingOver && !ShellAssociationRecovery.PathsEqual(path, targetExePath)) continue;
                     if (process.HasExited) continue;
-                    if (File.Exists(path)) RunProcessHiddenAndWait(path!, "--quit", 3000);
-                    if (!process.WaitForExit(4000)) throw new IOException("LeafTab 仍在运行。请从菜单彻底退出后重试，安装器没有强制终止进程。");
+                    using var signals = new ProcessLifetimeSignals();
+                    signals.SignalExit(path);
+                    signals.TrySendQuitToPrimary(path);
+                    if (!process.WaitForExit(4000))
+                    {
+                        // v0.6.8 relays predate the broadcast. Their existing idle
+                        // timer runs every 5 seconds with a 30-second threshold.
+                        bool legacyHidden = process.MainWindowHandle == IntPtr.Zero;
+                        if (!legacyHidden || !process.WaitForExit(35000))
+                            throw new IOException("LeafTab 仍在运行。请从菜单彻底退出后重试，安装器没有强制终止进程。");
+                    }
                 }
             }
         }

@@ -45,6 +45,7 @@ namespace LeafTab.Services
         public bool IsRegisterContextMenu { get; set; }
         public bool IsUnregisterShell { get; set; }
         public bool IsQuitProcess { get; set; }
+        public bool QuitCurrentExecutableOnly { get; set; }
         public bool IsBackgroundWarmup { get; set; }
         public bool IsComServerLaunch { get; set; }
         public bool OpenInNewWindow { get; set; }
@@ -141,6 +142,13 @@ namespace LeafTab.Services
                     string.Equals(trimmed, "--exit", StringComparison.OrdinalIgnoreCase))
                 {
                     req.IsQuitProcess = true;
+                    continue;
+                }
+
+                if (string.Equals(trimmed, "--quit-this-copy", StringComparison.OrdinalIgnoreCase))
+                {
+                    req.IsQuitProcess = true;
+                    req.QuitCurrentExecutableOnly = true;
                     continue;
                 }
 
@@ -320,6 +328,7 @@ namespace LeafTab.Services
 
         private readonly string _mutexName;
         private readonly string _pipeName;
+        private readonly ProcessLifetimeSignals _lifetimeSignals;
         private Mutex? _mutex;
         private bool _ownsMutex;
         private CancellationTokenSource? _listenCts;
@@ -334,18 +343,14 @@ namespace LeafTab.Services
             string hashHex = ComputeShortSha256Hex(userKey);
             _mutexName = $"Local\\LeafTab.SingleInstance.{hashHex}";
             _pipeName = $"LeafTab.SingleInstance.Pipe.{hashHex}";
+            _lifetimeSignals = new ProcessLifetimeSignals(userKey);
         }
 
         public bool TryAcquirePrimaryInstance(int waitMs = 0)
         {
             try
             {
-                _mutex = new Mutex(initiallyOwned: true, _mutexName, out bool createdNew);
-                if (createdNew)
-                {
-                    _ownsMutex = true;
-                    return true;
-                }
+                _mutex = ProcessLifetimeSignals.CreateCurrentUserMutex(_mutexName);
 
                 try
                 {
@@ -363,11 +368,17 @@ namespace LeafTab.Services
 
                 return false;
             }
-            catch
+            catch (Exception ex)
             {
-                return true;
+                DiagnosticLog.Write("instance-mutex-unavailable", ex);
+                return false;
             }
         }
+
+        internal void StartExitListening(string executablePath, Action onExit) =>
+            _lifetimeSignals.StartListening(executablePath, onExit);
+
+        internal bool SignalExit(string? executablePath = null) => _lifetimeSignals.SignalExit(executablePath);
 
         public bool TryForwardToPrimary(LaunchActionRequest request, int timeoutMs = 2500, string? expectedExecutablePath = null)
         {
@@ -522,6 +533,8 @@ namespace LeafTab.Services
             if (_disposed)
                 return;
             _disposed = true;
+
+            _lifetimeSignals.Dispose();
 
             try
             {

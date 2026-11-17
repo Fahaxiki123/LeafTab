@@ -27,13 +27,18 @@ namespace LeafTab.Services
         public uint FileAttributes { get; }
         public ulong FileSize { get; }
         public FILETIME LastWriteTime { get; }
+        public bool HasFileSize { get; }
+        public bool HasLastWriteTime { get; }
 
-        public SearchResultEntry(string fullPath, uint fileAttributes, ulong fileSize, FILETIME lastWriteTime)
+        public SearchResultEntry(string fullPath, uint fileAttributes, ulong fileSize, FILETIME lastWriteTime,
+            bool hasFileSize = true, bool hasLastWriteTime = true)
         {
             FullPath = fullPath;
             FileAttributes = fileAttributes;
             FileSize = fileSize;
             LastWriteTime = lastWriteTime;
+            HasFileSize = hasFileSize;
+            HasLastWriteTime = hasLastWriteTime;
         }
     }
 
@@ -185,7 +190,7 @@ namespace LeafTab.Services
             ParsedSearchQuery parsedQuery = ParseQuery(trimmedQuery);
 
             // Tier 1: Query Everything IPC when available
-            if (_ipcClient.IsAvailable)
+            if (!RequiresNativeQuerySemantics(trimmedQuery, parsedQuery) && _ipcClient.IsAvailable)
             {
                 SearchExecutionReport? everythingReport = await TrySearchViaEverythingAsync(
                     trimmedQuery,
@@ -289,6 +294,7 @@ namespace LeafTab.Services
                     normalizedRoot,
                     includeHidden,
                     maxResults,
+                    parsedQuery.HasUnsupportedNativeSyntax ? null : parsedQuery,
                     onBatch,
                     sw,
                     cancellationToken).ConfigureAwait(false);
@@ -308,6 +314,7 @@ namespace LeafTab.Services
                 scopeRoot: null,
                 includeHidden: includeHidden,
                 maxResults: maxResults,
+                localQuery: parsedQuery.HasUnsupportedNativeSyntax ? null : parsedQuery,
                 onBatch: onBatch,
                 sw: sw,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -363,6 +370,7 @@ namespace LeafTab.Services
             string? scopeRoot,
             bool includeHidden,
             int maxResults,
+            ParsedSearchQuery? localQuery,
             Action<SearchResultEntry[], int> onBatch,
             Stopwatch sw,
             CancellationToken cancellationToken)
@@ -429,13 +437,21 @@ namespace LeafTab.Services
                         attrs = item.IsFolder ? NativeMethods.FILE_ATTRIBUTE_DIRECTORY : NativeMethods.FILE_ATTRIBUTE_NORMAL;
                     }
 
+                    var entry = new SearchResultEntry(fullPath, attrs, item.FileSize, item.LastWriteTime);
+                    if (localQuery != null)
+                    {
+                        string relative = scopePrefix != null ? fullPath.Substring(scopePrefix.Length) : fullPath;
+                        string name = Path.GetFileName(fullPath);
+                        if (!localQuery.MatchesEntry(name, relative, in entry)) continue;
+                    }
+
                     if (matched >= maxResults)
                     {
                         hitResultLimit = true;
                         break;
                     }
 
-                    pending.Add(new SearchResultEntry(fullPath, attrs, item.FileSize, item.LastWriteTime));
+                    pending.Add(entry);
                     matched++;
 
                     if (pending.Count >= targetBatchSize)
@@ -701,7 +717,7 @@ namespace LeafTab.Services
             return true;
         }
 
-        private SearchExecutionReport ScanRootsWithWin32(
+        internal SearchExecutionReport ScanRootsWithWin32(
             string[] roots,
             string? singleCacheRoot,
             bool includeHidden,
@@ -709,7 +725,8 @@ namespace LeafTab.Services
             ParsedSearchQuery parsedQuery,
             Action<SearchResultEntry[], int> onBatch,
             Stopwatch sw,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            IReadOnlyList<string>? priorityDirectories = null)
         {
             var queueLock = new object();
             var primaryQueue = new Queue<string>(64);
@@ -743,7 +760,7 @@ namespace LeafTab.Services
             }
             else
             {
-                EnqueueInitialMultiDrivePriorityDirs(primaryQueue, roots, includeHidden);
+                EnqueueInitialMultiDrivePriorityDirs(primaryQueue, roots, includeHidden, priorityDirectories);
                 foreach (string r in roots)
                 {
                     string cleanRoot = EnsureTrailingBackslash(r);
@@ -752,7 +769,7 @@ namespace LeafTab.Services
             }
 
             // Dedup visited directories when prioritizing user folders + drive roots
-            var visitedDirs = roots.Length > 1
+            var visitedDirs = singleCacheRoot == null
                 ? new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase)
                 : null;
 
@@ -978,7 +995,8 @@ namespace LeafTab.Services
         private static void EnqueueInitialMultiDrivePriorityDirs(
             Queue<string> primaryQueue,
             string[] allowedRoots,
-            bool includeHidden)
+            bool includeHidden,
+            IReadOnlyList<string>? priorityDirectories)
         {
             void TryEnqueuePriority(string? dir)
             {
@@ -1008,6 +1026,11 @@ namespace LeafTab.Services
 
             try
             {
+                if (priorityDirectories != null)
+                {
+                    foreach (string directory in priorityDirectories) TryEnqueuePriority(directory);
+                    return;
+                }
                 TryEnqueuePriority(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
                 TryEnqueuePriority(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"));
                 TryEnqueuePriority(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
@@ -1282,7 +1305,7 @@ namespace LeafTab.Services
                 return normalizedQuery;
 
             string prefix = EnsureTrailingBackslash(rootDir!).Replace("\"", string.Empty);
-            return $"\"{prefix}\" {normalizedQuery}";
+            return $"\"{prefix}\" <{normalizedQuery}>";
         }
 
         private static List<string> TokenizeQuery(string query)

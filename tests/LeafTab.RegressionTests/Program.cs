@@ -28,6 +28,11 @@ namespace LeafTab.RegressionTests
                 assembly.GetType("LeafTab.Shared.DiagnosticLog")!.GetProperty("DirectoryPath", BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, Path.Combine(Root, "logs"));
             Console.WriteLine("Fixtures: " + Root);
             if (args.Contains("--search-navigation-native")) return RunSearchNavigationNativeTests();
+            if (args.Contains("--search-history-native")) return RunSearchHistoryFixNativeTests();
+            if (args.Contains("--window-search-native")) return RunWindowSearchSettingsNativeTests();
+            if (args.Contains("--focus-navigation-native")) return RunFocusNavigationNativeTests();
+            if (args.Contains("--standby-restore-native")) return RunStandbyRestoreNativeTests();
+            if (args.Contains("--focus-input-ui")) return RunForegroundFocusInputTests();
             if (args.Contains("--explorer-redirect-native")) return RunExplorerRedirectNativeTests();
             if (args.Contains("--shell-selection-native")) return RunShellSelectionNativeTests();
             if (args.Contains("--external-selection-native")) return RunExternalSelectionNativeTests();
@@ -83,6 +88,9 @@ namespace LeafTab.RegressionTests
             RunExplorerRedirectTests();
             RunShellProtocolTests();
             RunExternalSelectionTests();
+            RunWindowAndPreviewFixTests();
+            RunSearchFixTests();
+            RunLifecycleFixTests();
             Console.WriteLine($"RESULT: {_passed} passed, {_failed} failed");
             return _failed == 0 ? 0 : 1;
         }

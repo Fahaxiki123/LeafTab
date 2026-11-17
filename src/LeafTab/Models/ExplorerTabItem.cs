@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Media;
 using LeafTab.Controls;
 using LeafTab.Interop;
+using LeafTab.Shared;
 
 namespace LeafTab.Models
 {
@@ -43,6 +46,9 @@ namespace LeafTab.Models
         private int _pendingHistoryIndex = -1;
         private bool _suppressNextHistoryPush;
         private bool _initialNavigationCompleted;
+        private CancellationTokenSource? _historyParseCts;
+        private int _historyRequestVersion;
+        private int _pendingHistoryResolveIndex = -1;
 
         public Guid Id { get; } = Guid.NewGuid();
 
@@ -112,6 +118,7 @@ namespace LeafTab.Models
 
             UpdateDisplayMetadata(_currentPidl);
             BrowserHost = prewarmedHost ?? new ExplorerBrowserHost(_currentPidl, showPreviewPane);
+            BrowserHost.NavigationStarting += BrowserHost_NavigationStarting;
             if (prewarmedHost != null)
             {
                 IntPtr thisPcPidl = PidlManager.CreateThisPcPidl();
@@ -228,32 +235,66 @@ namespace LeafTab.Models
 
         internal bool NavigateHistoryStep(int delta)
         {
-            if (_disposed)
+            // Existing keyboard and mouse handlers report whether the request was
+            // accepted. UNC resolution continues asynchronously on the UI context.
+            Task<bool> navigation = NavigateHistoryStepAsync(delta);
+            return navigation.IsCompleted ? navigation.GetAwaiter().GetResult() : true;
+        }
+
+        internal async Task<bool> NavigateHistoryStepAsync(int delta,
+            Func<string, CancellationToken, Task<(IntPtr Pidl, string? ErrorMessage)>>? parseAddress = null)
+        {
+            if (_disposed || delta == 0)
                 return false;
 
-            if (BrowserHost.IsShowingSearchResults && delta < 0)
+            if (BrowserHost.IsShowingSearchResults)
             {
-                SearchQuery = string.Empty;
-                return BrowserHost.ExitSearchMode();
+                if (delta > 0) return false;
+                CancelHistoryResolution();
+                bool exited = BrowserHost.ExitSearchMode();
+                if (exited) SearchQuery = string.Empty;
+                return exited;
             }
 
-            int baseIdx = _pendingHistoryIndex >= 0 ? _pendingHistoryIndex : _historyIndex;
+            int baseIdx = _pendingHistoryResolveIndex >= 0 ? _pendingHistoryResolveIndex :
+                (_pendingHistoryIndex >= 0 ? _pendingHistoryIndex : _historyIndex);
             int targetIdx = baseIdx + delta;
             if (targetIdx < 0 || targetIdx >= _history.Count)
                 return false;
 
+            CancelHistoryResolution();
+            int requestVersion = _historyRequestVersion;
             TabHistoryEntry entry = _history[targetIdx];
             IntPtr targetPidl = PidlManager.FromBytes(entry.PidlBytes);
-            if (targetPidl == IntPtr.Zero && !string.IsNullOrWhiteSpace(entry.ParsingName))
-            {
-                targetPidl = PidlManager.TryParseLocalOrShellFast(entry.ParsingName);
-            }
-
-            if (targetPidl == IntPtr.Zero)
-                return false;
-
             try
             {
+                if (targetPidl == IntPtr.Zero && !string.IsNullOrWhiteSpace(entry.ParsingName))
+                    targetPidl = PidlManager.TryParseLocalOrShellFast(entry.ParsingName);
+
+                if (targetPidl == IntPtr.Zero && !string.IsNullOrWhiteSpace(entry.ParsingName))
+                {
+                    using var cts = new CancellationTokenSource();
+                    _historyParseCts = cts;
+                    _pendingHistoryResolveIndex = targetIdx;
+                    try
+                    {
+                        (targetPidl, _) = await (parseAddress ?? PidlManager.TryParseAddressAsync)(entry.ParsingName, cts.Token);
+                        if (cts.IsCancellationRequested) return false;
+                    }
+                    finally
+                    {
+                        if (ReferenceEquals(_historyParseCts, cts))
+                        {
+                            _historyParseCts = null;
+                            _pendingHistoryResolveIndex = -1;
+                        }
+                    }
+                }
+
+                if (_disposed || requestVersion != _historyRequestVersion || targetPidl == IntPtr.Zero ||
+                    targetIdx >= _history.Count || !ReferenceEquals(_history[targetIdx], entry))
+                    return false;
+
                 _pendingHistoryIndex = targetIdx;
                 _suppressNextHistoryPush = true;
                 SearchQuery = string.Empty;
@@ -265,14 +306,34 @@ namespace LeafTab.Models
                 }
                 return true;
             }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("history-navigation-failed", ex);
+                return false;
+            }
             finally
             {
                 PidlManager.Free(ref targetPidl);
             }
         }
 
+        private void BrowserHost_NavigationStarting(object? sender, EventArgs e) => CancelHistoryResolution();
+
+        private void CancelHistoryResolution()
+        {
+            _historyRequestVersion++;
+            _pendingHistoryResolveIndex = -1;
+            _historyParseCts?.Cancel();
+            _historyParseCts = null; // The pending operation owns disposal.
+        }
+
         internal void RestoreHistory(IReadOnlyList<string>? historyPaths, int savedIndex)
         {
+            CancelHistoryResolution();
             _history.Clear();
             _pendingHistoryIndex = -1;
 
@@ -306,6 +367,7 @@ namespace LeafTab.Models
 
         internal void RestoreHistoryFromSnapshot(ClosedTabSnapshot snapshot)
         {
+            CancelHistoryResolution();
             _history.Clear();
             _pendingHistoryIndex = -1;
 
@@ -406,6 +468,8 @@ namespace LeafTab.Models
             if (_disposed) return;
             _disposed = true;
 
+            CancelHistoryResolution();
+            BrowserHost.NavigationStarting -= BrowserHost_NavigationStarting;
             BrowserHost.Dispose();
             PidlManager.Free(ref _currentPidl);
             _history.Clear();

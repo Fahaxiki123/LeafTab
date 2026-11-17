@@ -12,6 +12,7 @@
         FontFamily="Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI"
         UseLayoutRounding="True"
         SnapsToDevicePixels="True"
+        KeyboardNavigation.ControlTabNavigation="None"
         WindowStartupLocation="CenterScreen">
 
     <shell:WindowChrome.WindowChrome>
@@ -429,6 +430,7 @@
                                                 MouseLeftButtonDown="TabPill_MouseLeftButtonDown"
                                                 MouseMove="TabPill_MouseMove"
                                                 MouseLeftButtonUp="TabPill_MouseLeftButtonUp"
+                                                LostMouseCapture="TabPill_LostMouseCapture"
                                                 MouseRightButtonUp="TabPill_MouseRightButtonUp"
                                                 MouseUp="TabPill_MouseUp"
                                                 DragEnter="TabPill_DragEnter"
@@ -1147,7 +1149,8 @@
                         <TextBlock Text="+ 收藏当前" FontSize="11.5" FontWeight="Medium" />
                     </Button>
 
-                    <ScrollViewer Grid.Column="1"
+                    <ScrollViewer x:Name="BookmarkScrollViewer" Grid.Column="1"
+                                  PreviewMouseWheel="BookmarkScrollViewer_PreviewMouseWheel"
                                   Focusable="False"
                                   IsTabStop="False"
                                   HorizontalScrollBarVisibility="Hidden"

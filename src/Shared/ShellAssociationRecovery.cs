@@ -244,10 +244,10 @@ namespace LeafTab.Shared
             using (var key = Registry.CurrentUser.OpenSubKey(shell, true))
             using (var bak = Registry.CurrentUser.OpenSubKey(backup))
             {
-                if (string.Equals(key?.GetValue("") as string, "LeafTabOpen", StringComparison.Ordinal))
+                if (string.Equals(key?.GetValue("") as string, "LeafTabOpen", StringComparison.OrdinalIgnoreCase))
                 {
                     if (bak != null && Convert.ToInt32(bak.GetValue("HadDefault", 0)) == 1)
-                        key!.SetValue("", bak.GetValue("PriorDefault", ""), (RegistryValueKind)Convert.ToInt32(bak.GetValue("PriorDefaultKind", (int)RegistryValueKind.String)));
+                        key!.SetValue("", bak.GetValue("PriorDefault", "", RegistryValueOptions.DoNotExpandEnvironmentNames), (RegistryValueKind)Convert.ToInt32(bak.GetValue("PriorDefaultKind", (int)RegistryValueKind.String)));
                     else key!.DeleteValue("", false);
                     restored = true;
                 }

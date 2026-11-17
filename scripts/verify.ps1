@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputRoot = (Join-Path $env:TEMP ('LeafTab-verification-' + [Guid]::NewGuid().ToString('N'))),
-    [switch]$SkipNative
+    [switch]$SkipNative,
+    [switch]$IncludeInteractive
 )
 $ErrorActionPreference = 'Stop'
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
@@ -38,25 +39,27 @@ try {
     & (Join-Path $output 'tests\LeafTab.RegressionTests\bin\x64\Release\net48\LeafTab.RegressionTests.exe') 2>&1 |
         Tee-Object -FilePath (Join-Path $output 'regression-tests.log')
     if ($LASTEXITCODE -ne 0) { throw "Regression tests failed. Evidence: $output" }
+    if (-not $SkipNative) {
+        $nativeSuites = @('external-selection-native', 'shell-selection-native', 'search-navigation-native', 'search-history-native', 'window-search-native', 'focus-navigation-native')
+        if ($IncludeInteractive) { $nativeSuites += 'standby-restore-native' }
+        foreach ($suite in $nativeSuites) {
+            & (Join-Path $output 'tests\LeafTab.RegressionTests\bin\x64\Release\net48\LeafTab.RegressionTests.exe') ("--" + $suite) 2>&1 |
+                Tee-Object -FilePath (Join-Path $output ($suite + '.log'))
+            if ($LASTEXITCODE -ne 0) { throw "Native suite $suite failed. Evidence: $output" }
+        }
+        $report = Join-Path $output 'native-selftest.md'
+        $process = Start-Process -FilePath (Join-Path $output 'src\LeafTab\bin\x64\Release\net48\LeafTab.exe') `
+            -ArgumentList ('--self-test "{0}"' -f $report) -WorkingDirectory $output -WindowStyle Hidden -PassThru
+        $deadline = [DateTime]::UtcNow.AddMinutes(3)
+        while (-not $process.WaitForExit(1000)) {
+            if ([DateTime]::UtcNow -gt $deadline) {
+                $null = $process.CloseMainWindow()
+                throw "Native self-test timed out. Only the isolated test window was asked to close. Evidence: $output"
+            }
+        }
+        if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report)) { throw "Native self-test failed. Evidence: $output" }
+        if (-not (Select-String -LiteralPath $report -SimpleMatch '## RESULT: PASS' -Quiet)) { throw "Native self-test did not pass. Evidence: $output" }
+    }
 }
 finally { $env:LEAFTAB_TEST_ROOT = $previousTestRoot }
-if (-not $SkipNative) {
-    foreach ($suite in @('external-selection-native', 'shell-selection-native', 'search-navigation-native')) {
-        & (Join-Path $output 'tests\LeafTab.RegressionTests\bin\x64\Release\net48\LeafTab.RegressionTests.exe') ("--" + $suite) 2>&1 |
-            Tee-Object -FilePath (Join-Path $output ($suite + '.log'))
-        if ($LASTEXITCODE -ne 0) { throw "Native suite $suite failed. Evidence: $output" }
-    }
-    $report = Join-Path $output 'native-selftest.md'
-    $process = Start-Process -FilePath (Join-Path $output 'src\LeafTab\bin\x64\Release\net48\LeafTab.exe') `
-        -ArgumentList ('--self-test "{0}"' -f $report) -WorkingDirectory $output -WindowStyle Hidden -PassThru
-    $deadline = [DateTime]::UtcNow.AddMinutes(3)
-    while (-not $process.WaitForExit(1000)) {
-        if ([DateTime]::UtcNow -gt $deadline) {
-            $null = $process.CloseMainWindow()
-            throw "Native self-test timed out. Only the isolated test window was asked to close. Evidence: $output"
-        }
-    }
-    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report)) { throw "Native self-test failed. Evidence: $output" }
-    if (-not (Select-String -LiteralPath $report -SimpleMatch '## RESULT: PASS' -Quiet)) { throw "Native self-test did not pass. Evidence: $output" }
-}
 Write-Output "Verified source copy and evidence: $output"

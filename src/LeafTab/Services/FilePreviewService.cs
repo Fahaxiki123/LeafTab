@@ -543,6 +543,7 @@ namespace LeafTab.Services
             bitmapResult = null;
             pixelWidth = 0;
             pixelHeight = 0;
+            int orientation = 1;
 
             try
             {
@@ -556,6 +557,7 @@ namespace LeafTab.Services
                     BitmapFrame frame = decoder.Frames[0];
                     pixelWidth = frame.PixelWidth;
                     pixelHeight = frame.PixelHeight;
+                    orientation = ReadExifOrientation(frame);
                     if (pixelWidth <= 0 || pixelHeight <= 0)
                         return ImageLoadOutcome.Failed;
                 }
@@ -597,7 +599,13 @@ namespace LeafTab.Services
                     bitmap.StreamSource = msDecode;
                     bitmap.EndInit();
                     bitmap.Freeze();
-                    bitmapResult = bitmap;
+                    bitmapResult = ApplyExifOrientation(bitmap, orientation);
+                    if (orientation >= 5 && orientation <= 8)
+                    {
+                        int originalWidth = pixelWidth;
+                        pixelWidth = pixelHeight;
+                        pixelHeight = originalWidth;
+                    }
                     return ImageLoadOutcome.Loaded;
                 }
             }
@@ -606,6 +614,48 @@ namespace LeafTab.Services
                 bitmapResult = null;
                 return ImageLoadOutcome.Failed;
             }
+        }
+
+        private static int ReadExifOrientation(BitmapFrame frame)
+        {
+            BitmapMetadata? metadata;
+            try { metadata = frame.Metadata as BitmapMetadata; }
+            catch (NotSupportedException) { return 1; }
+            catch (System.Runtime.InteropServices.COMException) { return 1; }
+            if (metadata == null) return 1;
+            foreach (string query in new[] { "/app1/ifd/{ushort=274}", "/ifd/{ushort=274}" })
+            {
+                try
+                {
+                    object? value = metadata.GetQuery(query);
+                    if (value == null) continue;
+                    int orientation = Convert.ToInt32(value);
+                    if (orientation >= 1 && orientation <= 8) return orientation;
+                }
+                catch (Exception ex) when (ex is NotSupportedException || ex is ArgumentException ||
+                    ex is InvalidOperationException || ex is FormatException || ex is OverflowException ||
+                    ex is System.Runtime.InteropServices.COMException) { }
+            }
+            return 1;
+        }
+
+        private static BitmapSource ApplyExifOrientation(BitmapSource bitmap, int orientation)
+        {
+            Transform? transform = orientation switch
+            {
+                2 => new ScaleTransform(-1, 1),
+                3 => new RotateTransform(180),
+                4 => new ScaleTransform(1, -1),
+                5 => new MatrixTransform(0, 1, 1, 0, 0, 0),
+                6 => new RotateTransform(90),
+                7 => new MatrixTransform(0, -1, -1, 0, 0, 0),
+                8 => new RotateTransform(270),
+                _ => null
+            };
+            if (transform == null) return bitmap;
+            var corrected = new TransformedBitmap(bitmap, transform);
+            corrected.Freeze();
+            return corrected;
         }
 
         private static bool TryLoadTextPreview(

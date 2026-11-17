@@ -15,6 +15,8 @@ namespace LeafTab.Controls
     {
         // ==================== ASYNC DIRECTORY SEARCH (NATIVE IResultsFolder) ====================
 
+        internal Func<bool>? SearchHiddenItemsProvider { get; set; }
+
         private bool EnsureSearchBrowserReady()
         {
             if (_isDestroyed || _hostHwnd == IntPtr.Zero)
@@ -235,7 +237,7 @@ namespace LeafTab.Controls
             // Filesystem directory OR '此电脑' full-system search:
             // Run ResultsFolder readiness wait CONCURRENTLY with Everything IPC / multi-threaded Win32 scan + background PIDL construction.
             string? searchRoot = hasRealFsRoot ? folderFileSystemPath : null;
-            (_, bool includeHidden) = PidlManager.GetShellVisibilityFlags();
+            bool includeHidden = SearchHiddenItemsProvider?.Invoke() ?? PidlManager.GetShellVisibilityFlags().ShowHidden;
             int remainingFsBudget = effectiveMaxResults;
             if (isThisPcMode && virtualCandidates != null && virtualCandidates.Count > 0)
             {
@@ -605,14 +607,16 @@ namespace LeafTab.Controls
             }
         }
 
-        private static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(IntPtr folderPidl, string query, int maxItems = 200)
+        internal static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(IntPtr folderPidl, string query, int maxItems = 200)
         {
             var matched = new List<byte[]>();
             bool truncated = false;
             if (folderPidl == IntPtr.Zero)
                 return (matched, false);
 
-            Func<string, bool> matcher = BuildFileNameMatcher(query);
+            FastFileSearchService.ParsedSearchQuery parsedQuery = FastFileSearchService.ParseQuery(query);
+            if (parsedQuery.HasUnsupportedNativeSyntax)
+                return (matched, false);
             Guid iidShellItem = ShellConstants.IID_IShellItem;
             if (NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? folderItem) != ShellConstants.S_OK || folderItem == null)
                 return (matched, false);
@@ -645,7 +649,7 @@ namespace LeafTab.Controls
                             try
                             {
                                 string? name = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
-                                if (!string.IsNullOrEmpty(name) && matcher(name!))
+                                if (!string.IsNullOrEmpty(name) && MatchesVirtualSearchItem(item, name!, parsedQuery))
                                 {
                                     if (matched.Count >= maxItems)
                                     {
@@ -686,10 +690,45 @@ namespace LeafTab.Controls
             return (matched, truncated);
         }
 
-        private static Func<string, bool> BuildFileNameMatcher(string query)
+        private static bool MatchesVirtualSearchItem(IShellItem item, string displayName,
+            FastFileSearchService.ParsedSearchQuery query)
         {
-            Func<string, string, bool> matcher = FastFileSearchService.BuildEntryMatcher(query);
-            return name => matcher(name, name);
+            uint mask = ShellConstants.SFGAO_FOLDER | ShellConstants.SFGAO_STREAM;
+            if (item.GetAttributes(mask, out uint attributes) < 0)
+                return false;
+            bool isFolder = (attributes & ShellConstants.SFGAO_FOLDER) != 0 &&
+                            (attributes & ShellConstants.SFGAO_STREAM) == 0;
+
+            // The friendly name can hide the extension. Keep friendly namespace
+            // names (including Recycle Bin names), restoring an omitted extension
+            // only when the filesystem leaf is otherwise the same name.
+            string name = displayName;
+            string? path = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
+            if (!string.IsNullOrEmpty(path))
+            {
+                string leaf = Path.GetFileName(path);
+                if (leaf.StartsWith(displayName + ".", StringComparison.OrdinalIgnoreCase))
+                    name = leaf;
+            }
+
+            if (!query.MatchesPathAndKind(name, name, isFolder))
+                return false;
+
+            ulong size = 0;
+            var modified = default(System.Runtime.InteropServices.ComTypes.FILETIME);
+            bool hasSize = false;
+            bool hasModified = false;
+            if (query.RequiresMetadata && item is IShellItem2 properties)
+            {
+                PROPERTYKEY sizeKey = PropertyKeys.Size;
+                PROPERTYKEY modifiedKey = PropertyKeys.DateModified;
+                hasSize = properties.GetUInt64(ref sizeKey, out size) >= 0;
+                hasModified = properties.GetFileTime(ref modifiedKey, out modified) >= 0;
+            }
+            var entry = new SearchResultEntry(path ?? name,
+                isFolder ? NativeMethods.FILE_ATTRIBUTE_DIRECTORY : NativeMethods.FILE_ATTRIBUTE_NORMAL,
+                size, modified, hasSize, hasModified);
+            return query.MatchesEntry(name, name, in entry);
         }
 
         public bool ExitSearchMode() => ExitSearchModeInternal(notifyChanged: true);

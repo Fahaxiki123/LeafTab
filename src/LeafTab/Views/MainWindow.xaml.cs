@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -182,16 +183,9 @@ namespace LeafTab.Views
             SizeChanged += (_, _) =>
             {
                 AddressSuggestPopup.IsOpen = false;
-                if (_showPreviewPane)
-                {
-                    double maxW = ComputePreviewMaxWidth();
-                    PreviewPaneColumn.MaxWidth = maxW;
-                    if (PreviewPaneColumn.Width.IsAbsolute && PreviewPaneColumn.Width.Value > maxW)
-                    {
-                        PreviewPaneColumn.Width = new GridLength(maxW);
-                    }
-                }
+                UpdatePreviewPaneWidthForAvailableSpace();
             };
+            ContentSurfaceGrid.SizeChanged += (_, _) => UpdatePreviewPaneWidthForAvailableSpace();
             BrowserStackGrid.SizeChanged += (_, _) => _selectedTab?.BrowserHost.SyncBrowserRect();
             PreviewMouseDown += (_, _) => _selectedTab?.BrowserHost.SuppressNativeFocusRect();
             Activated += (_, _) =>
@@ -209,6 +203,22 @@ namespace LeafTab.Views
             };
             Closing += MainWindow_Closing;
             Closed += MainWindow_Closed;
+            PreviewKeyDown += (_, e) =>
+            {
+                ModifierKeys modifiers = Keyboard.Modifiers;
+                if (e.Key == Key.Tab && IsActive && !_isClosingWindow &&
+                    (modifiers == ModifierKeys.Control || modifiers == (ModifierKeys.Control | ModifierKeys.Shift)))
+                {
+                    SwitchRelativeTab(modifiers.HasFlag(ModifierKeys.Shift) ? -1 : 1);
+                    e.Handled = true;
+                    return;
+                }
+                if (e.Key == Key.Escape && _tabReorderCandidate != null)
+                {
+                    CancelTabReorder(Mouse.Captured as FrameworkElement);
+                    e.Handled = true;
+                }
+            };
         }
 
         private void SyncStatusTimerState()
@@ -301,13 +311,17 @@ namespace LeafTab.Views
                 {
                     // If this secondary window is closing while other visible windows remain open, keep remaining windows' tabs.
                     var otherTabs = new List<(ExplorerTabItem Tab, bool IsSelected)>();
+                    MainWindow? survivingActive = App.CurrentApp.ManagedWindows.LastOrDefault(w =>
+                        !ReferenceEquals(w, this) && w.IsVisible && !w.IsClosingOrClosed && w.Tabs.Count > 0 && w.IsActive)
+                        ?? App.CurrentApp.ManagedWindows.LastOrDefault(w =>
+                            !ReferenceEquals(w, this) && w.IsVisible && !w.IsClosingOrClosed && w.Tabs.Count > 0);
                     foreach (MainWindow w in App.CurrentApp.ManagedWindows)
                     {
                         if (!ReferenceEquals(w, this) && w.IsVisible && !w.IsClosingOrClosed && w.Tabs.Count > 0)
                         {
                             foreach (ExplorerTabItem t in w.Tabs)
                             {
-                                otherTabs.Add((t, ReferenceEquals(w, App.CurrentApp.MainWindow) && ReferenceEquals(t, w.SelectedTab)));
+                                otherTabs.Add((t, ReferenceEquals(w, survivingActive) && ReferenceEquals(t, w.SelectedTab)));
                             }
                         }
                     }
@@ -846,13 +860,12 @@ namespace LeafTab.Views
                 return true;
             }
 
+            bool wakingFromStandby = !IsVisible;
             if (!_isLoadedCompleted)
             {
                 BringWindowToFront();
                 await WaitUntilLoadedAsync();
             }
-
-            bool wakingFromStandby = !IsVisible;
 
             if (request.Targets.Count == 0)
             {
@@ -1133,6 +1146,7 @@ namespace LeafTab.Views
 
                 host.NavigationCompleted += (_, args) =>
                 {
+                    CancelSearchForNavigation(tab);
                     tab.UpdateFromNavigation(args.FolderPidl);
                     RecordRecentFolder(tab);
                     if (ReferenceEquals(tab, _selectedTab))
@@ -1145,6 +1159,7 @@ namespace LeafTab.Views
 
                 host.NavigationStarting += (_, _) =>
                 {
+                    CancelSearchForNavigation(tab);
                     if (ReferenceEquals(tab, _selectedTab)) _shellViewRegistration.Dispose();
                 };
 
@@ -1173,7 +1188,7 @@ namespace LeafTab.Views
                 {
                     if (ReferenceEquals(tab, _selectedTab))
                     {
-                        if (AddressEditGrid.Visibility == Visibility.Visible)
+                        if (AddressEditGrid.Visibility == Visibility.Visible && host.IsNativeFocusInside())
                             ExitAddressEditMode();
                         UpdateCommandBarAndStatus(computeBytes: true);
                     }
@@ -1183,7 +1198,7 @@ namespace LeafTab.Views
                 {
                     if (ReferenceEquals(tab, _selectedTab))
                     {
-                        if (!host.IsShowingSearchResults && !string.IsNullOrEmpty(tab.SearchQuery))
+                        if (!host.IsShowingSearchResults)
                         {
                             tab.SearchQuery = string.Empty;
                             SetSearchBoxTextSilently(string.Empty);
@@ -1265,6 +1280,7 @@ namespace LeafTab.Views
                 BrowserStackGrid.Children.Add(tab.BrowserHost);
             }
 
+            if (!ReferenceEquals(_selectedTab, tab)) _selectedTab?.BrowserHost.CancelPendingWpfEditorFocus();
             _selectedTab = tab;
             RefreshShellViewRegistration();
             EnsureActiveTabVisible();
@@ -1649,6 +1665,20 @@ namespace LeafTab.Views
 
             int vk = (int)msg.wParam.ToInt64();
             ModifierKeys mods = Keyboard.Modifiers;
+            bool windowShortcut = (mods == ModifierKeys.Control &&
+                    (vk == 0x09 || vk == 'T' || vk == 'N' || vk == 'W' || vk == 'L' || vk == 'F' || vk == 'E' || vk == 0xC0)) ||
+                (mods == (ModifierKeys.Control | ModifierKeys.Shift) && (vk == 0x09 || vk == 'T'));
+            if ((_selectedTab?.BrowserHost.IsNativeEditControlFocused() ?? false) &&
+                !windowShortcut)
+            {
+                // Let the native editor receive text/editing keys; do not dispatch window
+                // navigation, refresh or creation commands against an in-progress rename.
+                handled = (mods == ModifierKeys.Alt && (vk == 0x25 || vk == 0x27 || vk == 0x26)) ||
+                    (mods == ModifierKeys.None && (vk == 0x73 || vk == 0x74)) ||
+                    (mods == (ModifierKeys.Control | ModifierKeys.Shift) && (vk == 'N' || vk == 'C')) ||
+                    (mods == ModifierKeys.Control && vk == 0x0D);
+                return;
+            }
             bool inWpfTextBox = !(_selectedTab?.BrowserHost.IsNativeFocusInside() ?? false) &&
                                (AddressTextBox.IsKeyboardFocusWithin ||
                                 SearchTextBox.IsKeyboardFocusWithin ||
@@ -1699,7 +1729,7 @@ namespace LeafTab.Views
                     handled = true;
                     return;
                 }
-                if (vk == 'D')
+                if (vk == 'D' && !inWpfTextBox)
                 {
                     ToggleBookmarkForCurrentFolder();
                     handled = true;
@@ -1969,6 +1999,30 @@ namespace LeafTab.Views
 
                 e.Handled = true;
                 _ = MoveTabToNewWindowAsync(candidate, dropTopLeftDip);
+            }
+        }
+
+        private void TabPill_LostMouseCapture(object sender, MouseEventArgs e) =>
+            CancelTabReorder(sender as FrameworkElement);
+
+        private void CancelTabReorder(FrameworkElement? pill)
+        {
+            _tabReorderCandidate = null;
+            _isReorderingTab = false;
+            _isTabTearOutArmed = false;
+            if (pill != null)
+            {
+                pill.Cursor = null;
+                if (pill.IsMouseCaptured) pill.ReleaseMouseCapture();
+            }
+        }
+
+        private void BookmarkScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (sender is ScrollViewer scroll && scroll.ScrollableWidth > 0)
+            {
+                scroll.ScrollToHorizontalOffset(scroll.HorizontalOffset - e.Delta);
+                e.Handled = true;
             }
         }
 
@@ -2734,7 +2788,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.8";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.9";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",
@@ -2756,10 +2810,25 @@ namespace LeafTab.Views
 
         private void RefreshAllTabs()
         {
+            FastFileSearchService.Shared.InvalidateCache();
+            var windows = App.CurrentApp?.ManagedWindows.Where(w => !w.IsClosingOrClosed).ToArray()
+                ?? new[] { this };
+            if (!windows.Contains(this)) windows = windows.Concat(new[] { this }).ToArray();
+            foreach (MainWindow window in windows) window.RefreshTabsForShellSettings();
+        }
+
+        private void RefreshTabsForShellSettings()
+        {
             _lastPreviewSelectionKey = string.Empty;
             foreach (ExplorerTabItem tab in _tabs)
             {
-                tab.BrowserHost.RefreshView();
+                if (tab.BrowserHost.IsShowingSearchResults && !string.IsNullOrWhiteSpace(tab.SearchQuery))
+                {
+                    string query = tab.SearchQuery;
+                    tab.BrowserHost.RefreshBrowseView();
+                    _ = ExecuteSearchOnTabAsync(tab, query);
+                }
+                else tab.BrowserHost.RefreshView();
             }
             UpdateCommandBarAndStatus(computeBytes: true);
             if (_showPreviewPane && _selectedTab != null)

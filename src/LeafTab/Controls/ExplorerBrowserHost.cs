@@ -203,6 +203,7 @@ namespace LeafTab.Controls
             _pendingInitialPidl = PidlManager.Clone(initialPidl);
             _showPreviewPane = showPreviewPane;
             _directUiSubclassDelegate = DirectUiSubclassProc;
+            _navigationTreeSubclassDelegate = NavigationTreeSubclassProc;
             _browseViewLayoutSubclassDelegate = BrowseViewLayoutSubclassProc;
             Focusable = true;
         }
@@ -399,6 +400,8 @@ namespace LeafTab.Controls
 
         private void DestroyPrimaryBrowserOnly()
         {
+            CancelPendingWpfEditorFocus();
+            DetachNavigationTreeFocusObserver();
             DetachBrowseViewLayoutSubclass();
             DetachDirectUiSubclass();
 
@@ -458,7 +461,14 @@ namespace LeafTab.Controls
 
             InvalidateSelectionCache();
 
+            TrackExternalNavigationPending(pidl, newRequest: true);
+            int requestedNavigation = _externalNavigationSerial;
             int hr = _browser.BrowseToIDList(pidl, ShellConstants.SBSP_ABSOLUTE | ShellConstants.SBSP_SAMEBROWSER);
+            if (hr != ShellConstants.S_OK && requestedNavigation == _externalNavigationSerial)
+            {
+                _externalNavigationPending = false;
+                _externalNavigationFailed = true;
+            }
             return hr == ShellConstants.S_OK;
         }
 
@@ -489,7 +499,13 @@ namespace LeafTab.Controls
         public void RefreshView()
         {
             FastFileSearchService.Shared.InvalidateCache();
-            IExplorerBrowser? active = ActiveBrowser;
+            RefreshBrowserView(ActiveBrowser);
+        }
+
+        internal void RefreshBrowseView() => RefreshBrowserView(_browser);
+
+        private void RefreshBrowserView(IExplorerBrowser? active)
+        {
             if (_isDestroyed || active == null) return;
             InvalidateSelectionCache();
 
@@ -550,14 +566,11 @@ namespace LeafTab.Controls
                     if (!computeBytes)
                         return new SelectionStatusInfo(total, selected, _cachedSelectedBytes, _cachedHasSizedSelection);
 
-                    bool missingSingleMeta = selected == 1 &&
-                                             _cachedSingleSelectedPath == null &&
-                                             _cachedSingleSelectedDisplayName == null;
-
-                    if (total == _cachedTotalItems &&
+                    // A rename can preserve both the item count and focused
+                    // index. Re-read the one selected item's current identity.
+                    if (selected != 1 && total == _cachedTotalItems &&
                         selected == _cachedSelectedItems &&
-                        focused == _cachedFocusedItem &&
-                        !missingSingleMeta)
+                        focused == _cachedFocusedItem)
                     {
                         return new SelectionStatusInfo(total, selected, _cachedSelectedBytes, _cachedHasSizedSelection);
                     }
@@ -914,6 +927,11 @@ namespace LeafTab.Controls
             }
 
             string dir = folderFileSystemPath!;
+            int navigationSerial = _externalNavigationSerial;
+            // Starting a creation is an explicit request to edit its result,
+            // even when the toolbar was clicked from the search/preview editor.
+            // Establish that intent now; never restore it after an async wait.
+            FocusNativeView();
             string baseName;
             string ext;
 
@@ -1004,9 +1022,24 @@ namespace LeafTab.Controls
 
                 RefreshView();
                 await Task.Delay(120).ConfigureAwait(true);
-                FocusNativeView();
-                TrySelectChildByName(createdName, beginRename: true);
-                InvalidateSelectionCache();
+                if (!_isDestroyed && navigationSerial == _externalNavigationSerial && !_isShowingSearchResults)
+                {
+                    // The user may already have navigated or started typing in
+                    // another editor while the Shell was enumerating the item.
+                    IntPtr focused = NativeMethods.GetFocus();
+                    bool rename = CanReceiveKeyboardFocus &&
+                        (focused == _hostHwnd || focused == _subclassedDirectUiHwnd);
+                    if (rename)
+                    {
+                        FocusNativeView();
+                        // Resolve/verify the selected child before opening its
+                        // editor. Re-selecting while SVSI_EDIT is active can
+                        // commit the newly created editor on some Shell views.
+                        if (TrySelectChildByName(createdName, beginRename: false))
+                            TryBeginInlineRename();
+                        InvalidateSelectionCache();
+                    }
+                }
                 return (true, $"已创建 {createdName}");
             }
             catch (Exception ex)
@@ -1559,6 +1592,13 @@ namespace LeafTab.Controls
             var sv = (IShellView)Marshal.GetObjectForIUnknown(psv);
             try
             {
+                // The navigation tree belongs to the browser frame, not this
+                // file view. Never offer its shortcuts to the selected files.
+                if (focusedWindow != _hostHwnd &&
+                    (sv.GetWindow(out IntPtr viewHwnd) != ShellConstants.S_OK || viewHwnd == IntPtr.Zero ||
+                     (focusedWindow != viewHwnd && !NativeMethods.IsChild(viewHwnd, focusedWindow))))
+                    return false;
+
                 var nativeMsg = new NATIVE_MSG
                 {
                     hwnd = wpfMsg.hwnd,
@@ -1623,7 +1663,8 @@ namespace LeafTab.Controls
         private void OnNativeNavigationComplete(IntPtr pidlFolder)
         {
             if (_isDestroyed) return;
-            TrackExternalNavigationComplete(pidlFolder);
+            if (!TrackExternalNavigationComplete(pidlFolder)) return;
+            int navigationSerial = _externalNavigationSerial;
             _viewGeneration++;
             _isKeyboardFocusActive = false;
             _isMouseDownInView = false;
@@ -1649,7 +1690,8 @@ namespace LeafTab.Controls
             {
                 try
                 {
-                    if (!_isDestroyed)
+                    if (!_isDestroyed && navigationSerial == _externalNavigationSerial &&
+                        IsFolderNavigationComplete(cloned))
                     {
                         SyncBrowserRect();
                         AttachDirectUiSubclassIfNeeded();
@@ -1668,6 +1710,8 @@ namespace LeafTab.Controls
         private void OnNativeNavigationFailed(IntPtr pidlFolder)
         {
             if (_isDestroyed) return;
+            if (_externalPendingPidl != IntPtr.Zero &&
+                !PidlManager.AreEqual(_externalPendingPidl, pidlFolder)) return;
             _externalNavigationPending = false;
             _externalNavigationFailed = true;
             _externalSelectionSerial++;
@@ -1683,6 +1727,8 @@ namespace LeafTab.Controls
         {
             if (_isDestroyed || _hostHwnd == IntPtr.Zero)
                 return;
+
+            AttachNavigationTreeFocusObserver();
 
             IntPtr searchRoot = GetShellViewWindowHandle();
             if (searchRoot == IntPtr.Zero)
@@ -1773,6 +1819,9 @@ namespace LeafTab.Controls
             UIntPtr uIdSubclass,
             UIntPtr dwRefData)
         {
+            if (uMsg == NativeMethods.WM_LBUTTONDOWN || uMsg == NativeMethods.WM_RBUTTONDOWN ||
+                uMsg == NativeMethods.WM_MBUTTONDOWN)
+                CancelPendingWpfEditorFocus();
             if (uMsg == NativeMethods.WM_NCDESTROY)
             {
                 NativeMethods.RemoveWindowSubclass(hWnd, _directUiSubclassDelegate, DirectUiSubclassId);
@@ -1831,8 +1880,9 @@ namespace LeafTab.Controls
             IntPtr result = NativeMethods.DefSubclassProc(hWnd, uMsg, wParam, lParam);
             if (uMsg == NativeMethods.WM_LBUTTONDOWN ||
                 uMsg == NativeMethods.WM_RBUTTONDOWN ||
-                uMsg == NativeMethods.WM_MBUTTONDOWN ||
-                uMsg == NativeMethods.WM_SETFOCUS)
+                uMsg == NativeMethods.WM_MBUTTONDOWN)
+                RememberFocusAfterNativePointerDown(hWnd);
+            else if (uMsg == NativeMethods.WM_SETFOCUS)
                 RememberFocusAfterNativeInput();
 
             if (checkFocusParkAfter && !_isDestroyed)

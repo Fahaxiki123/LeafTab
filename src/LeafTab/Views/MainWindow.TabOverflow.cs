@@ -30,7 +30,7 @@ namespace LeafTab.Views
             var menu = CreateLiquidGlassContextMenu(TabsOverflowButton);
             foreach (var tab in _tabs)
             {
-                var item = new MenuItem { Header = tab.Title, ToolTip = tab.ToolTipText, IsChecked = ReferenceEquals(tab, _selectedTab) };
+                var item = new MenuItem { Header = tab.Title.Replace("_", "__"), ToolTip = tab.ToolTipText, IsChecked = ReferenceEquals(tab, _selectedTab) };
                 item.Click += (_, _) => ActivateTab(tab);
                 menu.Items.Add(item);
             }

@@ -128,6 +128,7 @@ namespace LeafTab
                 if (restored)
                 {
                     using var quitClient = new SingleInstanceService();
+                    quitClient.SignalExit(ShellIntegrationService.GetCurrentExecutablePath());
                     if (!quitClient.TryAcquirePrimaryInstance())
                     {
                         quitClient.TryForwardToPrimary(new LaunchActionRequest { IsQuitProcess = true }, timeoutMs: 1500,
@@ -156,9 +157,11 @@ namespace LeafTab
             if (req.IsQuitProcess)
             {
                 using var quitClient = new SingleInstanceService();
+                string? quitScope = req.QuitCurrentExecutableOnly ? ShellIntegrationService.GetCurrentExecutablePath() : null;
+                quitClient.SignalExit(quitScope);
                 if (!quitClient.TryAcquirePrimaryInstance())
                 {
-                    quitClient.TryForwardToPrimary(req, timeoutMs: 1500);
+                    quitClient.TryForwardToPrimary(req, timeoutMs: 1500, expectedExecutablePath: quitScope);
                 }
                 Environment.Exit(0);
                 return;
@@ -203,6 +206,8 @@ namespace LeafTab
             if (!_isSelfTest)
             {
                 _singleInstance = new SingleInstanceService();
+                _singleInstance.StartExitListening(ShellIntegrationService.GetCurrentExecutablePath(),
+                    () => Dispatcher.BeginInvoke(new Action(ForceExitAllWindows)));
                 int acquireWaitMs = req.WaitMutexHandoff ? 2000 : 0;
                 if (!_singleInstance.TryAcquirePrimaryInstance(acquireWaitMs))
                 {
@@ -213,10 +218,10 @@ namespace LeafTab
                     }
 
                     bool forwarded = _singleInstance.TryForwardToPrimary(req, timeoutMs: 2500);
-                    _singleInstance.Dispose();
-                    _singleInstance = null;
                     if (forwarded || req.IsBackgroundWarmup)
                     {
+                        _singleInstance.Dispose();
+                        _singleInstance = null;
                         Environment.Exit(0);
                         return;
                     }
@@ -414,7 +419,7 @@ namespace LeafTab
 
         internal bool ShouldWindowEnterWarmStandby(MainWindow closingWindow)
         {
-            if (_isSelfTest || _isShuttingDownAll)
+            if (_isSelfTest || _isShuttingDownAll || !_isPrimaryInstance)
                 return false;
 
             // Only the LAST remaining visible window enters Warm Standby; secondary windows close & dispose cleanly!

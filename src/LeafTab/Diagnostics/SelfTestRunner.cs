@@ -114,7 +114,7 @@ namespace LeafTab.Diagnostics
                 long exeBytes = File.Exists(exePath) ? new FileInfo(exePath).Length : 0;
                 string projectDir = ResolveProjectDirectory();
 
-                log.AppendLine("# LeafTab v0.6.8 Native Regression Diagnostics");
+                log.AppendLine("# LeafTab v0.6.9 Native Regression Diagnostics");
                 log.AppendLine($"- Timestamp: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
                 log.AppendLine($"- OSVersion: {Environment.OSVersion} (64BitOS={Environment.Is64BitOperatingSystem}, 64BitProc={Environment.Is64BitProcess})");
                 log.AppendLine($"- CLR Version: {Environment.Version}");
@@ -692,7 +692,8 @@ namespace LeafTab.Diagnostics
 
                 LaunchActionRequest pQuote = LaunchRequestParser.Parse(new[] { "D:\"", "C:\\ " });
                 LaunchActionRequest pSelect = LaunchRequestParser.Parse(new[] { "/n,/select,D:\\Work, 2026\\report.pdf" });
-                LaunchActionRequest pExplorerClsid = LaunchRequestParser.Parse(new[] { "::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", @"C:\Users\Public\File Explorer.lnk" });
+                string nonLauncherPath = Path.Combine(Path.GetTempPath(), "LeafTab-non-launcher-" + Guid.NewGuid().ToString("N"), "File Explorer.lnk");
+                LaunchActionRequest pExplorerClsid = LaunchRequestParser.Parse(new[] { "::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", nonLauncherPath });
                 LaunchActionRequest pBgQuit = LaunchRequestParser.Parse(new[] { "--background", "--quit", "--new-window", "--handoff" });
                 string slnFile = Path.Combine(projectDir, "LeafTab.sln");
                 string csprojFile = Path.Combine(projectDir, "src", "LeafTab", "LeafTab.csproj");
@@ -710,7 +711,7 @@ namespace LeafTab.Diagnostics
                                 pDirectFile.Targets[0].SelectItemName == "LeafTab.sln" &&
                                 pExplorerClsid.Targets.Count == 2 &&
                                 pExplorerClsid.Targets[0].FolderOrAlias == "此电脑" &&
-                                pExplorerClsid.Targets[1].FolderOrAlias == "此电脑" &&
+                                pExplorerClsid.Targets[1].FolderOrAlias == nonLauncherPath &&
                                 pBgQuit.IsBackgroundWarmup &&
                                 pBgQuit.IsQuitProcess &&
                                 pBgQuit.OpenInNewWindow &&

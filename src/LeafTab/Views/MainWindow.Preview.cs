@@ -51,7 +51,7 @@ namespace LeafTab.Views
             {
                 RenderLoadedPreviewData(_currentPreviewData, _currentPreviewData.HeaderIcon ?? PreviewHeaderIcon.Source);
             }
-            RestoreNativeFocusFromPreviewChrome();
+            RestoreNativeFocusFromPreviewChrome(force: true);
         }
 
         private void PreviewGridSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
@@ -62,23 +62,36 @@ namespace LeafTab.Views
                 ScheduleSessionSave();
             }
             _selectedTab?.BrowserHost.SyncBrowserRect();
-            RestoreNativeFocusFromPreviewChrome();
+            RestoreNativeFocusFromPreviewChrome(force: true);
         }
 
         private void PreviewSidebarBorder_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
-            if (e.Handled)
+            if (e.Handled || IsInteractivePreviewSource(e.OriginalSource as DependencyObject))
                 return;
 
             // A click on non-text preview content explicitly leaves the previous
             // editor. Handle it now, before a later input can choose another target.
-            RestoreNativeFocusFromPreviewChrome();
+            RestoreNativeFocusFromPreviewChrome(force: true);
         }
 
-        private void RestoreNativeFocusFromPreviewChrome()
+        private bool IsInteractivePreviewSource(DependencyObject? source)
         {
-            if (!_isClosingWindow &&
-                !IsPreviewContentFocused())
+            for (DependencyObject? current = source; current != null && !ReferenceEquals(current, PreviewSidebarBorder);)
+            {
+                if (ReferenceEquals(current, PreviewTextBox) || ReferenceEquals(current, PreviewDocumentViewer) ||
+                    current is ButtonBase || current is Thumb || current is ScrollBar) return true;
+                current = current is FrameworkContentElement content ? content.Parent
+                    : (current is Visual || current is System.Windows.Media.Media3D.Visual3D
+                        ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current));
+            }
+            return false;
+        }
+
+        private void RestoreNativeFocusFromPreviewChrome(bool force = false)
+        {
+            if (!_isClosingWindow && !AddressTextBox.IsKeyboardFocusWithin && !SearchTextBox.IsKeyboardFocusWithin &&
+                (force || !IsPreviewContentFocused()))
             {
                 _selectedTab?.BrowserHost.FocusNativeView();
             }
@@ -123,10 +136,17 @@ namespace LeafTab.Views
 
         private double ComputePreviewMaxWidth()
         {
-            double refWidth = ActualWidth > 400
-                ? ActualWidth
-                : (!double.IsNaN(Width) && Width > 400 ? Width : 1160);
+            double refWidth = ContentSurfaceGrid.ActualWidth > 400 ? ContentSurfaceGrid.ActualWidth
+                : (ActualWidth > 400 ? ActualWidth : (!double.IsNaN(Width) && Width > 400 ? Width : 1160));
             return Math.Max(220, Math.Min(refWidth * 0.55, refWidth - 330));
+        }
+
+        private void UpdatePreviewPaneWidthForAvailableSpace()
+        {
+            if (!_showPreviewPane) return;
+            double maxWidth = ComputePreviewMaxWidth();
+            PreviewPaneColumn.MaxWidth = maxWidth;
+            PreviewPaneColumn.Width = new GridLength(Math.Max(220, Math.Min(_previewPaneWidthDip, maxWidth)));
         }
 
         private void ApplyPreviewPaneLayout()
@@ -211,6 +231,7 @@ namespace LeafTab.Views
             PreviewMetadataScroll.Visibility = ReferenceEquals(activeElement, PreviewMetadataScroll) ? Visibility.Visible : Visibility.Collapsed;
 
             if (hadPreviewTextFocus &&
+                !(_selectedTab?.BrowserHost.IsNativeFocusInside() ?? false) &&
                 !ReferenceEquals(activeElement, PreviewTextBox) &&
                 !ReferenceEquals(activeElement, PreviewDocumentViewer) &&
                 !AddressTextBox.IsKeyboardFocusWithin &&

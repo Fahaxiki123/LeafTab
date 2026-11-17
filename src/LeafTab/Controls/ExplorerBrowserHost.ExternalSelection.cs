@@ -19,8 +19,13 @@ namespace LeafTab.Controls
 
         public event EventHandler? NavigationStarting;
 
-        private void TrackExternalNavigationPending(IntPtr pidl)
+        private void TrackExternalNavigationPending(IntPtr pidl, bool newRequest = false)
         {
+            // BrowseToIDList can pump queued callbacks before raising Pending.
+            // Explicit requests register before entering COM; their matching
+            // native notification must not start a second navigation generation.
+            if (!newRequest && _externalNavigationPending && _externalPendingPidl != IntPtr.Zero &&
+                PidlManager.AreEqual(_externalPendingPidl, pidl)) return;
             _externalNavigationSerial++;
             _externalSelectionSerial++;
             _externalNavigationPending = true;
@@ -30,12 +35,15 @@ namespace LeafTab.Controls
             NavigationStarting?.Invoke(this, EventArgs.Empty);
         }
 
-        private void TrackExternalNavigationComplete(IntPtr pidl)
+        private bool TrackExternalNavigationComplete(IntPtr pidl)
         {
+            if (_externalPendingPidl != IntPtr.Zero &&
+                !PidlManager.AreEqual(_externalPendingPidl, pidl)) return false;
             _externalNavigationPending = false;
             _externalNavigationFailed = false;
             PidlManager.Free(ref _externalCompletedPidl);
             _externalCompletedPidl = PidlManager.Clone(pidl);
+            return true;
         }
 
         // A browser accepting BrowseToIDList is not proof that the folder is open.

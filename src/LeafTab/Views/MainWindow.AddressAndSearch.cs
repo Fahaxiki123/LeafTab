@@ -19,6 +19,9 @@ namespace LeafTab.Views
 {
     public partial class MainWindow
     {
+        private Task _addressSuggestionsTask = Task.CompletedTask;
+        private string? _addressSuggestionsInput;
+        private int _addressCompletionVersion;
         // ==================== NAVIGATION & INTERACTIVE BREADCRUMB BAR ====================
 
         private void BackButton_Click(object sender, RoutedEventArgs e)
@@ -291,7 +294,7 @@ namespace LeafTab.Views
                 {
                     var mi = new MenuItem
                     {
-                        Header = child.Title,
+                        Header = child.Title.Replace("_", "__"),
                         Tag = child,
                         Icon = CreateMenuIcon(child.Icon)
                     };
@@ -408,20 +411,25 @@ namespace LeafTab.Views
             AddressBoxBorder.BorderBrush = UiBrushes.Get(Color.FromArgb(0xB8, 0x00, 0x7A, 0xFF));
             AddressBoxBorder.BorderThickness = new Thickness(1.4);
 
-            IntPtr mainHwnd = new WindowInteropHelper(this).Handle;
-            IntPtr curWin32Focus = mainHwnd != IntPtr.Zero ? NativeMethods.GetFocus() : IntPtr.Zero;
-            if (mainHwnd != IntPtr.Zero &&
-                curWin32Focus != IntPtr.Zero &&
-                curWin32Focus != mainHwnd &&
-                NativeMethods.IsChild(mainHwnd, curWin32Focus))
+            bool selectAllOnFirstFocus = true;
+            void FocusAddressEditor()
             {
-                NativeMethods.SetFocus(mainHwnd);
+                int selectionStart = AddressTextBox.SelectionStart;
+                int selectionLength = AddressTextBox.SelectionLength;
+                // Let WPF acquire the HWND focus together with keyboard focus.
+                // A raw SetFocus(root) restores its previously focused native
+                // child and can reopen the file-list focus after a rename.
+                AddressEditGrid.UpdateLayout();
+                AddressTextBox.Focus();
+                Keyboard.Focus(AddressTextBox);
+                if (selectAllOnFirstFocus) AddressTextBox.SelectAll();
+                else AddressTextBox.Select(selectionStart, selectionLength);
+                // The Shell's delayed focus handoff must not select text that
+                // the user already typed after the first focus request.
+                selectAllOnFirstFocus = false;
             }
-
-            AddressEditGrid.UpdateLayout();
-            AddressTextBox.Focus();
-            Keyboard.Focus(AddressTextBox);
-            AddressTextBox.SelectAll();
+            if (_selectedTab != null) _selectedTab.BrowserHost.MoveFocusToWpfEditor(FocusAddressEditor);
+            else FocusAddressEditor();
 
             if (!_skipSessionPersistence && IsActive)
             {
@@ -431,7 +439,13 @@ namespace LeafTab.Views
 
         public void ExitAddressEditMode()
         {
+            _selectedTab?.BrowserHost.CancelPendingWpfEditorFocus();
+            _addressCompletionVersion++;
+            _addressParseCts?.Cancel();
+            AddressBusyIndicator.Visibility = Visibility.Collapsed;
             _addressSuggestCts?.Cancel();
+            _addressSuggestionsInput = null;
+            AddressSuggestListBox.ItemsSource = null;
             AddressSuggestPopup.IsOpen = false;
             AddressEditGrid.Visibility = Visibility.Collapsed;
             BreadcrumbContainerGrid.Visibility = Visibility.Visible;
@@ -440,7 +454,10 @@ namespace LeafTab.Views
             AddressBoxBorder.BorderThickness = new Thickness(1);
         }
 
-        private async void RefreshAddressSuggestions(bool showDefaultHistory)
+        private void RefreshAddressSuggestions(bool showDefaultHistory) =>
+            _addressSuggestionsTask = RefreshAddressSuggestionsAsync(showDefaultHistory);
+
+        private async Task RefreshAddressSuggestionsAsync(bool showDefaultHistory)
         {
             if (AddressEditGrid.Visibility != Visibility.Visible || _isClosingWindow)
             {
@@ -462,11 +479,15 @@ namespace LeafTab.Views
             _addressSuggestCts = new CancellationTokenSource();
             CancellationToken token = _addressSuggestCts.Token;
             string text = AddressTextBox.Text;
+            _addressSuggestionsInput = null;
+            AddressSuggestListBox.ItemsSource = null;
             try
             {
                 var suggestions = await QuickLaunchAndInstallService.BuildAddressSuggestionsAsync(
                     text, showDefaultHistory, _recentFolders.ToArray(), bookmarkPaths, token);
-                if (token.IsCancellationRequested || _isClosingWindow || AddressEditGrid.Visibility != Visibility.Visible) return;
+                if (token.IsCancellationRequested || _isClosingWindow || AddressEditGrid.Visibility != Visibility.Visible ||
+                    !string.Equals(text, AddressTextBox.Text, StringComparison.Ordinal)) return;
+                _addressSuggestionsInput = text;
                 AddressSuggestListBox.ItemsSource = suggestions;
                 AddressSuggestListBox.SelectedIndex = -1;
                 AddressSuggestPopup.IsOpen = suggestions.Count > 0 && IsActive;
@@ -482,6 +503,8 @@ namespace LeafTab.Views
             {
                 AddressTextBox.Text = text ?? string.Empty;
                 AddressTextBox.CaretIndex = AddressTextBox.Text.Length;
+                // Arrow-key cycling still belongs to this same suggestion list.
+                _addressSuggestionsInput = AddressTextBox.Text;
             }
             finally
             {
@@ -511,75 +534,51 @@ namespace LeafTab.Views
                 return;
             }
 
+            _addressCompletionVersion++;
+            _addressParseCts?.Cancel();
+            AddressBusyIndicator.Visibility = Visibility.Collapsed;
             RefreshAddressSuggestions(showDefaultHistory: false);
         }
 
-        private void AddressTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
+        private async void AddressTextBox_PreviewKeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Key == Key.Down)
+            bool completing = e.Key == Key.Tab && (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt)) == 0;
+            if (!completing && e.Key != Key.Down && !(e.Key == Key.Up && AddressSuggestPopup.IsOpen)) return;
+            // Mark handled before awaiting: WPF must not move focus while completion is pending.
+            e.Handled = true;
+            await ApplyAddressSuggestionAsync(e.Key, completing && Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
+        }
+
+        private async Task ApplyAddressSuggestionAsync(Key key, bool reverse = false)
+        {
+            int version = ++_addressCompletionVersion;
+            string input = AddressTextBox.Text;
+            if (_addressSuggestionsTask.IsCompleted &&
+                (!AddressSuggestPopup.IsOpen || !string.Equals(_addressSuggestionsInput, input, StringComparison.Ordinal)))
             {
-                if (!AddressSuggestPopup.IsOpen)
-                {
-                    bool useDefault = string.IsNullOrWhiteSpace(AddressTextBox.Text) ||
-                                      string.Equals(AddressTextBox.Text, _selectedTab?.AddressText, StringComparison.OrdinalIgnoreCase);
-                    RefreshAddressSuggestions(showDefaultHistory: useDefault);
-                }
-
-                if (AddressSuggestListBox.Items.Count > 0)
-                {
-                    int next = (AddressSuggestListBox.SelectedIndex + 1) % AddressSuggestListBox.Items.Count;
-                    AddressSuggestListBox.SelectedIndex = next;
-                    AddressSuggestListBox.ScrollIntoView(AddressSuggestListBox.SelectedItem);
-                    if (AddressSuggestListBox.SelectedItem is AddressSuggestionItem sel)
-                    {
-                        SetAddressTextFromSuggestion(sel.InsertText);
-                    }
-                    e.Handled = true;
-                }
-                return;
+                bool history = key != Key.Tab && (string.IsNullOrWhiteSpace(input) ||
+                    string.Equals(input, _selectedTab?.AddressText, StringComparison.OrdinalIgnoreCase));
+                RefreshAddressSuggestions(history);
             }
-
-            if (e.Key == Key.Up && AddressSuggestPopup.IsOpen && AddressSuggestListBox.Items.Count > 0)
-            {
-                int count = AddressSuggestListBox.Items.Count;
-                int prev = AddressSuggestListBox.SelectedIndex <= 0
-                    ? count - 1
-                    : AddressSuggestListBox.SelectedIndex - 1;
-                AddressSuggestListBox.SelectedIndex = prev;
-                AddressSuggestListBox.ScrollIntoView(AddressSuggestListBox.SelectedItem);
-                if (AddressSuggestListBox.SelectedItem is AddressSuggestionItem sel)
-                {
-                    SetAddressTextFromSuggestion(sel.InsertText);
-                }
-                e.Handled = true;
-                return;
-            }
-
-            if (e.Key == Key.Tab && Keyboard.Modifiers == ModifierKeys.None)
-            {
-                if (!AddressSuggestPopup.IsOpen)
-                {
-                    RefreshAddressSuggestions(showDefaultHistory: false);
-                }
-
-                AddressSuggestionItem? candidate = AddressSuggestListBox.SelectedItem as AddressSuggestionItem
-                    ?? (AddressSuggestListBox.Items.Count > 0 ? AddressSuggestListBox.Items[0] as AddressSuggestionItem : null);
-
-                if (candidate != null)
-                {
-                    string completed = candidate.InsertText;
-                    if (!candidate.IsCommand &&
-                        Directory.Exists(completed) &&
-                        !completed.EndsWith("\\", StringComparison.Ordinal))
-                    {
-                        completed += "\\";
-                    }
-
-                    SetAddressTextFromSuggestion(completed);
-                    RefreshAddressSuggestions(showDefaultHistory: false);
-                    e.Handled = true;
-                }
-            }
+            await _addressSuggestionsTask;
+            if (version != _addressCompletionVersion || _isClosingWindow ||
+                AddressEditGrid.Visibility != Visibility.Visible ||
+                !string.Equals(input, AddressTextBox.Text, StringComparison.Ordinal) ||
+                !string.Equals(_addressSuggestionsInput, input, StringComparison.Ordinal)) return;
+            int count = AddressSuggestListBox.Items.Count;
+            if (count == 0) return;
+            int index = AddressSuggestListBox.SelectedIndex;
+            if (key == Key.Up || reverse) index = index <= 0 ? count - 1 : index - 1;
+            else if (key == Key.Down) index = (index + 1) % count;
+            else if (index < 0) index = 0;
+            AddressSuggestListBox.SelectedIndex = index;
+            AddressSuggestListBox.ScrollIntoView(AddressSuggestListBox.SelectedItem);
+            if (AddressSuggestListBox.SelectedItem is not AddressSuggestionItem candidate) return;
+            string completed = candidate.InsertText;
+            if (key == Key.Tab && !candidate.IsCommand && Path.IsPathRooted(completed) &&
+                !completed.EndsWith("\\", StringComparison.Ordinal)) completed += "\\";
+            SetAddressTextFromSuggestion(completed);
+            if (key == Key.Tab) RefreshAddressSuggestions(showDefaultHistory: false);
         }
 
         private async void AddressSuggestItem_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -601,6 +600,8 @@ namespace LeafTab.Views
 
         private void AddressTextBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
         {
+            if (e.NewFocus == null && _selectedTab?.BrowserHost.HasPendingWpfEditorFocus == true)
+                return;
             ExitAddressEditMode();
         }
 
@@ -657,7 +658,8 @@ namespace LeafTab.Views
             try
             {
                 (IntPtr pidl, string? error) = await PidlManager.TryParseAddressAsync(inputText, token);
-                if (token.IsCancellationRequested || _isClosingWindow || !_tabs.Contains(targetTab))
+                if (token.IsCancellationRequested || reqId != _addressNavRequestId || _isClosingWindow ||
+                    !_tabs.Contains(targetTab) || !ReferenceEquals(_selectedTab, targetTab))
                 {
                     PidlManager.Free(ref pidl);
                     return false;
@@ -781,6 +783,17 @@ namespace LeafTab.Views
             {
                 await ExecuteSearchOnTabAsync(target, target.SearchQuery);
             }
+        }
+
+        private void CancelSearchForNavigation(ExplorerTabItem tab)
+        {
+            if (ReferenceEquals(_pendingSearchTab, tab))
+            {
+                _searchDebounceTimer.Stop();
+                _pendingSearchTab = null;
+            }
+            tab.SearchQuery = string.Empty;
+            if (ReferenceEquals(_selectedTab, tab)) SetSearchBoxTextSilently(string.Empty);
         }
 
         private async void SearchTextBox_KeyDown(object sender, KeyEventArgs e)

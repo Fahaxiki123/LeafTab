@@ -714,15 +714,41 @@ namespace LeafTab.Services
 
                 if (ch == '`')
                 {
-                    int close = text.IndexOf('`', i + 1);
-                    if (close > i)
+                    int delimiterLength = 1;
+                    while (i + delimiterLength < text.Length && text[i + delimiterLength] == '`') delimiterLength++;
+                    int close = FindCodeSpanEnd(text, i + delimiterLength, delimiterLength);
+                    if (close >= 0)
                     {
                         if (!FlushPlain() || !budget.TryConsumeInlineNodes(2))
                             break;
-                        string code = text.Substring(i + 1, close - (i + 1));
+                        string code = text.Substring(i + delimiterLength, close - i - delimiterLength).Replace('\n', ' ');
+                        if (code.Length >= 2 && code[0] == ' ' && code[code.Length - 1] == ' ' && code.Trim(' ').Length > 0)
+                            code = code.Substring(1, code.Length - 2);
                         nodes.Add(new MdInlineNode(MdInlineKind.InlineCode, code));
-                        i = close + 1;
+                        i = close + delimiterLength;
                         continue;
+                    }
+                    plainBuffer.Append('`', delimiterLength);
+                    i += delimiterLength;
+                    continue;
+                }
+
+                if (allowLinks && ch == '<')
+                {
+                    int end = text.IndexOf('>', i + 1);
+                    if (end > i + 1)
+                    {
+                        string url = text.Substring(i + 1, end - i - 1);
+                        if (url.IndexOfAny(new[] { ' ', '\t', '\r', '\n' }) < 0 &&
+                            Uri.TryCreate(url, UriKind.Absolute, out Uri? autoUri) &&
+                            (autoUri.Scheme == Uri.UriSchemeHttp || autoUri.Scheme == Uri.UriSchemeHttps))
+                        {
+                            if (!FlushPlain() || !budget.TryConsumeInlineNodes(2)) break;
+                            nodes.Add(new MdInlineNode(MdInlineKind.Link, url, url,
+                                new[] { new MdInlineNode(MdInlineKind.Plain, url) }));
+                            i = end + 1;
+                            continue;
+                        }
                     }
                 }
 
@@ -1255,7 +1281,9 @@ namespace LeafTab.Services
                         }
                         else
                         {
-                            target.Add(new Run(node.Text) { Foreground = LinkBrush });
+                            if (node.Children != null && node.Children.Length > 0)
+                                MaterializeInlines(target, node.Children, onHyperlinkNavigate, ref remainingInlines);
+                            else target.Add(new Run(node.Text) { Foreground = LinkBrush });
                         }
                         break;
 
@@ -1583,6 +1611,20 @@ namespace LeafTab.Services
             return idx;
         }
 
+        private static int FindCodeSpanEnd(string text, int start, int delimiterLength)
+        {
+            for (int pos = start; pos < text.Length;)
+            {
+                int found = text.IndexOf('`', pos);
+                if (found < 0) return -1;
+                int length = 1;
+                while (found + length < text.Length && text[found + length] == '`') length++;
+                if (length == delimiterLength) return found;
+                pos = found + length;
+            }
+            return -1;
+        }
+
         private static bool TryParseBracketUrl(string text, int openBracketIdx, out string label, out string url, out int afterIndex)
         {
             label = string.Empty;
@@ -1619,6 +1661,10 @@ namespace LeafTab.Services
 
             int closeParen = -1;
             int parenDepth = 1;
+            char quote = '\0';
+            bool angle = false;
+            int destinationStart = closeBracket + 2;
+            while (destinationStart < text.Length && char.IsWhiteSpace(text[destinationStart])) destinationStart++;
             for (int k = closeBracket + 2; k < text.Length; k++)
             {
                 if (text[k] == '\\' && k + 1 < text.Length)
@@ -1626,6 +1672,11 @@ namespace LeafTab.Services
                     k++;
                     continue;
                 }
+                if (quote != '\0') { if (text[k] == quote) quote = '\0'; continue; }
+                if (angle) { if (text[k] == '>') angle = false; continue; }
+                if (text[k] == '<' && k == destinationStart) { angle = true; continue; }
+                if ((text[k] == '"' || text[k] == '\'') && k > closeBracket + 2 && char.IsWhiteSpace(text[k - 1]))
+                { quote = text[k]; continue; }
                 if (text[k] == '(')
                     parenDepth++;
                 else if (text[k] == ')')
@@ -1643,7 +1694,26 @@ namespace LeafTab.Services
                 return false;
 
             label = text.Substring(openBracketIdx + 1, closeBracket - (openBracketIdx + 1));
-            url = text.Substring(closeBracket + 2, closeParen - (closeBracket + 2));
+            string destination = text.Substring(closeBracket + 2, closeParen - (closeBracket + 2)).Trim();
+            int destinationEnd;
+            if (destination.StartsWith("<", StringComparison.Ordinal))
+            {
+                destinationEnd = destination.IndexOf('>');
+                if (destinationEnd < 0) return false;
+                url = destination.Substring(1, destinationEnd - 1);
+                destinationEnd++;
+            }
+            else
+            {
+                destinationEnd = 0;
+                while (destinationEnd < destination.Length && !char.IsWhiteSpace(destination[destinationEnd])) destinationEnd++;
+                url = destination.Substring(0, destinationEnd);
+            }
+            string title = destination.Substring(destinationEnd).Trim();
+            if (title.Length > 0 && (title.Length < 2 ||
+                !((title[0] == '"' && title[title.Length - 1] == '"') ||
+                  (title[0] == '\'' && title[title.Length - 1] == '\'') ||
+                  (title[0] == '(' && title[title.Length - 1] == ')')))) return false;
             afterIndex = closeParen + 1;
             return true;
         }

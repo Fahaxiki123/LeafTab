@@ -541,7 +541,8 @@ namespace LeafTab.Services
             bool alreadyLeafTabOwned = false;
             bool keyExisted = false;
             bool hadPriorDefault = false;
-            string priorDefault = string.Empty;
+            object priorDefault = string.Empty;
+            RegistryValueKind priorDefaultKind = RegistryValueKind.String;
 
             using (RegistryKey? existing = Registry.CurrentUser.OpenSubKey(shellKeyPath))
             {
@@ -557,7 +558,8 @@ namespace LeafTab.Services
                     else if (rawDef != null)
                     {
                         hadPriorDefault = true;
-                        priorDefault = defStr ?? rawDef.ToString() ?? string.Empty;
+                        priorDefault = rawDef;
+                        priorDefaultKind = existing.GetValueKind(string.Empty);
                     }
                 }
             }
@@ -568,7 +570,8 @@ namespace LeafTab.Services
                 bak.SetValue("Captured", 1, RegistryValueKind.DWord);
                 bak.SetValue("KeyExisted", keyExisted ? 1 : 0, RegistryValueKind.DWord);
                 bak.SetValue("HadDefault", hadPriorDefault ? 1 : 0, RegistryValueKind.DWord);
-                bak.SetValue("PriorDefault", priorDefault, RegistryValueKind.String);
+                bak.SetValue("PriorDefault", priorDefault, priorDefaultKind);
+                bak.SetValue("PriorDefaultKind", (int)priorDefaultKind, RegistryValueKind.DWord);
             }
 
             using (RegistryKey shellKey = Registry.CurrentUser.CreateSubKey(shellKeyPath))
@@ -1072,7 +1075,17 @@ namespace LeafTab.Services
                 if (ShouldInterceptIntoLeafTab(browserHwnd))
                     return false;
 
-                if (selection.GetCount(out uint count) == ShellConstants.S_OK && count > 0 &&
+                if (selection.GetCount(out uint count) != ShellConstants.S_OK || count == 0) return false;
+                NativeMethods.GetWindowThreadProcessId(browserHwnd, out uint browserPid);
+                bool leafTabHost = browserPid == s_currentPid ||
+                    ShellAssociationRecovery.PathsEqual(NativeMethods.TryGetProcessImagePath(browserPid),
+                        ShellIntegrationService.GetCurrentExecutablePath());
+                // Route the complete selection through the normal tab-opening
+                // path. Consuming only index zero silently discarded the rest.
+                // Common file dialogs retain their own in-place navigation.
+                if (ShouldRouteEmbeddedSelectionAsTabs(leafTabHost, count)) return false;
+
+                if (
                     selection.GetItemAt(0, out IShellItem? firstItem) == ShellConstants.S_OK && firstItem != null)
                 {
                     IntPtr itemPidl = IntPtr.Zero;
@@ -1099,6 +1112,9 @@ namespace LeafTab.Services
                 Marshal.Release(psbPtr);
             }
         }
+
+        internal static bool ShouldRouteEmbeddedSelectionAsTabs(bool leafTabHost, uint selectionCount) =>
+            leafTabHost && selectionCount > 1;
 
         private static bool ShouldInterceptIntoLeafTab(IntPtr browserHwnd)
         {
@@ -1162,7 +1178,6 @@ namespace LeafTab.Services
                         try
                         {
                             string? parsing = PidlManager.GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
-                            string? display = PidlManager.GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
                             string? fsPath = PidlManager.GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
 
                             if (!string.IsNullOrWhiteSpace(fsPath) && File.Exists(fsPath))
@@ -1172,7 +1187,7 @@ namespace LeafTab.Services
                             }
 
                             // Redirect Windows File Explorer launcher CLSID {52205fd8-5dfb-447d-801a-d0b52f2e83e1} cleanly to "此电脑"
-                            if (PidlManager.IsExplorerLauncherTarget(parsing) || PidlManager.IsExplorerLauncherTarget(display))
+                            if (string.IsNullOrWhiteSpace(fsPath) && PidlManager.IsExplorerLauncherTarget(parsing))
                             {
                                 req.Targets.Add(new LaunchTargetItem("此电脑"));
                                 continue;
@@ -1203,7 +1218,9 @@ namespace LeafTab.Services
 
             if (req.Targets.Count == 0 && !string.IsNullOrWhiteSpace(_parameters))
             {
-                req.Targets.AddRange(LaunchRequestParser.Parse(new[] { _parameters! }).Targets);
+                LaunchActionRequest parsed = ParseShellParameters(_parameters!);
+                req.OpenInNewWindow = parsed.OpenInNewWindow;
+                req.Targets.AddRange(parsed.Targets);
             }
 
             if (req.Targets.Count == 0 && !string.IsNullOrWhiteSpace(_directory) && Directory.Exists(_directory))
@@ -1219,5 +1236,28 @@ namespace LeafTab.Services
 
             return req;
         }
+
+        internal static LaunchActionRequest ParseShellParameters(string parameters)
+        {
+            // Some Shell callers supply one unquoted literal path with spaces.
+            if (Directory.Exists(parameters) || File.Exists(parameters))
+                return LaunchRequestParser.Parse(new[] { parameters });
+
+            IntPtr argv = CommandLineToArgvW("LeafTab.exe " + parameters, out int count);
+            if (argv == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            try
+            {
+                var args = new string[Math.Max(0, count - 1)];
+                for (int i = 1; i < count; i++)
+                    args[i - 1] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size)) ?? string.Empty;
+                return LaunchRequestParser.Parse(args);
+            }
+            finally { FreeCommandLineArguments(argv); }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CommandLineToArgvW(string commandLine, out int argumentCount);
+        [DllImport("kernel32.dll", EntryPoint = "LocalFree")]
+        private static extern IntPtr FreeCommandLineArguments(IntPtr memory);
     }
 }

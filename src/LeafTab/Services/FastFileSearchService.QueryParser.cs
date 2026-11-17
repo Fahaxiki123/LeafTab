@@ -36,6 +36,18 @@ namespace LeafTab.Services
                 _orBranches = orBranches;
             }
 
+            internal bool RequiresMetadata
+            {
+                get
+                {
+                    if (_metadataPredicate != null) return true;
+                    if (_orBranches != null)
+                        foreach (SearchClause branch in _orBranches)
+                            if (branch.RequiresMetadata) return true;
+                    return false;
+                }
+            }
+
             public bool MayMatchPathAndKind(string name, string relativePath, bool isDirectory)
             {
                 if (_orBranches != null)
@@ -84,6 +96,15 @@ namespace LeafTab.Services
 
             public bool HasUnsupportedNativeSyntax { get; }
             public string? UnsupportedSyntaxNotice { get; }
+            internal bool RequiresMetadata
+            {
+                get
+                {
+                    foreach (SearchClause clause in _clauses)
+                        if (clause.RequiresMetadata) return true;
+                    return false;
+                }
+            }
 
             public ParsedSearchQuery(
                 SearchClause[] clauses,
@@ -207,6 +228,59 @@ namespace LeafTab.Services
                 notice);
         }
 
+        // These filters are LeafTab's documented semantics, not Everything aliases:
+        // type: is an extension category, path: is relative, and size: is in exact
+        // bytes. Evaluate the complete query locally rather than prefiltering with
+        // an incompatible IPC query and permanently losing possible matches.
+        // Queries using Everything-only functions retain the existing IPC path.
+        internal static bool RequiresNativeQuerySemantics(string query, ParsedSearchQuery parsedQuery)
+        {
+            if (parsedQuery.HasUnsupportedNativeSyntax)
+                return false;
+
+            foreach (List<string> group in TokenizeConjunctionOfDisjunctions(query))
+            {
+                if (group.Count > 1)
+                    return true; // Preserve LeafTab's OR-before-AND regardless of Everything settings.
+                foreach (string atom in group)
+                {
+                    int colon = atom.IndexOf(':');
+                    if (colon >= 0)
+                    {
+                        string prefix = atom.Substring(0, colon);
+                        string argument = atom.Substring(colon + 1);
+                        if (string.Equals(prefix, "ext", StringComparison.OrdinalIgnoreCase) &&
+                            IsSimpleEverythingExtensionList(argument))
+                            continue;
+                        if ((string.Equals(prefix, "file", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(prefix, "folder", StringComparison.OrdinalIgnoreCase)) &&
+                            IsPlainEverythingNameTerm(argument))
+                            continue;
+                        return true;
+                    }
+                    if (!IsPlainEverythingNameTerm(atom)) return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool IsPlainEverythingNameTerm(string text) =>
+            text.IndexOfAny(new[] { ':', '\\', '/', '<', '>', '|', '!' }) < 0;
+
+        private static bool IsSimpleEverythingExtensionList(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            foreach (string extension in text.Split(';'))
+            {
+                if (extension.Length == 0) return false;
+                foreach (char c in extension)
+                    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_' || c == '-'))
+                        return false;
+            }
+            return true;
+        }
+
         private static SearchClause? ParseSingleAtomClause(string token, out bool hasUnsupported, out string? notice)
         {
             hasUnsupported = false;
@@ -250,7 +324,7 @@ namespace LeafTab.Services
                     ulong capturedMax = maxBytes;
                     return new SearchClause(
                         pathPredicate: null,
-                        metadataPredicate: entry => entry.FileSize >= capturedMin && entry.FileSize <= capturedMax,
+                        metadataPredicate: entry => entry.HasFileSize && entry.FileSize >= capturedMin && entry.FileSize <= capturedMax,
                         requireDirectory: false,
                         requireFile: true);
                 }
@@ -273,7 +347,7 @@ namespace LeafTab.Services
                         metadataPredicate: entry =>
                         {
                             long ft = FileTimeToTicks(entry.LastWriteTime);
-                            return ft >= capturedMinFt && ft <= capturedMaxFt;
+                            return entry.HasLastWriteTime && ft >= capturedMinFt && ft <= capturedMaxFt;
                         },
                         requireDirectory: false,
                         requireFile: false);

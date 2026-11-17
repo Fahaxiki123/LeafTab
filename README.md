@@ -1,12 +1,19 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.8 外部文件定位与系统接管完善版**（2026-11-16）。
+当前最新版本：**v0.6.9 稳定性与交互修复版**（2026-11-17）。
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 350 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 360 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.9 更新内容
+
+- 修复首次后台唤醒时恢复标签、COM 中继退出与跨副本卸载隔离、同名真实目录识别和多选文件夹打开。
+- 修复标签快捷键、行内重命名与导航树焦点、预览还焦、地址补全和搜索取消的交互问题；新建项目的延迟回调不再操作已切换后的目录。
+- 普通名称、规范 `ext:` 列表及简单 `file:` / `folder:` 筛选保留 Everything 加速；`type:`、日期、大小、相对路径、正则及 OR 等完整的 LeafTab 本地查询使用原生扫描/缓存保证含义一致。包含 `content:` 等索引专属函数的组合仍遵循 Everything 语法；大范围复杂筛选可能比索引查询耗时更长。
+- 补齐虚拟目录筛选、单盘扫描去重、隐藏项搜索重建及 UNC 历史恢复；修复 EXIF 图片方向、Markdown 链接/代码和预览宽度恢复。
 
 ## 0.6.8 更新内容
 
@@ -76,9 +83,9 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases) 下载最新版本（`v0.6.8`）：
+前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.9) 下载最新版本（`v0.6.9`）：
 
-- **图形化一键安装包**：`LeafTab-v0.6.8-Setup-x64.exe`（约 350 KB）
+- **图形化一键安装包**：`LeafTab-v0.6.9-Setup-x64.exe`（约 360 KB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -177,7 +184,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.8-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.9-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---
@@ -188,7 +195,9 @@ src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.8-Setup-x64.exe       # 图
 pwsh -NoProfile -File scripts/verify.ps1
 ```
 
-脚本将源码复制到新的临时目录，构建主程序和安装器，运行独立回归用例与原生界面自检，输出构建日志、用例结果和性能记录。注册表测试使用随机沙盒，不修改真实文件夹关联；项目内不产生 `bin/obj`。只运行快速回归可加 `-SkipNative`。
+脚本将源码复制到新的临时目录，构建主程序和安装器，运行独立回归用例、原生选择/搜索/历史/焦点导航回归与界面自检，输出构建日志、用例结果和性能记录。注册表测试使用随机沙盒，不修改真实文件夹关联；所有用例数据保存在隔离输出目录，项目内不产生 `bin/obj`。只运行快速回归可加 `-SkipNative`；加 `-IncludeInteractive` 会额外短暂显示测试窗口，验证首次后台唤醒和关闭副窗口后的会话保存。
+
+真实键盘验收使用隔离构建中的 `LeafTab.RegressionTests.exe --focus-input-ui`：从文本框和原生列表切换标签，执行 F2 后 Tab、F5，再关闭测试窗口输出断言结果。该模式需要人工或桌面操作工具输入，不会自动注入按键；测试文件与会话均独立于已安装版本。
 
 开发验收可使用 `LeafTab.exe --self-test-ui <测试目录>...` 打开隔离窗口；该模式跳过会话持久化和系统接管。完整自检命令仍为 `--self-test <报告路径>`。
 

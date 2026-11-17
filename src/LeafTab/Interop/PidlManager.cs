@@ -707,7 +707,9 @@ namespace LeafTab.Interop
                 return false;
 
             // Windows 10/11 File Explorer launcher stub CLSID (invoked by Taskbar/Start Menu File Explorer shortcut & Win+E)
-            if (s.IndexOf("52205fd8-5dfb-447d-801a-d0b52f2e83e1", StringComparison.OrdinalIgnoreCase) >= 0)
+            string namespaceName = s.StartsWith("shell:", StringComparison.OrdinalIgnoreCase) ? s.Substring(6) : s;
+            if (string.Equals(namespaceName, "::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(namespaceName, "{52205fd8-5dfb-447d-801a-d0b52f2e83e1}", StringComparison.OrdinalIgnoreCase))
                 return true;
 
             if (string.Equals(s, "文件资源管理器", StringComparison.OrdinalIgnoreCase) ||
@@ -715,7 +717,7 @@ namespace LeafTab.Interop
                 string.Equals(s, "Windows 资源管理器", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(s, "Windows Explorer", StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                return !Directory.Exists(s);
             }
 
             if (s.EndsWith(@"\File Explorer.lnk", StringComparison.OrdinalIgnoreCase) ||
@@ -723,10 +725,36 @@ namespace LeafTab.Interop
                 string.Equals(s, "File Explorer.lnk", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(s, "文件资源管理器.lnk", StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                return IsExplorerLauncherShortcut(s);
             }
 
             return false;
+        }
+
+        private static bool IsExplorerLauncherShortcut(string path)
+        {
+            // Alias detection also runs on the UI thread before the bounded
+            // asynchronous UNC parser. Never probe a network shortcut here.
+            if (path.StartsWith(@"\\", StringComparison.Ordinal)) return false;
+            if (!File.Exists(path)) return false;
+            object? instance = null;
+            try
+            {
+                Type? linkType = Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046"), false);
+                if (linkType == null) return false;
+                instance = Activator.CreateInstance(linkType);
+                if (instance is not IShellLinkW link || instance is not System.Runtime.InteropServices.ComTypes.IPersistFile file) return false;
+                file.Load(path, 0);
+                var target = new System.Text.StringBuilder(32768);
+                var arguments = new System.Text.StringBuilder(32768);
+                if (link.GetPath(target, target.Capacity, IntPtr.Zero, 0) < 0 ||
+                    link.GetArguments(arguments, arguments.Capacity) < 0) return false;
+                return LeafTab.Shared.ShellAssociationRecovery.PathsEqual(target.ToString(),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe")) &&
+                    string.IsNullOrWhiteSpace(arguments.ToString());
+            }
+            catch { return false; }
+            finally { if (instance != null && Marshal.IsComObject(instance)) Marshal.ReleaseComObject(instance); }
         }
 
         public static IntPtr NormalizeToBrowsablePidl(IntPtr pidl)
@@ -740,8 +768,8 @@ namespace LeafTab.Interop
                 try
                 {
                     string? parsing = GetShellItemString(item, SIGDN.SIGDN_DESKTOPABSOLUTEPARSING);
-                    string? title = GetShellItemString(item, SIGDN.SIGDN_NORMALDISPLAY);
-                    if (IsExplorerLauncherTarget(parsing) || IsExplorerLauncherTarget(title))
+                    string? fileSystemPath = GetShellItemString(item, SIGDN.SIGDN_FILESYSPATH);
+                    if (string.IsNullOrWhiteSpace(fileSystemPath) && IsExplorerLauncherTarget(parsing))
                     {
                         Free(ref pidl);
                         return CreateThisPcPidl();

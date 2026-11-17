@@ -137,7 +137,7 @@ namespace LeafTab.RegressionTests
                     else Check(received.Result.Length == 0, "Quit was sent to a different executable.");
                 }
             });
-            Test("Installer takeover quits unregistered copies using each copy's client", () =>
+            Test("Installer scoped quit preserves other copies and takeover reaches every matching process", () =>
             {
                 string template = BuildQuitFixture();
                 string install = MakeDirectory("stop-target"), portable = MakeDirectory("stop-portable");
@@ -170,7 +170,7 @@ namespace LeafTab.RegressionTests
             }));
             Test("Setup version metadata matches main executable version", () =>
             {
-                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.8");
+                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.9");
                 Check(typeof(LeafTab.App).Assembly.GetName().Version == Version.Parse(LeafTab.Setup.SetupEngine.AppVersion + ".0"));
             });
             Test("Breadcrumb blank hit filter distinguishes blank chrome from interactive buttons", () =>
@@ -1136,18 +1136,37 @@ namespace LeafTab.RegressionTests
         {
             string exe = Path.Combine(MakeDirectory("quit-fixture"), "LeafTab.exe");
             const string source = @"
-using System; using System.IO; using System.Threading;
+using System; using System.IO; using System.Threading; using System.Text;
+using System.Diagnostics; using System.Security.Cryptography; using System.Security.Principal;
 class QuitFixture {
+    static string Hash(string value) {
+        using (var sha = SHA256.Create()) {
+            byte[] bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(value.ToUpperInvariant()));
+            return BitConverter.ToString(bytes, 0, 8).Replace(""-"", """").ToLowerInvariant();
+        }
+    }
     static void Main(string[] args) {
         string root = AppDomain.CurrentDomain.BaseDirectory;
         string quit = Path.Combine(root, ""quit"");
         if (args.Length > 0 && args[0] == ""--quit"") { File.WriteAllText(quit, """"); return; }
-        File.WriteAllText(Path.Combine(root, ""ready""), """");
-        for (int i = 0; i < 1000 && !File.Exists(quit); i++) Thread.Sleep(20);
+        string identity = WindowsIdentity.GetCurrent().User.Value + "":"" + Process.GetCurrentProcess().SessionId;
+        string prefix = ""Local\\LeafTab.Exit."" + Hash(identity);
+        string exe = Path.GetFullPath(Path.Combine(root, ""LeafTab.exe""));
+        using (var global = new EventWaitHandle(false, EventResetMode.ManualReset, prefix))
+        using (var scoped = new EventWaitHandle(false, EventResetMode.ManualReset, prefix + ""."" + Hash(exe))) {
+            File.WriteAllText(Path.Combine(root, ""ready""), """");
+            for (int i = 0; i < 1000 && !File.Exists(quit); i++) {
+                if (WaitHandle.WaitAny(new WaitHandle[] { global, scoped }, 20) != WaitHandle.WaitTimeout) {
+                    File.WriteAllText(quit, """");
+                    break;
+                }
+            }
+        }
     }
 }";
             using var compiler = new CSharpCodeProvider();
             var parameters = new CompilerParameters { GenerateExecutable = true, OutputAssembly = exe, CompilerOptions = "/target:winexe /platform:x64" };
+            parameters.ReferencedAssemblies.Add("System.dll");
             CompilerResults result = compiler.CompileAssemblyFromSource(parameters, source);
             Check(!result.Errors.HasErrors, string.Join("; ", result.Errors.Cast<CompilerError>()));
             return exe;
