@@ -1,10 +1,14 @@
 # LeafTab（一叶）
 
-当前最新版本：**v0.6.9 稳定性与交互修复版**（2026-11-17）。
+**[获取最新稳定版](https://github.com/Fahaxiki123/LeafTab/releases/latest)** · [全部版本](https://github.com/Fahaxiki123/LeafTab/releases)
+
+截至 **2026-11-18** 已核对发布版本：**v0.6.9 稳定性与交互修复版**（2026-11-17 发布）。
+
+**[下载 v0.6.9 Windows x64 安装包](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/LeafTab-v0.6.9-Setup-x64.exe)** · [版本说明](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.9) · [SHA-256 校验文件](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/SHA256SUMS.txt) · [同版本源码](https://github.com/Fahaxiki123/LeafTab/tree/v0.6.9)
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 360 KB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 363 KiB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
 
@@ -83,16 +87,16 @@
 
 ## 下载与安装
 
-前往 [**GitHub Releases**](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.9) 下载最新版本（`v0.6.9`）：
+前往 [**最新稳定版下载页**](https://github.com/Fahaxiki123/LeafTab/releases/latest) 获取当前发布。上方 v0.6.9 安装包、校验文件和源码均固定到同一版本；后续升级使用最新稳定版入口，查找旧版使用 [全部版本](https://github.com/Fahaxiki123/LeafTab/releases)。
 
-- **图形化一键安装包**：`LeafTab-v0.6.9-Setup-x64.exe`（约 360 KB）
+- **已核对的 v0.6.9 图形化安装包**：[LeafTab-v0.6.9-Setup-x64.exe](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/LeafTab-v0.6.9-Setup-x64.exe)（约 363 KiB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
 
 ---
 
-## 核心特性（v0.6.0）
+## 核心特性
 
 - **单进程真多窗口并排分屏 + 高频日用效率细节（v0.6.0 新增）**：
   - **独立多窗口与拖拽撕出分屏**：支持 `Ctrl + N` 新开独立窗口、系统文件夹右键「在新窗口中打开」（`opennewwindow` 专属 COM 路由）、标签页右键「移动到新窗口 / 在新窗口中打开」，以及直接**按住标签页向上/向下拖出标签栏松手拆分为独立窗口**（完整保留该页签前进/后退历史栈，支持 `Win + ← / →` 左右贴靠分屏互拖文件）；关闭副窗口即刻释放，仅最后一个可见窗口关闭时进入后台热驻留；
