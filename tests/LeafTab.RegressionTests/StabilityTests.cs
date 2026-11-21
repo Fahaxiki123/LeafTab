@@ -72,7 +72,7 @@ namespace LeafTab.RegressionTests
                 File.WriteAllText(Path.Combine(source, ".portable"), "");
                 Check(AppConfigService.ResolveConfigFilePath(source, MakeDirectory("portable-destination")) == Path.Combine(source, "config.json"));
             });
-            Test("Uninstall removes both config locations and preserves other files", () =>
+            Test("Uninstall preserves unmarked install-directory files and removes owned shared config", () =>
             {
                 string install = MakeDirectory("uninstall"), data = MakeDirectory("uninstall-data");
                 foreach (string dir in new[] { install, data })
@@ -82,7 +82,7 @@ namespace LeafTab.RegressionTests
                     File.WriteAllText(Path.Combine(dir, "keep.txt"), "user document");
                 }
                 LeafTab.Setup.SetupEngine.RemoveKnownUserData(install, data);
-                Check(!File.Exists(Path.Combine(install, "config.json")) && !File.Exists(Path.Combine(data, "config.json.bak")));
+                Check(File.ReadAllText(Path.Combine(install, "config.json")) == "data" && !File.Exists(Path.Combine(data, "config.json.bak")));
                 Check(File.Exists(Path.Combine(install, "keep.txt")) && File.Exists(Path.Combine(data, "keep.txt")));
             });
             Test("Two windows retain simultaneous bookmark additions and deletions", () =>
@@ -110,6 +110,7 @@ namespace LeafTab.RegressionTests
                 }
                 finally { a.PrepareForForceExit(); b.PrepareForForceExit(); a.Close(); b.Close(); store.Flush(); }
             });
+            RunSetupAndConfigFixTests();
             RunProtocolAndPackagingTests();
             RunReviewRegressionTests();
             RunSearchOptimizationTests();

@@ -27,7 +27,7 @@ namespace LeafTab.Services
             {
                 DiagnosticLog.Write("config-migration-deferred", ex);
                 string legacy = Path.Combine(directory, "config.json");
-                return TryDeserializeFile(legacy) != null || TryDeserializeFile(legacy + ".bak") != null
+                return TryDeserializeLegacyConfig(legacy) != null || TryDeserializeLegacyConfig(legacy + ".bak") != null
                     ? legacy : Path.Combine(userDirectory, "config.json");
             }
         }
@@ -40,7 +40,7 @@ namespace LeafTab.Services
             if (ShellAssociationRecovery.PathsEqual(portablePath, destination)) return destination;
             using var gate = AcquireConfigGate(destination);
             if (TryDeserializeFile(destination) != null || TryDeserializeFile(destination + ".bak") != null) return destination;
-            var legacy = TryDeserializeFile(portablePath) ?? TryDeserializeFile(portablePath + ".bak");
+            var legacy = TryDeserializeLegacyConfig(portablePath) ?? TryDeserializeLegacyConfig(portablePath + ".bak");
             if (legacy == null) return destination;
             // A valid destination always wins, including intentionally empty bookmarks.
             // Keep the source intact so an older binary and failed migrations remain recoverable.
@@ -52,6 +52,9 @@ namespace LeafTab.Services
             DiagnosticLog.Write("legacy-config-migration-failed-retaining-source");
             return portablePath;
         }
+
+        private static AppConfig? TryDeserializeLegacyConfig(string path) =>
+            LegacyConfigFile.HasLeafTabFormat(path) ? TryDeserializeFile(path) : null;
 
         internal static bool PrepareInstalledConfig()
         {
@@ -96,18 +99,31 @@ namespace LeafTab.Services
             string path = customPath ?? ConfigFilePath;
             string bakPath = path + ".bak";
 
-            AppConfig? primary = TryDeserializeFile(path);
-            if (primary != null)
+            IDisposable? gate = null;
+            try
             {
-                EnsureDefaultBookmarksIfNeeded(primary);
-                return primary;
+                gate = AcquireConfigGate(path);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("config-read-gate-bypassed", ex);
             }
 
-            AppConfig? backup = TryDeserializeFile(bakPath);
-            if (backup != null)
+            using (gate)
             {
-                EnsureDefaultBookmarksIfNeeded(backup);
-                return backup;
+                AppConfig? primary = TryDeserializeFile(path);
+                if (primary != null)
+                {
+                    EnsureDefaultBookmarksIfNeeded(primary);
+                    return primary;
+                }
+
+                AppConfig? backup = TryDeserializeFile(bakPath);
+                if (backup != null)
+                {
+                    EnsureDefaultBookmarksIfNeeded(backup);
+                    return backup;
+                }
             }
 
             var fresh = new AppConfig();
@@ -181,15 +197,17 @@ namespace LeafTab.Services
 
                 if (File.Exists(path))
                 {
+                    // A recovered backup must survive the first write after a damaged primary.
+                    string? replacementBackup = TryDeserializeFile(path) != null ? bakPath : null;
                     try
                     {
-                        File.Replace(tempPath, path, bakPath, ignoreMetadataErrors: true);
+                        File.Replace(tempPath, path, replacementBackup, ignoreMetadataErrors: true);
                         return true;
                     }
                     catch (IOException ex) when ((ex.HResult & 0xffff) == 1 || (ex.HResult & 0xffff) == 50)
                     {
                         // Fallback for filesystems that do not support ReplaceFileW (e.g. FAT32/exFAT USB drives)
-                        File.Copy(path, bakPath, overwrite: true);
+                        if (replacementBackup != null) File.Copy(path, replacementBackup, overwrite: true);
                         File.Copy(tempPath, path, overwrite: true);
                         File.Delete(tempPath);
                         return true;

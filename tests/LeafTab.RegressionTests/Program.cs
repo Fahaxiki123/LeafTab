@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using LeafTab.Controls;
@@ -14,8 +16,23 @@ namespace LeafTab.RegressionTests
     {
         private static int _failed;
         private static int _passed;
-        private static readonly string Root = Path.Combine(Environment.GetEnvironmentVariable("LEAFTAB_TEST_ROOT") ?? Path.GetTempPath(), "LeafTab-regression-" + Guid.NewGuid().ToString("N"));
+        // Shell APIs return long names, even when TEMP uses an 8.3 alias.
+        private static readonly string Root = Path.Combine(
+            Path.GetFullPath(Environment.GetEnvironmentVariable("LEAFTAB_TEST_ROOT") ?? Path.GetTempPath()),
+            "LeafTab-regression-" + Guid.NewGuid().ToString("N"));
         private static readonly string Exe = typeof(LeafTab.App).Assembly.Location;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint GetShortPathName(string longPath, StringBuilder shortPath, int length);
+
+        private static string? TryGetShortTestPath(string path)
+        {
+            var buffer = new StringBuilder(32768);
+            uint length = GetShortPathName(path, buffer, buffer.Capacity);
+            if (length == 0 || length >= buffer.Capacity) return null;
+            string shortPath = buffer.ToString();
+            return string.Equals(path, shortPath, StringComparison.OrdinalIgnoreCase) ? null : shortPath;
+        }
 
         [STAThread]
         private static int Main(string[] args)

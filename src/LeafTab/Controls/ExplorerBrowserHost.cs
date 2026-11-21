@@ -2096,6 +2096,7 @@ namespace LeafTab.Controls
 
         private void DestroySearchBrowserOnly()
         {
+            _isFillSearchTransition = false;
             PidlManager.Free(ref _searchResultsPidl);
             if (_searchEventSink != null)
             {
@@ -2135,6 +2136,21 @@ namespace LeafTab.Controls
                 if (NativeMethods.IsWindow(_searchHostHwnd))
                     NativeMethods.DestroyWindow(_searchHostHwnd);
                 _searchHostHwnd = IntPtr.Zero;
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            try
+            {
+                base.Dispose(disposing);
+            }
+            finally
+            {
+                _isDestroyed = true;
+                // 未挂载的标签页没有 HWND，WPF 不会调用 DestroyWindowCore，此处原子释放初始 PIDL
+                IntPtr pending = Interlocked.Exchange(ref _pendingInitialPidl, IntPtr.Zero);
+                PidlManager.Free(ref pending);
             }
         }
 

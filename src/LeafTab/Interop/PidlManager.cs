@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -8,6 +9,7 @@ using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 
 namespace LeafTab.Interop
 {
@@ -26,6 +28,18 @@ namespace LeafTab.Interop
         public string ParsingName { get; set; } = string.Empty;
         public byte[] PidlBytes { get; set; } = Array.Empty<byte>();
         public ImageSource? Icon { get; set; }
+    }
+
+    internal sealed class BreadcrumbChildrenResult
+    {
+        public List<BreadcrumbNode> Children { get; }
+        public bool IsTruncated { get; }
+
+        public BreadcrumbChildrenResult(List<BreadcrumbNode> children, bool isTruncated)
+        {
+            Children = children;
+            IsTruncated = isTruncated;
+        }
     }
 
     internal static class PidlManager
@@ -517,18 +531,360 @@ namespace LeafTab.Interop
             }
         }
 
+        internal const int MaxBreadcrumbChildFolders = 2000;
+        internal static int BreadcrumbOperationTimeoutMs = 8000;
+
+        private static readonly ShellStaLane s_breadcrumbFolderLane = new ShellStaLane("LeafTab breadcrumb folders");
+        private static readonly ShellStaLane s_breadcrumbIconLane = new ShellStaLane("LeafTab breadcrumb icons");
+        private static readonly ShellStaLane s_virtualSearchLane = new ShellStaLane("LeafTab virtual folder search");
+
         /// <summary>
-        /// Enumerates immediate child folders for a breadcrumb chevron '>' dropdown popup.
+        /// 带 WPF 消息泵的常驻后台 STA 通道。
+        /// 平时复用单个 STA 线程与 Dispatcher，避免反复创建并遗弃 HwndWrapper；
+        /// 当阻塞于底层 COM/Win32 的任务被调用方取消或超时放弃时，自动将该线程标为退休并启用新线程，
+        /// 防止慢速或离线网络共享饿死后续本地请求。
         /// </summary>
-        public static List<BreadcrumbNode> EnumerateChildFolders(IntPtr parentPidl, int maxCount = 80)
+        internal sealed class ShellStaLane
+        {
+            private const int MaxRetiredWorkers = 4;
+
+            internal sealed class LaneWorker
+            {
+                private readonly ManualResetEventSlim _ready = new ManualResetEventSlim(false);
+                private Dispatcher? _dispatcher;
+                private int _retired;
+                private int _exited;
+
+                public bool IsRetired => Volatile.Read(ref _retired) != 0;
+                public bool HasExited => Volatile.Read(ref _exited) != 0;
+
+                public LaneWorker(string threadName, Action<LaneWorker> onThreadExit)
+                {
+                    var thread = new Thread(() =>
+                    {
+                        try
+                        {
+                            Dispatcher dispatcher = Dispatcher.CurrentDispatcher;
+                            Volatile.Write(ref _dispatcher, dispatcher);
+                            _ready.Set();
+                            Dispatcher.Run();
+                        }
+                        finally
+                        {
+                            Volatile.Write(ref _exited, 1);
+                            _ready.Set();
+                            onThreadExit(this);
+                        }
+                    })
+                    {
+                        IsBackground = true,
+                        Name = threadName
+                    };
+                    thread.SetApartmentState(ApartmentState.STA);
+                    thread.Start();
+                }
+
+                public Dispatcher EnsureDispatcher()
+                {
+                    _ready.Wait();
+                    return Volatile.Read(ref _dispatcher) ?? throw new InvalidOperationException("STA 通道初始化失败。");
+                }
+
+                public bool TryRetireAfter(Task finished)
+                {
+                    if (HasExited || Interlocked.CompareExchange(ref _retired, 1, 0) != 0)
+                        return false;
+
+                    // Completion may already have raced past the lane's retirement decision.
+                    // In either order, only the retiring request schedules shutdown.
+                    _ = finished.ContinueWith(
+                        _ => EnsureDispatcher().BeginInvokeShutdown(DispatcherPriority.Normal),
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                    return true;
+                }
+            }
+
+            private sealed class ActiveExecution
+            {
+                private int _abandoned;
+                public LaneWorker Worker { get; }
+                public TaskCompletionSource<bool> Finished { get; } =
+                    new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                public TaskCompletionSource<bool> AbandonedSignal { get; } =
+                    new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+                public ActiveExecution(LaneWorker worker) => Worker = worker;
+                public bool IsAbandoned => Volatile.Read(ref _abandoned) != 0;
+
+                public void MarkAbandoned()
+                {
+                    if (Interlocked.Exchange(ref _abandoned, 1) == 0)
+                        AbandonedSignal.TrySetResult(true);
+                }
+
+                public void MarkFinished()
+                {
+                    Finished.TrySetResult(true);
+                }
+            }
+
+            private readonly object _gate = new object();
+            private readonly string _threadName;
+            private LaneWorker? _currentWorker;
+            private ActiveExecution? _currentExecution;
+            private int _retiredWorkers;
+            private TaskCompletionSource<bool> _retiredExitedSignal =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public ShellStaLane(string threadName) => _threadName = threadName;
+
+            private LaneWorker CreateWorkerLocked() => new LaneWorker(_threadName, OnWorkerExited);
+
+            private void OnWorkerExited(LaneWorker worker)
+            {
+                TaskCompletionSource<bool>? signal = null;
+                lock (_gate)
+                {
+                    if (ReferenceEquals(_currentWorker, worker))
+                        _currentWorker = null;
+
+                    if (worker.IsRetired)
+                    {
+                        if (_retiredWorkers > 0)
+                            _retiredWorkers--;
+                        signal = _retiredExitedSignal;
+                        _retiredExitedSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    }
+                }
+                signal?.TrySetResult(true);
+            }
+
+            public async Task<T> RunAsync<T>(Func<CancellationToken, T> work, CancellationToken token, int timeoutMs)
+            {
+                token.ThrowIfCancellationRequested();
+                int effectiveTimeout = timeoutMs > 0 ? timeoutMs : Timeout.Infinite;
+                long deadlineTicks = effectiveTimeout == Timeout.Infinite
+                    ? long.MaxValue
+                    : Stopwatch.GetTimestamp() + (long)(effectiveTimeout * (Stopwatch.Frequency / 1000.0));
+
+                ActiveExecution? acquired = null;
+                while (acquired == null)
+                {
+                    Task? waitTask = null;
+                    lock (_gate)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (_currentExecution == null || _currentExecution.Finished.Task.IsCompleted)
+                        {
+                            LaneWorker worker = _currentWorker != null && !_currentWorker.IsRetired && !_currentWorker.HasExited
+                                ? _currentWorker
+                                : CreateWorkerLocked();
+                            _currentWorker = worker;
+                            acquired = new ActiveExecution(worker);
+                            _currentExecution = acquired;
+                        }
+                        else if (_currentExecution.IsAbandoned && _retiredWorkers < MaxRetiredWorkers)
+                        {
+                            if (_currentExecution.Worker.TryRetireAfter(_currentExecution.Finished.Task))
+                                _retiredWorkers++;
+                            LaneWorker worker = CreateWorkerLocked();
+                            _currentWorker = worker;
+                            acquired = new ActiveExecution(worker);
+                            _currentExecution = acquired;
+                        }
+                        else
+                        {
+                            waitTask = _currentExecution.IsAbandoned
+                                ? Task.WhenAny(_currentExecution.Finished.Task, _retiredExitedSignal.Task)
+                                : Task.WhenAny(_currentExecution.Finished.Task, _currentExecution.AbandonedSignal.Task);
+                        }
+                    }
+
+                    if (acquired == null && waitTask != null)
+                    {
+                        await WaitWithTokenAndDeadlineAsync(waitTask, token, deadlineTicks).ConfigureAwait(false);
+                    }
+                }
+
+                var resultTcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+                CancellationTokenSource opCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                CancellationToken opToken = opCts.Token;
+                bool handedOffToSta = false;
+                try
+                {
+                    Dispatcher dispatcher = acquired.Worker.EnsureDispatcher();
+                    _ = dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            opToken.ThrowIfCancellationRequested();
+                            resultTcs.TrySetResult(work(opToken));
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            resultTcs.TrySetCanceled();
+                        }
+                        catch (Exception ex)
+                        {
+                            resultTcs.TrySetException(ex);
+                        }
+                        finally
+                        {
+                            acquired.MarkFinished();
+                        }
+                    }));
+                    handedOffToSta = true;
+
+                    return await AwaitResultWithTokenAndDeadlineAsync(resultTcs.Task, acquired, opCts, token, deadlineTicks)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    if (!handedOffToSta)
+                        acquired.MarkFinished();
+                    throw;
+                }
+                finally
+                {
+                    if (acquired.Finished.Task.IsCompleted)
+                    {
+                        opCts.Dispose();
+                    }
+                    else
+                    {
+                        // STA 回调仍在运行（例如阻塞在 OS COM 调用），推迟到回调退出后再释放链接 CTS
+                        _ = acquired.Finished.Task.ContinueWith(
+                            _ => opCts.Dispose(),
+                            CancellationToken.None,
+                            TaskContinuationOptions.ExecuteSynchronously,
+                            TaskScheduler.Default);
+                    }
+                }
+            }
+
+            private static int ComputeRemainingMs(long deadlineTicks)
+            {
+                if (deadlineTicks == long.MaxValue)
+                    return Timeout.Infinite;
+                double remainingMs = (deadlineTicks - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency;
+                if (remainingMs <= 0)
+                    return 0;
+                return remainingMs >= int.MaxValue ? int.MaxValue - 1 : Math.Max(1, (int)Math.Ceiling(remainingMs));
+            }
+
+            private static async Task WaitWithTokenAndDeadlineAsync(Task waitTask, CancellationToken token, long deadlineTicks)
+            {
+                token.ThrowIfCancellationRequested();
+                int remainingMs = ComputeRemainingMs(deadlineTicks);
+                if (remainingMs == 0)
+                    throw new TimeoutException("后台 Shell 操作等待超时。");
+
+                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                Task delayTask = Task.Delay(remainingMs, waitCts.Token);
+                Task completed = await Task.WhenAny(waitTask, delayTask).ConfigureAwait(false);
+                if (ReferenceEquals(completed, waitTask))
+                {
+                    waitCts.Cancel();
+                    return;
+                }
+
+                token.ThrowIfCancellationRequested();
+                throw new TimeoutException("后台 Shell 操作等待超时。");
+            }
+
+            private static async Task<T> AwaitResultWithTokenAndDeadlineAsync<T>(
+                Task<T> resultTask,
+                ActiveExecution execution,
+                CancellationTokenSource opCts,
+                CancellationToken callerToken,
+                long deadlineTicks)
+            {
+                int remainingMs = ComputeRemainingMs(deadlineTicks);
+                if (remainingMs == 0)
+                {
+                    try { opCts.Cancel(); } catch { }
+                    execution.MarkAbandoned();
+                    callerToken.ThrowIfCancellationRequested();
+                    throw new TimeoutException("后台 Shell 操作执行超时。");
+                }
+
+                using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+                Task delayTask = Task.Delay(remainingMs, waitCts.Token);
+                Task completed = await Task.WhenAny(resultTask, delayTask).ConfigureAwait(false);
+                if (ReferenceEquals(completed, resultTask))
+                {
+                    waitCts.Cancel();
+                    return await resultTask.ConfigureAwait(false);
+                }
+
+                try { opCts.Cancel(); } catch { }
+                execution.MarkAbandoned();
+                callerToken.ThrowIfCancellationRequested();
+                throw new TimeoutException("后台 Shell 操作执行超时。");
+            }
+        }
+
+        internal static Task<T> RunBreadcrumbFolderLaneAsync<T>(
+            Func<CancellationToken, T> work,
+            CancellationToken token,
+            int? timeoutMs = null) =>
+            s_breadcrumbFolderLane.RunAsync(work, token, timeoutMs ?? BreadcrumbOperationTimeoutMs);
+
+        internal static Task<T> RunVirtualSearchAsync<T>(
+            Func<CancellationToken, T> work,
+            CancellationToken token,
+            int timeoutMs) => s_virtualSearchLane.RunAsync(work, token, timeoutMs);
+
+        internal static Task<BreadcrumbChildrenResult> GetChildFoldersResultAsync(
+            byte[] parent,
+            CancellationToken token,
+            int maxCount = MaxBreadcrumbChildFolders)
+        {
+            return s_breadcrumbFolderLane.RunAsync(staToken =>
+            {
+                IntPtr pidl = FromBytes(parent);
+                try { return EnumerateChildFolders(pidl, maxCount, staToken); }
+                finally { Free(ref pidl); }
+            }, token, BreadcrumbOperationTimeoutMs);
+        }
+
+        internal static async Task<List<BreadcrumbNode>> GetChildFoldersAsync(byte[] parent, CancellationToken token)
+        {
+            BreadcrumbChildrenResult result = await GetChildFoldersResultAsync(parent, token, MaxBreadcrumbChildFolders)
+                .ConfigureAwait(false);
+            return result.Children;
+        }
+
+        internal static Task<ImageSource?[]> GetChildFolderIconsAsync(List<BreadcrumbNode> page, CancellationToken token)
+        {
+            return s_breadcrumbIconLane.RunAsync(staToken =>
+            {
+                var icons = new ImageSource?[page.Count];
+                for (int i = 0; i < page.Count; i++)
+                {
+                    staToken.ThrowIfCancellationRequested();
+                    IntPtr pidl = FromBytes(page[i].PidlBytes);
+                    try { icons[i] = GetOrExtractSmallIcon(pidl, page[i].ParsingName); }
+                    finally { Free(ref pidl); }
+                }
+                return icons;
+            }, token, BreadcrumbOperationTimeoutMs);
+        }
+
+        private static BreadcrumbChildrenResult EnumerateChildFolders(IntPtr parentPidl, int maxCount, CancellationToken token)
         {
             var children = new List<BreadcrumbNode>();
             if (parentPidl == IntPtr.Zero)
-                return children;
+                return new BreadcrumbChildrenResult(children, false);
 
             Guid iidShellItem = ShellConstants.IID_IShellItem;
-            if (NativeMethods.SHCreateItemFromIDList(parentPidl, ref iidShellItem, out IShellItem? parentItem) != ShellConstants.S_OK || parentItem == null)
-                return children;
+            int hrCreate = NativeMethods.SHCreateItemFromIDList(parentPidl, ref iidShellItem, out IShellItem? parentItem);
+            if (hrCreate < 0)
+                Marshal.ThrowExceptionForHR(hrCreate, new IntPtr(-1));
+            if (parentItem == null)
+                return new BreadcrumbChildrenResult(children, false);
 
             IntPtr pFolder = IntPtr.Zero;
             IShellFolder? shellFolder = null;
@@ -539,19 +895,35 @@ namespace LeafTab.Interop
             {
                 Guid bhid = BHID_SFObject;
                 Guid iidFolder = ShellConstants.IID_IShellFolder;
-                if (parentItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidFolder, out pFolder) != ShellConstants.S_OK || pFolder == IntPtr.Zero)
-                    return children;
+                int hrBind = parentItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidFolder, out pFolder);
+                if (hrBind < 0)
+                    Marshal.ThrowExceptionForHR(hrBind, new IntPtr(-1));
+                if (pFolder == IntPtr.Zero)
+                    return new BreadcrumbChildrenResult(children, false);
 
                 shellFolder = (IShellFolder)Marshal.GetObjectForIUnknown(pFolder);
                 (bool _, bool showHidden) = GetShellVisibilityFlags();
                 uint flags = ShellConstants.SHCONTF_FOLDERS | (showHidden ? ShellConstants.SHCONTF_INCLUDEHIDDEN : 0u);
 
-                if (shellFolder.EnumObjects(IntPtr.Zero, flags, out pEnum) != ShellConstants.S_OK || pEnum == IntPtr.Zero)
-                    return children;
+                int hrEnum = shellFolder.EnumObjects(IntPtr.Zero, flags, out pEnum);
+                if (hrEnum == ShellConstants.S_FALSE)
+                    return new BreadcrumbChildrenResult(children, false);
+                if (hrEnum < 0)
+                    Marshal.ThrowExceptionForHR(hrEnum, new IntPtr(-1));
+                if (pEnum == IntPtr.Zero)
+                    return new BreadcrumbChildrenResult(children, false);
 
                 enumIdList = (IEnumIDList)Marshal.GetObjectForIUnknown(pEnum);
-                while (children.Count < maxCount && enumIdList.Next(1, out IntPtr childRelPidl, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRelPidl != IntPtr.Zero)
+                bool truncated = false;
+                int effectiveLimit = Math.Max(1, maxCount);
+
+                while (true)
                 {
+                    token.ThrowIfCancellationRequested();
+                    IntPtr childRelPidl = NextChildPidl(enumIdList);
+                    if (childRelPidl == IntPtr.Zero)
+                        break;
+
                     IntPtr fullChildPidl = IntPtr.Zero;
                     try
                     {
@@ -564,6 +936,12 @@ namespace LeafTab.Interop
                                     (attrs & ShellConstants.SFGAO_FOLDER) != 0 &&
                                     (attrs & ShellConstants.SFGAO_STREAM) == 0)
                                 {
+                                    if (children.Count >= effectiveLimit)
+                                    {
+                                        truncated = true;
+                                        break;
+                                    }
+
                                     fullChildPidl = Combine(parentPidl, childRelPidl);
                                     if (fullChildPidl != IntPtr.Zero)
                                     {
@@ -573,8 +951,7 @@ namespace LeafTab.Interop
                                         {
                                             Title = title,
                                             ParsingName = parsing,
-                                            PidlBytes = ToBytes(fullChildPidl),
-                                            Icon = GetOrExtractSmallIcon(fullChildPidl, parsing)
+                                            PidlBytes = ToBytes(fullChildPidl)
                                         });
                                     }
                                 }
@@ -585,6 +962,10 @@ namespace LeafTab.Interop
                             }
                         }
                     }
+                    catch (Exception ex) when (!(ex is OperationCanceledException))
+                    {
+                        // 单个损坏或无权限子项不应中断整级目录枚举
+                    }
                     finally
                     {
                         Free(ref fullChildPidl);
@@ -593,11 +974,7 @@ namespace LeafTab.Interop
                 }
 
                 children.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
-                return children;
-            }
-            catch
-            {
-                return children;
+                return new BreadcrumbChildrenResult(children, truncated);
             }
             finally
             {
@@ -607,6 +984,18 @@ namespace LeafTab.Interop
                 if (pFolder != IntPtr.Zero) Marshal.Release(pFolder);
                 Marshal.ReleaseComObject(parentItem);
             }
+        }
+
+        internal static IntPtr NextChildPidl(IEnumIDList enumerator)
+        {
+            int hr = enumerator.Next(1, out IntPtr child, out uint fetched);
+            if (hr == ShellConstants.S_FALSE)
+                return IntPtr.Zero;
+            if (hr < 0)
+                Marshal.ThrowExceptionForHR(hr, new IntPtr(-1));
+            if (hr != ShellConstants.S_OK || fetched != 1 || child == IntPtr.Zero)
+                throw new InvalidDataException("Shell 子文件夹枚举器返回了无效的结果。");
+            return child;
         }
 
         public static (bool ShowExtensions, bool ShowHidden) GetShellVisibilityFlags()

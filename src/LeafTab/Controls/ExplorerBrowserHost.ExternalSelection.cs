@@ -53,6 +53,9 @@ namespace LeafTab.Controls
             expectedPidl != IntPtr.Zero && _externalCompletedPidl != IntPtr.Zero &&
             PidlManager.AreEqual(_externalCompletedPidl, expectedPidl);
 
+        internal bool HasRequestedDifferentFolder(IntPtr expectedPidl) =>
+            _externalPendingPidl != IntPtr.Zero && !PidlManager.AreEqual(_externalPendingPidl, expectedPidl);
+
         internal async Task<bool> WaitForFolderNavigationAsync(IntPtr expectedPidl, int timeoutMs = 5000,
             CancellationToken cancellationToken = default)
         {

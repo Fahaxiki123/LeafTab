@@ -16,16 +16,27 @@ namespace LeafTab.Controls
         // ==================== ASYNC DIRECTORY SEARCH (NATIVE IResultsFolder) ====================
 
         internal Func<bool>? SearchHiddenItemsProvider { get; set; }
+        internal FastFileSearchService FileSearchService { get; set; } = FastFileSearchService.Shared;
+        internal Func<IntPtr, string, int, CancellationToken, (List<byte[]> Items, bool Truncated)> VirtualChildrenProvider
+            { get; set; } = CollectMatchingVirtualChildren;
+        internal bool SimulateSearchViewTimeoutForTest { get; set; }
 
-        private bool EnsureSearchBrowserReady()
+        private bool EnsureSearchBrowserReady(out bool isFreshBrowser)
         {
+            isFreshBrowser = false;
             if (_isDestroyed || _hostHwnd == IntPtr.Zero)
                 return false;
 
             if (_searchBrowser != null && _searchHostHwnd != IntPtr.Zero)
             {
-                _searchBrowser.RemoveAll();
-                return true;
+                if (IsResultsFolderReady())
+                {
+                    _searchBrowser.RemoveAll();
+                    return true;
+                }
+
+                // 首次 FillFromObject 超时或失败后会残留半初始化的搜索视图，必须销毁后重建
+                DestroySearchBrowserOnly();
             }
 
             NativeMethods.GetClientRect(_hostHwnd, out RECT rc);
@@ -93,6 +104,7 @@ namespace LeafTab.Controls
                 return false;
             }
 
+            isFreshBrowser = true;
             return true;
         }
 
@@ -141,25 +153,38 @@ namespace LeafTab.Controls
             return StartSearchAsync(_lastSearchQuery, _preSearchFolderPidl, _lastSearchRootPath, nextMax);
         }
 
+        internal int SearchRequestVersion { get; private set; }
+
         public async Task<int> StartSearchAsync(
-            string rawQuery,
-            IntPtr currentFolderPidl,
-            string? folderFileSystemPath,
-            int maxResults = DefaultMaxSearchResults)
+            string rawQuery, IntPtr currentFolderPidl, string? folderFileSystemPath, int maxResults = DefaultMaxSearchResults)
+        {
+            SearchRequestVersion++;
+            var result = await RunSearchAsync(rawQuery, currentFolderPidl, folderFileSystemPath, maxResults);
+            return result.Count;
+        }
+
+        internal async Task<bool> StartSearchForMoveAsync(
+            string rawQuery, IntPtr currentFolderPidl, string? folderFileSystemPath, int maxResults)
+        {
+            var result = await RunSearchAsync(rawQuery, currentFolderPidl, folderFileSystemPath, maxResults);
+            return result.Completed;
+        }
+
+        private async Task<(int Count, bool Completed)> RunSearchAsync(
+            string rawQuery, IntPtr currentFolderPidl, string? folderFileSystemPath, int maxResults)
         {
             if (_isDestroyed || _browser == null)
-                return 0;
+                return (0, false);
 
             string query = (rawQuery ?? string.Empty).Trim();
-            if (string.IsNullOrEmpty(query))
+            if (query.Length == 0)
             {
-                ExitSearchMode();
-                return 0;
+                ExitSearchModeInternal(notifyChanged: true);
+                return (0, false);
             }
 
-            int effectiveMaxResults = Math.Max(1, Math.Min(MaxLoadMoreSearchResults, maxResults));
-            Stopwatch uiSw = Stopwatch.StartNew();
-
+            int limit = Math.Max(1, Math.Min(MaxLoadMoreSearchResults, maxResults));
+            var elapsed = Stopwatch.StartNew();
             if (!_isShowingSearchResults && currentFolderPidl != IntPtr.Zero)
             {
                 PidlManager.Free(ref _preSearchFolderPidl);
@@ -168,293 +193,283 @@ namespace LeafTab.Controls
 
             _lastSearchQuery = query;
             _lastSearchRootPath = folderFileSystemPath;
-            _currentSearchMaxResults = effectiveMaxResults;
+            _currentSearchMaxResults = limit;
             _lastSearchNotice = null;
 
-            bool hasRealFsRoot = !string.IsNullOrWhiteSpace(folderFileSystemPath) && Directory.Exists(folderFileSystemPath);
+            bool hasFileSystemRoot = !string.IsNullOrWhiteSpace(folderFileSystemPath) && Directory.Exists(folderFileSystemPath);
             IntPtr sourceFolder = _preSearchFolderPidl != IntPtr.Zero ? _preSearchFolderPidl : currentFolderPidl;
-            bool isThisPcMode = !hasRealFsRoot && PidlManager.IsThisPcPidl(sourceFolder);
-
-            // Snapshot virtual children BEFORE switching view when not in a real filesystem directory
-            List<byte[]>? virtualCandidates = null;
-            bool virtualTruncated = false;
-            if (!hasRealFsRoot)
-            {
-                int virtualCap = isThisPcMode ? 64 : Math.Min(effectiveMaxResults, 1000);
-                (virtualCandidates, virtualTruncated) = CollectMatchingVirtualChildren(sourceFolder, query, virtualCap);
-            }
+            bool isThisPc = !hasFileSystemRoot && PidlManager.IsThisPcPidl(sourceFolder);
+            bool searchFiles = hasFileSystemRoot || isThisPc;
+            bool searchVirtual = !hasFileSystemRoot &&
+                (!isThisPc || !FastFileSearchService.ParseQuery(query).HasUnsupportedNativeSyntax);
+            byte[]? sourceBytes = searchVirtual && sourceFolder != IntPtr.Zero ? PidlManager.ToBytes(sourceFolder) : null;
 
             CancelSearchWorkerOnly();
-            _searchCts = new CancellationTokenSource();
-            CancellationToken token = _searchCts.Token;
-            int myGen = ++_searchGeneration;
+            var searchCts = new CancellationTokenSource();
+            _searchCts = searchCts;
+            CancellationToken token = searchCts.Token;
+            int generation = ++_searchGeneration;
+            bool IsCurrent() => !_isDestroyed && !token.IsCancellationRequested && generation == _searchGeneration;
 
-            bool firstInit = _searchBrowser == null;
-            if (!EnsureSearchBrowserReady() || _searchBrowser == null)
-            {
-                _isSearchRunning = false;
-                _isSearchTruncated = false;
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                return 0;
-            }
-
-            _isShowingSearchResults = true;
-            ShowSearchPresentation();
-            _isSearchRunning = true;
-            _isSearchTruncated = false;
-            _searchMatchCount = 0;
-            _lastSearchBackend = SearchBackendKind.None;
-            _lastSearchElapsedMs = 0;
-            InvalidateSelectionCache();
-            _searchBrowser.SetEmptyText($"正在搜索“{query}”…");
-            SearchStateChanged?.Invoke(this, EventArgs.Empty);
-
-            // Pure virtual folder (e.g. Recycle Bin, Home): wait briefly for ResultsFolder and insert snapshotted items
-            if (!hasRealFsRoot && !isThisPcMode)
-            {
-                bool virtualReady = await WaitForResultsFolderReadyAsync(firstInit, myGen, token).ConfigureAwait(true);
-                _isFillSearchTransition = false;
-                if (!virtualReady || _isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
-                    return 0;
-
-                AttachDirectUiSubclassIfNeeded();
-                TrySetViewStyle(ExplorerViewStyle.Details);
-                EnsureSearchColumnsConfigured();
-
-                int added = AddPidlBatchToResultsFolder(virtualCandidates ?? new List<byte[]>());
-                uiSw.Stop();
-                _searchMatchCount = added;
-                _isSearchTruncated = virtualTruncated;
-                _lastSearchBackend = SearchBackendKind.VirtualFolder;
-                _lastSearchElapsedMs = uiSw.ElapsedMilliseconds;
-                _isSearchRunning = false;
-                _searchBrowser.SetEmptyText(added == 0 ? "没有与搜索条件匹配的项。" : string.Empty);
-                InvalidateSelectionCache();
-                SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                return added;
-            }
-
-            // Filesystem directory OR '此电脑' full-system search:
-            // Run ResultsFolder readiness wait CONCURRENTLY with Everything IPC / multi-threaded Win32 scan + background PIDL construction.
-            string? searchRoot = hasRealFsRoot ? folderFileSystemPath : null;
-            bool includeHidden = SearchHiddenItemsProvider?.Invoke() ?? PidlManager.GetShellVisibilityFlags().ShowHidden;
-            int remainingFsBudget = effectiveMaxResults;
-            if (isThisPcMode && virtualCandidates != null && virtualCandidates.Count > 0)
-            {
-                remainingFsBudget = Math.Max(1, effectiveMaxResults - virtualCandidates.Count);
-            }
-
-            var viewPreparedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var binderLock = new object();
-
-            Task<SearchExecutionReport> searchTask = Task.Run(async () =>
-            {
-                using var pidlBinder = new PidlManager.FastPidlBinder();
-
-                try
-                {
-                    return await FastFileSearchService.Shared.SearchAsync(
-                        query,
-                        searchRoot,
-                        includeHidden,
-                        remainingFsBudget,
-                        (entries, batchIndex) =>
-                        {
-                            if (token.IsCancellationRequested || _isDestroyed)
-                                return;
-
-                            IntPtr[] pidls = new IntPtr[entries.Length];
-                            int validCount = 0;
-                            try
-                            {
-                                lock (binderLock)
-                                {
-                                    for (int i = 0; i < entries.Length; i++)
-                                    {
-                                        if (token.IsCancellationRequested)
-                                            break;
-
-                                        SearchResultEntry entry = entries[i];
-                                        IntPtr pidl = pidlBinder.CreatePidlFromMetadata(
-                                            entry.FullPath,
-                                            entry.FileAttributes,
-                                            entry.FileSize,
-                                            entry.LastWriteTime);
-
-                                        if (pidl != IntPtr.Zero)
-                                        {
-                                            pidls[validCount++] = pidl;
-                                        }
-                                    }
-                                }
-                            }
-                            catch
-                            {
-                                for (int i = 0; i < validCount; i++)
-                                {
-                                    if (pidls[i] != IntPtr.Zero)
-                                    {
-                                        NativeMethods.ILFree(pidls[i]);
-                                        pidls[i] = IntPtr.Zero;
-                                    }
-                                }
-                                return;
-                            }
-
-                            if (validCount == 0)
-                                return;
-
-                            var ownedBatch = new OwnedPidlBatch(pidls, validCount);
-                            bool viewReady = viewPreparedTcs.Task.GetAwaiter().GetResult();
-                            if (!viewReady || token.IsCancellationRequested || _isDestroyed)
-                            {
-                                ownedBatch.Dispose();
-                                return;
-                            }
-
-                            try
-                            {
-                                DispatchSearchPidlBatchAsync(ownedBatch, batchIndex, myGen, token).GetAwaiter().GetResult();
-                            }
-                            catch
-                            {
-                                ownedBatch.Dispose();
-                            }
-                        },
-                        token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return new SearchExecutionReport(SearchBackendKind.None, 0, false, 0);
-                }
-            }, token);
-
+            var viewPrepared = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var fileBudget = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task workers = Task.CompletedTask;
             try
             {
-                bool ready = await WaitForResultsFolderReadyAsync(firstInit, myGen, token).ConfigureAwait(true);
-                _isFillSearchTransition = false;
-                if (!ready || _isDestroyed || token.IsCancellationRequested || myGen != _searchGeneration)
+                bool browserReady = EnsureSearchBrowserReady(out bool firstInit);
+                if (!IsCurrent()) return (0, false);
+                if (!browserReady || _searchBrowser == null)
                 {
-                    viewPreparedTcs.TrySetResult(false);
-                    return 0;
+                    _lastSearchNotice = "搜索结果视图未能初始化，请重新搜索。";
+                    _isSearchTruncated = false;
+                    SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                    return (0, false);
                 }
+
+                _isShowingSearchResults = true;
+                ShowSearchPresentation();
+                if (!IsCurrent()) return (0, false);
+                _isSearchRunning = true;
+                _isSearchTruncated = false;
+                _searchMatchCount = 0;
+                _lastSearchBackend = SearchBackendKind.None;
+                _lastSearchElapsedMs = 0;
+                InvalidateSelectionCache();
+                _searchBrowser.SetEmptyText($"正在搜索“{query}”…");
+                SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                if (!IsCurrent()) return (0, false);
+
+                Task<(List<byte[]> Items, bool Truncated)>? virtualTask = null;
+                if (searchVirtual)
+                {
+                    virtualTask = PidlManager.RunVirtualSearchAsync(staToken =>
+                    {
+                        IntPtr folder = sourceBytes == null ? IntPtr.Zero : PidlManager.FromBytes(sourceBytes);
+                        try { return VirtualChildrenProvider(folder, query, limit, staToken); }
+                        finally { PidlManager.Free(ref folder); }
+                    }, token, timeoutMs: 30000);
+                    workers = virtualTask;
+                }
+
+                // Leave room for top-level Shell devices while the filesystem scan streams.
+                // Only the tail waits for their actual count; unused slots return to files.
+                int reservedForDevices = Math.Min(64, (limit + 1) / 2);
+                int earlyFileBudget = searchVirtual ? limit - reservedForDevices : limit;
+                if (!searchVirtual) fileBudget.TrySetResult(limit);
+                Task<(SearchExecutionReport Report, bool Omitted)>? fileTask = null;
+                if (searchFiles)
+                {
+                    bool includeHidden = SearchHiddenItemsProvider?.Invoke() ?? PidlManager.GetShellVisibilityFlags().ShowHidden;
+                    fileTask = Task.Run(() => SearchFileBatchesAsync(query, hasFileSystemRoot ? folderFileSystemPath : null, includeHidden, limit,
+                        earlyFileBudget, fileBudget.Task, viewPrepared.Task, generation, token), token);
+                    workers = Task.WhenAll(workers, fileTask);
+                }
+
+                if (!await WaitForResultsFolderReadyAsync(firstInit, generation, token, elapsed) || !IsCurrent())
+                    return (0, false);
 
                 AttachDirectUiSubclassIfNeeded();
                 TrySetViewStyle(ExplorerViewStyle.Details);
                 EnsureSearchColumnsConfigured();
+                viewPrepared.TrySetResult(true);
 
-                // In '此电脑' mode, immediately surface matching drives/virtual items before or alongside file matches
-                if (isThisPcMode && virtualCandidates != null && virtualCandidates.Count > 0)
+                int virtualAdded = 0;
+                bool truncated = false;
+                bool completed = true;
+                string? notice = null;
+                if (virtualTask != null)
                 {
-                    int virtualAdded = AddPidlBatchToResultsFolder(virtualCandidates);
-                    if (virtualAdded > 0)
+                    try
                     {
-                        _searchMatchCount += virtualAdded;
-                        InvalidateSelectionCache();
-                        SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                        var result = await virtualTask;
+                        truncated = result.Truncated;
+                        int offset = 0;
+                        while (offset < result.Items.Count && IsCurrent())
+                        {
+                            int capacity = limit - _searchMatchCount;
+                            if (capacity <= 0)
+                            {
+                                truncated = true;
+                                break;
+                            }
+                            int count = Math.Min(Math.Min(offset == 0 ? 48 : 96, capacity), result.Items.Count - offset);
+                            int added = AddPidlBatchToResultsFolder(result.Items.GetRange(offset, count), generation);
+                            if (!IsCurrent()) return (0, false);
+                            virtualAdded += added;
+                            _searchMatchCount += added;
+                            offset += count;
+                            InvalidateSelectionCache();
+                            SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                            if (offset < result.Items.Count)
+                                await Dispatcher.Yield(DispatcherPriority.Background);
+                        }
+                    }
+                    catch (Exception ex) when (!token.IsCancellationRequested)
+                    {
+                        completed = false;
+                        notice = ex is TimeoutException ? "虚拟目录搜索响应超时，请稍后重试。" :
+                            ex is NotSupportedException ? "虚拟目录不支持此搜索条件。" : "未能读取虚拟目录，请稍后重试。";
                     }
                 }
+                if (!IsCurrent()) return (0, false);
+                fileBudget.TrySetResult(limit - virtualAdded);
 
-                viewPreparedTcs.TrySetResult(true);
-
-                SearchExecutionReport report = await searchTask.ConfigureAwait(true);
-
-                if (!_isDestroyed && myGen == _searchGeneration && !token.IsCancellationRequested)
+                SearchBackendKind backend = SearchBackendKind.VirtualFolder;
+                if (fileTask != null)
                 {
-                    uiSw.Stop();
-                    _isSearchTruncated = report.IsTruncated || (isThisPcMode && virtualTruncated);
-                    _lastSearchBackend = report.Backend;
-                    _lastSearchElapsedMs = Math.Max(1, uiSw.ElapsedMilliseconds);
-                    _lastSearchNotice = report.NoticeMessage;
-                    _isSearchRunning = false;
-                    string emptyText = !string.IsNullOrWhiteSpace(report.NoticeMessage)
-                        ? report.NoticeMessage!
-                        : "没有与搜索条件匹配的项。";
-                    _searchBrowser?.SetEmptyText(_searchMatchCount == 0 ? emptyText : string.Empty);
-                    InvalidateSelectionCache();
-                    SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                    var (report, omitted) = await fileTask;
+                    if (!IsCurrent()) return (0, false);
+                    backend = report.Backend;
+                    truncated |= report.IsTruncated || omitted;
+                    completed &= report.QuerySupported && backend != SearchBackendKind.None;
+                    if (report.NoticeMessage != null)
+                        notice = notice == null ? report.NoticeMessage : notice + " " + report.NoticeMessage;
                 }
+
+                _isSearchTruncated = truncated;
+                _lastSearchBackend = backend;
+                _lastSearchElapsedMs = Math.Max(1, elapsed.ElapsedMilliseconds);
+                _lastSearchNotice = notice;
+                _isSearchRunning = false;
+                int found = _searchMatchCount;
+                _searchBrowser?.SetEmptyText(_searchMatchCount == 0 ? notice ?? "没有与搜索条件匹配的项。" : string.Empty);
+                if (!IsCurrent()) return (0, false);
+                InvalidateSelectionCache();
+                SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                return (found, completed && IsCurrent());
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
-                viewPreparedTcs.TrySetResult(false);
+                return (0, false);
+            }
+            catch (Exception ex)
+            {
+                if (!IsCurrent()) return (0, false);
+                LeafTab.Shared.DiagnosticLog.Write("search-failed", ex);
+                _lastSearchNotice = "搜索未能完成，请重新搜索。";
+                _lastSearchElapsedMs = Math.Max(1, elapsed.ElapsedMilliseconds);
+                _isSearchRunning = false;
+                _searchBrowser?.SetEmptyText(_lastSearchNotice);
+                SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                return (_searchMatchCount, false);
             }
             finally
             {
-                viewPreparedTcs.TrySetResult(false);
+                viewPrepared.TrySetResult(false);
+                fileBudget.TrySetResult(0);
+                if (ReferenceEquals(_searchCts, searchCts))
+                    _searchCts = null;
+                if (!workers.IsCompleted)
+                    searchCts.Cancel();
+                // A canceled native scan may still own token registrations until its worker exits.
+                _ = workers.ContinueWith(t => { _ = t.Exception; searchCts.Dispose(); },
+                    CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
-
-            return _searchMatchCount;
         }
 
-        private async Task<bool> WaitForResultsFolderReadyAsync(bool firstInit, int expectedGen, CancellationToken token)
+        private async Task<(SearchExecutionReport Report, bool Omitted)> SearchFileBatchesAsync(
+            string query, string? root, bool includeHidden, int limit, int earlyBudget, Task<int> finalBudget,
+            Task<bool> viewPrepared, int generation, CancellationToken token)
+        {
+            using var binder = new PidlManager.FastPidlBinder();
+            int filesAdded = 0;
+            bool omitted = false;
+            SearchExecutionReport report = await FileSearchService.SearchAsync(query, root, includeHidden, limit, (entries, batchIndex) =>
+            {
+                if (!viewPrepared.GetAwaiter().GetResult() || token.IsCancellationRequested)
+                    return;
+                int available = finalBudget.IsCompleted ? finalBudget.GetAwaiter().GetResult() : earlyBudget;
+                int first = Math.Min(entries.Length, Math.Max(0, available - filesAdded));
+                filesAdded += Deliver(0, first);
+                if (first < entries.Length)
+                {
+                    int remaining = Math.Max(0, finalBudget.GetAwaiter().GetResult() - filesAdded);
+                    int tail = Math.Min(entries.Length - first, remaining);
+                    filesAdded += Deliver(first, tail);
+                    omitted |= first + tail < entries.Length;
+                }
+
+                int Deliver(int start, int count)
+                {
+                    if (count == 0 || token.IsCancellationRequested) return 0;
+                    var pidls = new IntPtr[count];
+                    using var batch = new OwnedPidlBatch(pidls, count);
+                    for (int i = 0; i < count && !token.IsCancellationRequested; i++)
+                    {
+                        SearchResultEntry item = entries[start + i];
+                        pidls[i] = binder.CreatePidlFromMetadata(item.FullPath, item.FileAttributes, item.FileSize, item.LastWriteTime);
+                    }
+                    if (token.IsCancellationRequested) return 0;
+                    var dispatched = DispatchSearchPidlBatchAsync(batch, batchIndex, generation, token).GetAwaiter().GetResult();
+                    omitted |= dispatched.Omitted;
+                    return dispatched.Added;
+                }
+            }, token).ConfigureAwait(false);
+            return (report, omitted);
+        }
+
+        private async Task<bool> WaitForResultsFolderReadyAsync(bool firstInit, int expectedGen, CancellationToken token, Stopwatch elapsed)
         {
             int maxIterations = firstInit ? 36 : 12;
-            for (int waitIdx = 0; waitIdx < maxIterations; waitIdx++)
+            for (int waitIdx = 0; ; waitIdx++)
             {
                 if (_isDestroyed || token.IsCancellationRequested || expectedGen != _searchGeneration)
                     return false;
 
-                if (IsResultsFolderReady())
+                bool ready = IsResultsFolderReady();
+                if (_isDestroyed || token.IsCancellationRequested || expectedGen != _searchGeneration)
+                    return false;
+                if (ready)
+                {
+                    _isFillSearchTransition = false;
                     return true;
+                }
 
+                if (waitIdx == maxIterations)
+                    break;
                 await Task.Delay(8).ConfigureAwait(true);
             }
-            return !_isDestroyed && !token.IsCancellationRequested && expectedGen == _searchGeneration && IsResultsFolderReady();
+
+            CancelSearchWorkerOnly();
+            _isFillSearchTransition = false;
+            _lastSearchElapsedMs = elapsed.ElapsedMilliseconds;
+            _lastSearchNotice = "搜索结果视图未能及时就绪，请重新搜索。";
+            _searchBrowser?.SetEmptyText(_lastSearchNotice);
+            SearchStateChanged?.Invoke(this, EventArgs.Empty);
+            return false;
         }
 
-        private Task DispatchSearchPidlBatchAsync(OwnedPidlBatch batch, int batchIndex, int expectedGen, CancellationToken token)
+        // The scanner owns the batch until the Dispatcher operation finishes, including cancellation or failure.
+        private Task<(int Added, bool Omitted)> DispatchSearchPidlBatchAsync(
+            OwnedPidlBatch batch, int batchIndex, int expectedGen, CancellationToken token)
         {
-            DispatcherPriority priority = batchIndex == 0 ? DispatcherPriority.Normal : DispatcherPriority.Background;
-            bool queued = false;
-            try
+            var priority = batchIndex == 0 ? DispatcherPriority.Normal : DispatcherPriority.Background;
+            return Dispatcher.InvokeAsync(() =>
             {
-                Task uiTask = Dispatcher.InvokeAsync(() =>
+                if (_isDestroyed || token.IsCancellationRequested || expectedGen != _searchGeneration || !_isShowingSearchResults)
+                    return (0, false);
+                int count = Math.Min(batch.Count, Math.Max(0, _currentSearchMaxResults - _searchMatchCount));
+                int added = AddOwnedPidlBatchToResultsFolder(batch, count, expectedGen);
+                if (expectedGen != _searchGeneration) return (0, false);
+                if (added > 0)
                 {
-                    try
-                    {
-                        if (_isDestroyed || token.IsCancellationRequested || expectedGen != _searchGeneration || !_isShowingSearchResults)
-                            return;
-
-                        int added = AddOwnedPidlBatchToResultsFolder(batch);
-                        if (added > 0)
-                        {
-                            _searchMatchCount += added;
-                            InvalidateSelectionCache();
-                            SearchStateChanged?.Invoke(this, EventArgs.Empty);
-                        }
-                    }
-                    finally
-                    {
-                        batch.Dispose();
-                    }
-                }, priority).Task;
-                queued = true;
-
-                // Ensure PIDLs are guaranteed freed even if the Dispatcher cancels a Background item during shutdown
-                return uiTask.ContinueWith(
-                    _ => batch.Dispose(),
-                    CancellationToken.None,
-                    TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
-            }
-            finally
-            {
-                if (!queued)
-                    batch.Dispose();
-            }
+                    _searchMatchCount += added;
+                    InvalidateSelectionCache();
+                    SearchStateChanged?.Invoke(this, EventArgs.Empty);
+                }
+                return (added, count < batch.Count);
+            }, priority).Task;
         }
 
-        private int AddOwnedPidlBatchToResultsFolder(OwnedPidlBatch batch)
+        private int AddOwnedPidlBatchToResultsFolder(OwnedPidlBatch batch, int count, int generation)
         {
             IntPtr[]? pidls = batch.RawArray;
-            int count = batch.Count;
             if (pidls == null || count <= 0)
                 return 0;
 
             IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf, out IFolderView2? fv2, out IntPtr pfv2);
             if (rf == null)
-                return 0;
+                throw new IOException("搜索结果视图不可用。");
 
             int added = 0;
             bool redrawSuspended = false;
@@ -466,7 +481,7 @@ namespace LeafTab.Controls
                     redrawSuspended = true;
                 }
 
-                for (int i = 0; i < count; i++)
+                for (int i = 0; i < count && generation == _searchGeneration; i++)
                 {
                     IntPtr pidl = pidls[i];
                     if (pidl == IntPtr.Zero)
@@ -495,14 +510,14 @@ namespace LeafTab.Controls
             return added;
         }
 
-        private int AddPidlBatchToResultsFolder(List<byte[]> pidlBytesList)
+        private int AddPidlBatchToResultsFolder(List<byte[]> pidlBytesList, int generation)
         {
             if (pidlBytesList.Count == 0)
                 return 0;
 
             IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf, out IFolderView2? fv2, out IntPtr pfv2);
             if (rf == null)
-                return 0;
+                throw new IOException("搜索结果视图不可用。");
 
             int added = 0;
             bool redrawSuspended = false;
@@ -516,6 +531,7 @@ namespace LeafTab.Controls
 
                 foreach (byte[] raw in pidlBytesList)
                 {
+                    if (generation != _searchGeneration) break;
                     IntPtr pidl = PidlManager.FromBytes(raw);
                     if (pidl != IntPtr.Zero)
                     {
@@ -552,6 +568,9 @@ namespace LeafTab.Controls
 
         private bool IsResultsFolderReady()
         {
+            if (SimulateSearchViewTimeoutForTest)
+                return false;
+
             IResultsFolder? rf = AcquireResultsFolder(out IntPtr prf, out IFolderView2? fv2, out IntPtr pfv2);
             if (rf == null)
                 return false;
@@ -607,19 +626,25 @@ namespace LeafTab.Controls
             }
         }
 
-        internal static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(IntPtr folderPidl, string query, int maxItems = 200)
+        internal static (List<byte[]> Items, bool Truncated) CollectMatchingVirtualChildren(
+            IntPtr folderPidl,
+            string query,
+            int maxItems = 200,
+            CancellationToken cancellationToken = default)
         {
             var matched = new List<byte[]>();
             bool truncated = false;
             if (folderPidl == IntPtr.Zero)
-                return (matched, false);
+                throw new IOException("无法取得虚拟目录。");
 
+            cancellationToken.ThrowIfCancellationRequested();
             FastFileSearchService.ParsedSearchQuery parsedQuery = FastFileSearchService.ParseQuery(query);
             if (parsedQuery.HasUnsupportedNativeSyntax)
-                return (matched, false);
+                throw new NotSupportedException("虚拟目录不支持此搜索条件。");
             Guid iidShellItem = ShellConstants.IID_IShellItem;
-            if (NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? folderItem) != ShellConstants.S_OK || folderItem == null)
-                return (matched, false);
+            Marshal.ThrowExceptionForHR(NativeMethods.SHCreateItemFromIDList(folderPidl, ref iidShellItem, out IShellItem? folderItem), new IntPtr(-1));
+            if (folderItem == null)
+                throw new IOException("无法取得虚拟目录。");
 
             IntPtr pSf = IntPtr.Zero;
             IShellFolder? sf = null;
@@ -630,20 +655,30 @@ namespace LeafTab.Controls
             {
                 Guid bhid = new Guid("3981e224-f559-11d3-8e3a-00c04f6837d5");
                 Guid iidSf = ShellConstants.IID_IShellFolder;
-                if (folderItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidSf, out pSf) != ShellConstants.S_OK || pSf == IntPtr.Zero)
-                    return (matched, false);
+                Marshal.ThrowExceptionForHR(folderItem.BindToHandler(IntPtr.Zero, ref bhid, ref iidSf, out pSf), new IntPtr(-1));
+                if (pSf == IntPtr.Zero)
+                    throw new IOException("无法打开虚拟目录。");
 
                 sf = (IShellFolder)Marshal.GetObjectForIUnknown(pSf);
                 uint flags = ShellConstants.SHCONTF_FOLDERS | ShellConstants.SHCONTF_NONFOLDERS;
-                if (sf.EnumObjects(IntPtr.Zero, flags, out pEnum) != ShellConstants.S_OK || pEnum == IntPtr.Zero)
+                int hr = sf.EnumObjects(IntPtr.Zero, flags, out pEnum);
+                Marshal.ThrowExceptionForHR(hr, new IntPtr(-1));
+                if (hr == ShellConstants.S_FALSE)
                     return (matched, false);
+                if (pEnum == IntPtr.Zero)
+                    throw new IOException("无法枚举虚拟目录。");
 
                 enumList = (IEnumIDList)Marshal.GetObjectForIUnknown(pEnum);
-                while (enumList.Next(1, out IntPtr childRel, out uint fetched) == ShellConstants.S_OK && fetched == 1 && childRel != IntPtr.Zero)
+                while (true)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    IntPtr childRel = PidlManager.NextChildPidl(enumList);
+                    if (childRel == IntPtr.Zero)
+                        break;
                     IntPtr fullChild = IntPtr.Zero;
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
                         if (NativeMethods.SHCreateItemWithParent(folderPidl, sf, childRel, ref iidShellItem, out IShellItem? item) == ShellConstants.S_OK && item != null)
                         {
                             try
@@ -674,9 +709,6 @@ namespace LeafTab.Controls
                         PidlManager.Free(ref childRel);
                     }
                 }
-            }
-            catch
-            {
             }
             finally
             {
@@ -731,7 +763,11 @@ namespace LeafTab.Controls
             return query.MatchesEntry(name, name, in entry);
         }
 
-        public bool ExitSearchMode() => ExitSearchModeInternal(notifyChanged: true);
+        public bool ExitSearchMode()
+        {
+            SearchRequestVersion++;
+            return ExitSearchModeInternal(notifyChanged: true);
+        }
 
         private bool ExitSearchModeInternal(bool notifyChanged)
         {
@@ -756,11 +792,12 @@ namespace LeafTab.Controls
         private void CancelSearchWorkerOnly()
         {
             _searchGeneration++;
-            if (_searchCts != null)
+            CancellationTokenSource? active = _searchCts;
+            _searchCts = null;
+            if (active != null)
             {
-                try { _searchCts.Cancel(); } catch { }
-                _searchCts.Dispose();
-                _searchCts = null;
+                // 仅触发取消而不立即 Dispose，由 StartSearchAsync 在后台任务收敛后释放，避免 Register 抛 ObjectDisposedException
+                try { active.Cancel(); } catch { }
             }
             _isSearchRunning = false;
         }
@@ -911,7 +948,7 @@ namespace LeafTab.Controls
                 if (owner._isFillSearchTransition)
                     return ShellConstants.S_OK;
 
-                if (PidlManager.AreEqual(pidlFolder, owner._searchResultsPidl))
+                if (owner._searchResultsPidl == IntPtr.Zero || PidlManager.AreEqual(pidlFolder, owner._searchResultsPidl))
                     return E_ABORT;
 
                 // Keep the result container in place if the Shell requests a

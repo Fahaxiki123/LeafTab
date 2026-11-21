@@ -12,10 +12,10 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>..\LeafTab\Assets\LeafTab.ico</ApplicationIcon>
-    <AssemblyName>LeafTab-v0.6.9-Setup-x64</AssemblyName>
+    <AssemblyName>LeafTab-v0.6.10-Setup-x64</AssemblyName>
     <RootNamespace>LeafTab.Setup</RootNamespace>
-    <Version>0.6.9</Version>
-    <AssemblyTitle>LeafTab（一叶）v0.6.9 安装向导</AssemblyTitle>
+    <Version>0.6.10</Version>
+    <AssemblyTitle>LeafTab（一叶）v0.6.10 安装向导</AssemblyTitle>
     <Product>LeafTab（一叶）</Product>
     <Company>LeafTab</Company>
     <Copyright>Copyright © LeafTab</Copyright>
@@ -94,6 +94,8 @@
   </Target>
 
   <ItemGroup>
+    <Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.Xml" />
     <Compile Include="..\Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

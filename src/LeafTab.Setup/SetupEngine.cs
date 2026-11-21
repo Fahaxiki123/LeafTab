@@ -43,7 +43,7 @@ namespace LeafTab.Setup
 
     internal static class SetupEngine
     {
-        public const string AppVersion = "0.6.9";
+        public const string AppVersion = "0.6.10";
         public const string PayloadResourceName = "LeafTab.Payload.gz";
         public const string UninstallRegistryKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\LeafTab";
         public const string ShortcutFileName = "LeafTab（一叶）.lnk";
@@ -385,7 +385,7 @@ namespace LeafTab.Setup
                 string uninstallExePath = Path.Combine(installDir, UninstallerExeName);
                 string selfExe = Assembly.GetExecutingAssembly().Location;
                 string? registeredDirectory = GetRegisteredInstallDirectory();
-                bool ownsSharedData = registeredDirectory == null || PathsEqual(registeredDirectory, installDir);
+                bool ownsSharedData = OwnsSharedUserData(installDir, registeredDirectory);
 
                 progress?.Invoke(20, "正在退出此安装位置的程序并恢复关联…");
                 await Task.Run(() =>
@@ -1239,26 +1239,68 @@ namespace LeafTab.Setup
                 SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero);
         }
 
+        internal static bool OwnsSharedUserData(string installDir, string? registeredDirectory, string? defaultInstallDirectory = null)
+        {
+            if (File.Exists(Path.Combine(installDir, ".portable")))
+                return false;
+            if (registeredDirectory != null)
+                return PathsEqual(registeredDirectory, installDir);
+            return PathsEqual(installDir, defaultInstallDirectory ?? GetDefaultInstallDirectory());
+        }
+
         internal static void RemoveKnownUserData(string installDir, string? userDirectory = null, bool includeSharedData = true)
         {
             string userDir = userDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "LeafTab");
-            foreach (string directory in includeSharedData ? new[] { installDir, userDir } : new[] { installDir })
+            if (includeSharedData)
+                RemoveConfigFiles(userDir, requireLeafTabSignature: false, isPortableDirectory: false);
+
+            bool hasPortableMarker = File.Exists(Path.Combine(installDir, ".portable"));
+            if (!PathsEqual(installDir, userDir))
+                RemoveConfigFiles(installDir, requireLeafTabSignature: true, isPortableDirectory: hasPortableMarker);
+        }
+
+        private static void RemoveConfigFiles(string directory, bool requireLeafTabSignature, bool isPortableDirectory)
+        {
+            string absolute = Path.GetFullPath(directory);
+            if (string.Equals(absolute.TrimEnd('\\'), Path.GetPathRoot(absolute)?.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("拒绝清理磁盘根目录。");
+            for (var parent = new DirectoryInfo(absolute); parent != null; parent = parent.Parent)
+                if (parent.Exists && (parent.Attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("配置目录包含链接，已保留数据。");
+
+            string[] names = { "config.json", "config.json.bak", "config.json.tmp", "config.json.migrated.bak" };
+            bool hasAnyLeafTabSignature = false;
+            if (requireLeafTabSignature && isPortableDirectory)
             {
-                string absolute = Path.GetFullPath(directory);
-                if (string.Equals(absolute.TrimEnd('\\'), Path.GetPathRoot(absolute)?.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException("拒绝清理磁盘根目录。");
-                for (var parent = new DirectoryInfo(absolute); parent != null; parent = parent.Parent)
-                    if (parent.Exists && (parent.Attributes & FileAttributes.ReparsePoint) != 0)
-                        throw new IOException("配置目录包含链接，已保留数据。");
-                foreach (string name in new[] { "config.json", "config.json.bak", "config.json.tmp", "config.json.migrated.bak" })
+                foreach (string name in names)
                 {
-                    string file = Path.Combine(absolute, name);
-                    if (!File.Exists(file)) continue;
-                    if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new IOException("配置文件是链接，已保留数据。");
+                    string candidate = Path.Combine(absolute, name);
+                    if (File.Exists(candidate) &&
+                        (File.GetAttributes(candidate) & FileAttributes.ReparsePoint) == 0 &&
+                        LegacyConfigFile.HasLeafTabFormat(candidate))
+                    {
+                        hasAnyLeafTabSignature = true;
+                        break;
+                    }
+                }
+            }
+
+            foreach (string name in names)
+            {
+                string file = Path.Combine(absolute, name);
+                if (!File.Exists(file)) continue;
+                if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new IOException("配置文件是链接，已保留数据。");
+                if (!requireLeafTabSignature || LegacyConfigFile.HasLeafTabFormat(file))
+                {
                     File.Delete(file);
                 }
-                TryRemoveDirectoryIfEmpty(absolute);
+                else if (isPortableDirectory && hasAnyLeafTabSignature && LegacyConfigFile.IsConfirmedCorruptJsonFile(file))
+                {
+                    // 便携目录下已确认存在 LeafTab 配置签名时，损坏/半写入的配置残余也一并清理，同时保留第三方有效 JSON
+                    File.Delete(file);
+                }
             }
+            TryRemoveDirectoryIfEmpty(absolute);
         }
 
         private static void DeleteOwnedShortcut(string path, string expectedExe)
@@ -1390,15 +1432,20 @@ namespace LeafTab.Setup
             return null;
         }
 
-        private static string NormalizeChosenFolder(string chosenPath)
+        internal static string NormalizeChosenFolder(string chosenPath)
         {
-            string trimmed = chosenPath.Trim().TrimEnd('\\', '/');
-            if (trimmed.EndsWith("\\LeafTab", StringComparison.OrdinalIgnoreCase) ||
-                File.Exists(Path.Combine(trimmed, "LeafTab.exe")))
+            var selected = new DirectoryInfo(chosenPath.Trim());
+            string fullName = selected.FullName;
+            string? root = Path.GetPathRoot(fullName);
+            if (!string.Equals(fullName, root, StringComparison.OrdinalIgnoreCase))
+                fullName = fullName.TrimEnd('\\', '/');
+
+            if (string.Equals(selected.Name, "LeafTab", StringComparison.OrdinalIgnoreCase) ||
+                File.Exists(Path.Combine(fullName, "LeafTab.exe")))
             {
-                return trimmed;
+                return fullName;
             }
-            return Path.Combine(trimmed, "LeafTab");
+            return Path.Combine(fullName, "LeafTab");
         }
 
         private static void RunProcessHiddenAndWait(string fileName, string arguments, int timeoutMs)

@@ -170,7 +170,7 @@ namespace LeafTab.RegressionTests
             }));
             Test("Setup version metadata matches main executable version", () =>
             {
-                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.9");
+                Check(LeafTab.Setup.SetupEngine.AppVersion == "0.6.10");
                 Check(typeof(LeafTab.App).Assembly.GetName().Version == Version.Parse(LeafTab.Setup.SetupEngine.AppVersion + ".0"));
             });
             Test("Breadcrumb blank hit filter distinguishes blank chrome from interactive buttons", () =>
@@ -990,6 +990,19 @@ namespace LeafTab.RegressionTests
                 Check(parsedBackslash.ExceedsComplexityBudget &&
                       backslashInlines <= FilePreviewService.MaxMarkdownInlineNodes + 2,
                     $"Expected trailing-backslash hard breaks capped <= {FilePreviewService.MaxMarkdownInlineNodes + 2}, got {backslashInlines}");
+            });
+            Test("Markdown list continuations preserve task boundaries with bounded allocation", () =>
+            {
+                string markdown = "- [x] first\n" + string.Concat(Enumerable.Repeat("  abc\n", 2048)) + "- second";
+                FilePreviewService.ParseMarkdownStructure("- warmup\n  abc");
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                var parsed = FilePreviewService.ParseMarkdownStructure(markdown);
+                long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                var list = (MdListBlock)parsed.Blocks.Single();
+                Check(list.Items.Length == 2 && list.Items[0].IsTask && list.Items[0].TaskDone);
+                Check(list.Items[0].Inlines.Single().Text == "first" + string.Concat(Enumerable.Repeat(" abc", 2048)));
+                Check(!list.Items[1].IsTask && list.Items[1].Inlines.Single().Text == "second");
+                Check(allocated < 4 * 1024 * 1024, "List continuation parsing allocated " + allocated + " bytes.");
             });
             Test("Markdown hard-break coalescing preserves text, formatting boundaries, and truncation", () =>
             {

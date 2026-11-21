@@ -73,6 +73,31 @@ namespace LeafTab.RegressionTests
                     "Everything-only functions must still reach Everything.");
             });
 
+            Test("An 8.3 search root accepts indexed results with long paths", () =>
+            {
+                string root = MakeDirectory("indexed long path fixture");
+                string? shortRoot = TryGetShortTestPath(root);
+                if (shortRoot == null)
+                {
+                    Console.WriteLine("8.3 aliases are unavailable on the fixture volume.");
+                    return;
+                }
+
+                string file = Path.Combine(root, "scoped-match.txt");
+                File.WriteAllText(file, "match");
+                string ipcClass = "LeafTabShortScope_" + Guid.NewGuid().ToString("N");
+                using var server = new MockEverythingIpcServer(ipcClass, root, file, file, file, root)
+                {
+                    Mode = MockEverythingMode.PagedDataset,
+                    PagedItems = new[] { (0u, file, 5UL) }
+                };
+                using var client = new EverythingIpcClient(ipcClass);
+                string[] paths = SearchFixPaths(new FastFileSearchService(client), "match", shortRoot, out SearchExecutionReport report);
+                Check(report.Backend == SearchBackendKind.Everything && paths.Length == 1 &&
+                    string.Equals(paths[0], file, StringComparison.OrdinalIgnoreCase),
+                    "The long indexed path was lost under an 8.3 search scope.");
+            });
+
             Test("Everything scope groups the complete advanced OR expression", () =>
             {
                 string query = FastFileSearchService.BuildEverythingScopedQuery(@"D:\scope", "content:a | content:b");
@@ -96,6 +121,95 @@ namespace LeafTab.RegressionTests
                     new[] { priority });
                 Check(hits.Count == 3 && hits.Select(x => x.FullPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 3);
                 Check(!report.IsTruncated, "Duplicate traversal falsely consumed the three-file result limit.");
+            });
+
+            Test("This PC matches paths relative to each drive, including priority folders", () =>
+            {
+                string[] roots = { MakeDirectory("global-drive-A"), MakeDirectory("global-drive-B") };
+                string[] expected = roots.Select(r => Path.Combine(r, "reports", "annual.txt")).ToArray();
+                foreach (string file in expected)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+                    File.WriteAllText(file, "annual");
+                }
+                using var disabled = new EverythingIpcClient("LeafTabMissing_" + Guid.NewGuid().ToString("N"));
+                var service = new FastFileSearchService(disabled);
+                foreach (string query in new[] { @"path:reports\annual.txt", @"path:regex:^reports\\annual\.txt$", @"reports\annual.txt" })
+                {
+                    var paths = new List<string>();
+                    service.ScanRootsWithWin32(roots, null, true, 10, FastFileSearchService.ParseQuery(query),
+                        (items, _) => paths.AddRange(items.Select(item => item.FullPath)), Stopwatch.StartNew(),
+                        CancellationToken.None, new[] { Path.GetDirectoryName(expected[1])! });
+                    Check(paths.Count == expected.Length && new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase).SetEquals(expected),
+                        "Wrong multi-drive results for " + query);
+                }
+            });
+
+            Test("A flat scan streams its first batch, honors cancellation, and caches only complete scans", () =>
+            {
+                string root = MakeDirectory("flat-stream");
+                const int files = 180;
+                for (int i = 0; i < files; i++)
+                    File.WriteAllText(Path.Combine(root, i.ToString("D3") + ".txt"), string.Empty);
+
+                int examined = 0;
+                var query = new FastFileSearchService.ParsedSearchQuery(new[]
+                {
+                    new FastFileSearchService.SearchClause((_, _) => { Interlocked.Increment(ref examined); return true; },
+                        null, requireDirectory: false, requireFile: true)
+                }, false, null);
+                using var disabled = new EverythingIpcClient("LeafTabMissing_" + Guid.NewGuid().ToString("N"));
+                var service = new FastFileSearchService(disabled);
+                using var cancel = new CancellationTokenSource();
+                SearchExecutionReport stopped = service.ScanRootsWithWin32(new[] { root }, root, true, 100, query,
+                    (items, index) =>
+                    {
+                        // One flat directory has exactly one enumerator. The number of
+                        // predicates evaluated tells us how far it got before delivery.
+                        Check(index == 0 && items.Length == 48 && examined == items.Length);
+                        cancel.Cancel();
+                    }, Stopwatch.StartNew(), cancel.Token);
+                Check(examined == 48 && stopped.MatchedCount == 48);
+
+                examined = 0;
+                var sizes = new List<int>();
+                SearchExecutionReport limited = service.ScanRootsWithWin32(new[] { root }, root, true, 100, query,
+                    (items, index) => { Check(index == sizes.Count); sizes.Add(items.Length); },
+                    Stopwatch.StartNew(), CancellationToken.None);
+                Check(examined == 101 && limited.IsTruncated && limited.MatchedCount == 100 &&
+                    sizes.SequenceEqual(new[] { 48, 52 }));
+
+                SearchExecutionReport exact = service.SearchAsync("ext:txt", root, true, files, (_, _) => { },
+                    CancellationToken.None).GetAwaiter().GetResult();
+                Check(exact.Backend == SearchBackendKind.NativeFastScan && exact.MatchedCount == files && !exact.IsTruncated);
+                SearchExecutionReport warm = service.SearchAsync("ext:txt", root, true, files, (_, _) => { },
+                    CancellationToken.None).GetAwaiter().GetResult();
+                Check(warm.Backend == SearchBackendKind.MemoryCache && warm.MatchedCount == files && !warm.IsTruncated);
+            });
+
+            Test("Concurrent directories deliver complete numbered batches in order", () =>
+            {
+                string root = MakeDirectory("parallel-batches");
+                for (int d = 0; d < 8; d++)
+                {
+                    string directory = Path.Combine(root, d.ToString());
+                    Directory.CreateDirectory(directory);
+                    for (int i = 0; i < 75; i++)
+                        File.WriteAllText(Path.Combine(directory, i.ToString() + ".txt"), string.Empty);
+                }
+                var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var sizes = new List<int>();
+                using var disabled = new EverythingIpcClient("LeafTabMissing_" + Guid.NewGuid().ToString("N"));
+                var service = new FastFileSearchService(disabled);
+                SearchExecutionReport report = service.ScanRootsWithWin32(new[] { root }, root, true, 400,
+                    FastFileSearchService.ParseQuery("ext:txt"), (items, index) =>
+                    {
+                        Check(index == sizes.Count, "Out-of-order batch index " + index);
+                        sizes.Add(items.Length);
+                        foreach (SearchResultEntry item in items) Check(paths.Add(item.FullPath));
+                    }, Stopwatch.StartNew(), CancellationToken.None);
+                Check(report.IsTruncated && report.MatchedCount == 400 && paths.Count == 400);
+                Check(sizes.SequenceEqual(new[] { 48, 96, 96, 96, 64 }));
             });
 
             Test("Virtual-child filtering uses actual kinds, sizes and modified dates", () =>
@@ -124,6 +238,57 @@ namespace LeafTab.RegressionTests
                     hasFileSize: false, hasLastWriteTime: false);
                 Check(!FastFileSearchService.ParseQuery("size:empty").MatchesEntry("unknown.txt", "unknown.txt", in unknown));
                 Check(!FastFileSearchService.ParseQuery("dm:<2020").MatchesEntry("unknown.txt", "unknown.txt", in unknown));
+            });
+
+            Test("Slow batch delivery does not block parallel workers or reorder batches", () =>
+            {
+                string root = MakeDirectory("nonblocking-batches");
+                for (int d = 0; d < 8; d++)
+                {
+                    string directory = Path.Combine(root, d.ToString());
+                    Directory.CreateDirectory(directory);
+                    for (int i = 0; i < 75; i++)
+                        File.WriteAllText(Path.Combine(directory, i.ToString() + ".txt"), string.Empty);
+                }
+                int evaluated = 0;
+                int evaluatedDuringSlowBatch0 = 0;
+                var query = new FastFileSearchService.ParsedSearchQuery(new[]
+                {
+                    new FastFileSearchService.SearchClause((_, _) => { Interlocked.Increment(ref evaluated); return true; },
+                        null, requireDirectory: false, requireFile: true)
+                }, false, null);
+                var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var batchIndices = new List<int>();
+                using var disabled = new EverythingIpcClient("LeafTabMissing_" + Guid.NewGuid().ToString("N"));
+                var service = new FastFileSearchService(disabled);
+                SearchExecutionReport report = service.ScanRootsWithWin32(new[] { root }, root, true, 400, query,
+                    (items, index) =>
+                    {
+                        batchIndices.Add(index);
+                        foreach (SearchResultEntry item in items) Check(paths.Add(item.FullPath));
+                        if (index == 0)
+                        {
+                            Thread.Sleep(120);
+                            evaluatedDuringSlowBatch0 = Volatile.Read(ref evaluated);
+                        }
+                    }, Stopwatch.StartNew(), CancellationToken.None);
+                Check(report.IsTruncated && report.MatchedCount == 400 && paths.Count == 400);
+                Check(batchIndices.SequenceEqual(Enumerable.Range(0, batchIndices.Count)));
+                Check(evaluatedDuringSlowBatch0 > 48, "Parallel scanning stalled behind slow batch 0 delivery.");
+            });
+
+            Test("ScanRootsWithWin32 returns cleanly when pre-canceled", () =>
+            {
+                string root = MakeDirectory("precanceled-scan");
+                File.WriteAllText(Path.Combine(root, "a.txt"), "a");
+                using var disabled = new EverythingIpcClient("LeafTabMissing_" + Guid.NewGuid().ToString("N"));
+                var service = new FastFileSearchService(disabled);
+                using var canceled = new CancellationTokenSource();
+                canceled.Cancel();
+                SearchExecutionReport report = service.ScanRootsWithWin32(new[] { root }, root, true, 100,
+                    FastFileSearchService.ParseQuery("ext:txt"), (_, _) => Check(false, "Canceled scan should not emit batches."),
+                    Stopwatch.StartNew(), canceled.Token);
+                Check(report.MatchedCount == 0 && !report.IsTruncated);
             });
         }
 
@@ -202,6 +367,12 @@ namespace LeafTab.RegressionTests
                     Check(querySeenOnExit == "match" && tab.SearchQuery == string.Empty && !host.IsShowingSearchResults);
                 });
 
+                await CheckSearchTimeoutAndRetryAsync(host, sourcePidl, source);
+                await CheckRapidSearchCancelSafetyAsync(host, sourcePidl, source);
+                await CheckFirstInitSearchTimeoutRebuildAsync(parent, sourcePidl, destinationPidl, source);
+                await CheckVirtualSearchLoadMoreAsync(host);
+                await CheckConcurrentVirtualSearchAsync(host);
+
                 tab.RestoreHistory(new[] { @"\\leaftab-fixture\share", source }, 1);
                 var firstResolution = new TaskCompletionSource<(IntPtr, string?)>();
                 CancellationToken oldToken = default;
@@ -252,6 +423,222 @@ namespace LeafTab.RegressionTests
                 if (parent != IntPtr.Zero) NativeMethods.DestroyWindow(parent);
                 PidlManager.Free(ref sourcePidl);
                 PidlManager.Free(ref destinationPidl);
+            }
+        }
+
+        private static async Task CheckSearchTimeoutAndRetryAsync(ExplorerBrowserHost host, IntPtr folder, string path)
+        {
+            // Hold the results browser out of view while the normal search entry point
+            // waits for its Shell folder. Restore the same COM object for the retry.
+            var field = typeof(ExplorerBrowserHost).GetField("_searchBrowser", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var resultsBrowser = field.GetValue(host);
+            CancellationToken worker = default;
+            bool observedTimeout = false;
+            void OnSearchStateChanged(object? sender, EventArgs e)
+            {
+                if (host.IsSearchRunning && !worker.CanBeCanceled)
+                {
+                    worker = NativeField<CancellationTokenSource>(host, "_searchCts").Token;
+                    field.SetValue(host, null);
+                }
+                else if (!host.IsSearchRunning && host.LastSearchNotice != null)
+                    observedTimeout = true;
+            }
+            host.SearchStateChanged += OnSearchStateChanged;
+            try
+            {
+                int found = await host.StartSearchAsync("ext:txt", folder, path);
+                Test("A search view timeout cancels the scanner and publishes a completed retryable state", () =>
+                    Check(found == 0 && observedTimeout && worker.IsCancellationRequested && !host.IsSearchRunning));
+            }
+            finally
+            {
+                host.SearchStateChanged -= OnSearchStateChanged;
+                field.SetValue(host, resultsBrowser);
+            }
+            int retry = await host.StartSearchAsync("match", folder, path);
+            Test("A search can be retried after the view times out", () =>
+                Check(retry == 1 && host.LastSearchNotice == null && !host.IsSearchRunning));
+            host.ExitSearchMode();
+        }
+
+        private static async Task CheckRapidSearchCancelSafetyAsync(ExplorerBrowserHost host, IntPtr folder, string path)
+        {
+            Task<int> t1 = host.StartSearchAsync("nonexistent-a", folder, path);
+            Task<int> t2 = host.StartSearchAsync("ext:txt", folder, path);
+            Task<int> t3 = host.StartSearchAsync("match", folder, path);
+            await Task.WhenAll(t1, t2, t3);
+            int finalCount = await t3;
+            Test("Rapid consecutive searches cancel cleanly without ObjectDisposedException", () =>
+                Check(finalCount == 1 && host.IsShowingSearchResults && !host.IsSearchRunning && host.SearchMatchCount == 1));
+            host.ExitSearchMode();
+        }
+
+        private static async Task CheckFirstInitSearchTimeoutRebuildAsync(IntPtr parent, IntPtr sourcePidl, IntPtr destinationPidl, string sourcePath)
+        {
+            IntPtr freshBuilt = IntPtr.Zero;
+            var freshTab = new ExplorerTabItem(sourcePidl);
+            ExplorerBrowserHost freshHost = freshTab.BrowserHost;
+            try
+            {
+                int navCount = 0;
+                freshHost.NavigationCompleted += (_, args) => { freshTab.UpdateFromNavigation(args.FolderPidl); navCount++; };
+                freshHost.Measure(new Size(960, 640));
+                freshHost.Arrange(new Rect(0, 0, 960, 640));
+                freshBuilt = ((HandleRef)typeof(ExplorerBrowserHost).GetMethod("BuildWindowCore", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .Invoke(freshHost, new object[] { new HandleRef(null, parent) })!).Handle;
+                Check(await WaitNativeConditionAsync(() => navCount > 0));
+
+                freshHost.SimulateSearchViewTimeoutForTest = true;
+                int first = await freshHost.StartSearchAsync("match", sourcePidl, sourcePath);
+                Check(first == 0 && freshHost.LastSearchNotice != null && !freshHost.IsSearchRunning);
+
+                // 验证当 ResultsFolder 未完成初始化时，迟到的 OnNavigationPending 不会把 PIDL 路由给主浏览器
+                var resultsPidlField = typeof(ExplorerBrowserHost).GetField("_searchResultsPidl", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                IntPtr savedResultsPidl = (IntPtr)resultsPidlField.GetValue(freshHost)!;
+                resultsPidlField.SetValue(freshHost, IntPtr.Zero);
+                PidlManager.Free(ref savedResultsPidl);
+                object sink = typeof(ExplorerBrowserHost).GetField("_searchEventSink", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(freshHost)!;
+                int hr = (int)sink.GetType().GetMethod("OnNavigationPending")!.Invoke(sink, new object[] { destinationPidl })!;
+                await Dispatcher.Yield(DispatcherPriority.Background);
+                Check(hr != ShellConstants.S_OK && PidlManager.AreEqual(freshTab.CurrentPidl, sourcePidl));
+
+                // 模拟首次 FillFromObject 留下的半初始化 _searchBrowser（无 ResultsFolder 视图），验证重试会自动销毁并重建成功
+                var browserField = typeof(ExplorerBrowserHost).GetField("_searchBrowser", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                object? halfInitialized = Activator.CreateInstance(Type.GetTypeFromCLSID(ShellConstants.CLSID_ExplorerBrowser, true)!);
+                object? previousBrowser = browserField.GetValue(freshHost);
+                browserField.SetValue(freshHost, halfInitialized);
+                if (previousBrowser != null && Marshal.IsComObject(previousBrowser))
+                    Marshal.FinalReleaseComObject(previousBrowser);
+
+                freshHost.SimulateSearchViewTimeoutForTest = false;
+                int retry = await freshHost.StartSearchAsync("match", sourcePidl, sourcePath);
+                object? rebuiltBrowser = browserField.GetValue(freshHost);
+                Test("First search timeout destroys half-initialized browser, guards late callbacks, and rebuilds on retry", () =>
+                    Check(retry == 1 && !ReferenceEquals(rebuiltBrowser, halfInitialized) &&
+                          freshHost.LastSearchNotice == null && !freshHost.IsSearchRunning));
+            }
+            finally
+            {
+                freshHost.SimulateSearchViewTimeoutForTest = false;
+                if (freshBuilt != IntPtr.Zero)
+                    typeof(ExplorerBrowserHost).GetMethod("DestroyWindowCore", BindingFlags.Instance | BindingFlags.NonPublic)!
+                        .Invoke(freshHost, new object[] { new HandleRef(freshHost, freshBuilt) });
+                freshTab.Dispose();
+            }
+        }
+
+        private static async Task CheckVirtualSearchLoadMoreAsync(ExplorerBrowserHost host)
+        {
+            string fixture = MakeDirectory("virtual-pagination");
+            for (int i = 0; i < 1001; i++)
+                File.WriteAllText(Path.Combine(fixture, i.ToString("D4") + ".txt"), string.Empty);
+            IntPtr folder = PidlManager.TryParseLocalOrShellFast(fixture);
+            try
+            {
+                // A fixture folder supplies real Shell children without using the user's Recycle Bin.
+                int first = await host.StartSearchAsync("file:", folder, folderFileSystemPath: null);
+                Check(first == ExplorerBrowserHost.DefaultMaxSearchResults && host.CanLoadMoreSearchResults);
+                int expanded = await host.LoadMoreSearchResultsAsync();
+                Test("A virtual folder can load search matches beyond the first thousand", () =>
+                    Check(expanded == 1001 && !host.CanLoadMoreSearchResults));
+            }
+            finally
+            {
+                host.ExitSearchMode();
+                PidlManager.Free(ref folder);
+            }
+        }
+
+        private static async Task CheckConcurrentVirtualSearchAsync(ExplorerBrowserHost host)
+        {
+            string folders = MakeDirectory("mixed-search");
+            string virtualRoot = Directory.CreateDirectory(Path.Combine(folders, "devices")).FullName;
+            string device = Path.Combine(virtualRoot, "device.txt");
+            string indexed = Path.Combine(folders, "indexed.txt");
+            File.WriteAllText(device, "device");
+            File.WriteAllText(indexed, "indexed");
+            string ipcClass = "LeafTabMixedSearch_" + Guid.NewGuid().ToString("N");
+            using var server = new MockEverythingIpcServer(ipcClass, folders, indexed, indexed, indexed, folders)
+            {
+                Mode = MockEverythingMode.PagedDataset,
+                PagedItems = new[] { (0u, indexed, 7UL) }
+            };
+            using var client = new EverythingIpcClient(ipcClass);
+            var originalService = host.FileSearchService;
+            var originalProvider = host.VirtualChildrenProvider;
+            var originalVisibility = host.SearchHiddenItemsProvider;
+            IntPtr pc = PidlManager.CreateThisPcPidl();
+            IntPtr fixture = PidlManager.TryParseLocalOrShellFast(virtualRoot);
+            byte[] fixtureBytes = PidlManager.ToBytes(fixture);
+            using var release = new ManualResetEventSlim();
+            try
+            {
+                host.FileSearchService = new FastFileSearchService(client);
+                host.SearchHiddenItemsProvider = () => true;
+                host.VirtualChildrenProvider = (_, query, cap, token) =>
+                {
+                    release.Wait(token);
+                    IntPtr copy = PidlManager.FromBytes(fixtureBytes);
+                    try { return ExplorerBrowserHost.CollectMatchingVirtualChildren(copy, query, cap, token); }
+                    finally { PidlManager.Free(ref copy); }
+                };
+                Task<bool> delayed = host.StartSearchForMoveAsync("file:", pc, null, 2);
+                Check(await WaitNativeConditionAsync(() => host.SearchMatchCount == 1 && host.IsSearchRunning),
+                    $"File results did not stream: count={host.SearchMatchCount}, running={host.IsSearchRunning}, IPC queries={server.QueryCount}.");
+                await Task.Delay(1600);
+                Check(!delayed.IsCompleted && host.LastSearchNotice == null);
+                release.Set();
+                bool completed = await delayed;
+                Test("This PC streams indexed files and merges devices arriving after 1.5 seconds", () =>
+                    Check(completed && host.SearchMatchCount == 2 && !host.IsSearchTruncated && host.LastSearchNotice == null));
+
+                int limited = await host.StartSearchAsync("file:", pc, null, 1);
+                Check(await host.SelectChildItemWhenReadyAsync(Path.GetFileName(device)));
+                Test("Devices and file matches share one limit and loading more returns both", () =>
+                    Check(limited == 1 && host.IsSearchTruncated && host.CanLoadMoreSearchResults));
+                int expanded = await host.LoadMoreSearchResultsAsync();
+                Check(expanded == 2 && !host.IsSearchTruncated);
+
+                release.Reset();
+                Task<bool> stale = host.StartSearchForMoveAsync("file:", pc, null, 100);
+                Check(await WaitNativeConditionAsync(() => host.SearchMatchCount == 1 && host.IsSearchRunning));
+                host.ExitSearchMode();
+                Check(!await stale && !host.IsShowingSearchResults);
+                release.Set();
+
+                host.VirtualChildrenProvider = (_, _, _, _) => throw new TimeoutException();
+                bool partial = await host.StartSearchForMoveAsync("file:", pc, null, 100);
+                Test("Device timeout preserves filesystem matches and marks the search incomplete", () =>
+                    Check(!partial && host.SearchMatchCount == 1 && host.LastSearchNotice != null && !host.IsSearchRunning));
+                host.ExitSearchMode();
+
+                host.VirtualChildrenProvider = (_, _, _, _) => throw new UnauthorizedAccessException();
+                bool denied = await host.StartSearchForMoveAsync("file:", fixture, null, 100);
+                Check(!denied && host.SearchMatchCount == 0 && host.LastSearchNotice != null);
+                host.VirtualChildrenProvider = originalProvider;
+                bool noMatches = await host.StartSearchForMoveAsync("missing-name", fixture, null, 100);
+                Test("An unreadable virtual folder is distinct from a successful search with zero matches", () =>
+                    Check(noMatches && host.SearchMatchCount == 0 && host.LastSearchNotice == null));
+                host.ExitSearchMode();
+                IntPtr plainFile = PidlManager.TryParseLocalOrShellFast(indexed);
+                try
+                {
+                    bool bound = await host.StartSearchForMoveAsync("file:", plainFile, null, 2);
+                    Test("A Shell item that cannot bind as a folder publishes an enumeration failure", () =>
+                        Check(!bound && host.LastSearchNotice != null && !host.IsSearchRunning));
+                }
+                finally { PidlManager.Free(ref plainFile); }
+            }
+            finally
+            {
+                release.Set();
+                host.ExitSearchMode();
+                host.VirtualChildrenProvider = originalProvider;
+                host.FileSearchService = originalService;
+                host.SearchHiddenItemsProvider = originalVisibility;
+                PidlManager.Free(ref pc);
+                PidlManager.Free(ref fixture);
             }
         }
     }

@@ -441,9 +441,10 @@ namespace LeafTab.Services
                 // 6. List (- / * / + or 1.) including GitHub task items (- [ ] / - [x])
                 if (TryParseListItem(line, out bool isOrdered, out string firstItemBody, out bool isTask, out bool taskDone))
                 {
-                    var rawItems = new List<(string Body, bool IsTask, bool TaskDone)>();
+                    var rawItems = new List<(StringBuilder Body, bool IsTask, bool TaskDone)>();
                     bool anyTask = isTask;
-                    rawItems.Add((firstItemBody, isTask, taskDone));
+                    int totalItems = 1;
+                    rawItems.Add((new StringBuilder(firstItemBody), isTask, taskDone));
                     i++;
 
                     while (i < endIndex)
@@ -466,7 +467,8 @@ namespace LeafTab.Services
                             if (itemOrd != isOrdered)
                                 break;
                             anyTask |= itemTask;
-                            rawItems.Add((itemBody, itemTask, itemDone));
+                            if (++totalItems <= MaxMarkdownBlocks)
+                                rawItems.Add((new StringBuilder(itemBody), itemTask, itemDone));
                             i++;
                             continue;
                         }
@@ -475,9 +477,8 @@ namespace LeafTab.Services
                             !TryParseFenceHeader(nextLine, out _, out _, out _) &&
                             !IsBlockquoteLine(nextLine))
                         {
-                            int lastIdx = rawItems.Count - 1;
-                            var prev = rawItems[lastIdx];
-                            rawItems[lastIdx] = (prev.Body + " " + nextLine.Trim(), prev.IsTask, prev.TaskDone);
+                            if (totalItems <= MaxMarkdownBlocks)
+                                rawItems[rawItems.Count - 1].Body.Append(' ').Append(nextLine.Trim());
                             i++;
                             continue;
                         }
@@ -485,20 +486,19 @@ namespace LeafTab.Services
                         break;
                     }
 
-                    int itemCap = Math.Min(rawItems.Count, MaxMarkdownBlocks);
-                    if (rawItems.Count > itemCap)
+                    if (totalItems > rawItems.Count)
                     {
-                        budget.FlagExceeded($"列表项过多（共 {rawItems.Count} 项），已自动切换为源码极速预览（点击「渲染」可预览前部排版）");
+                        budget.FlagExceeded($"列表项过多（共 {totalItems} 项），已自动切换为源码极速预览（点击「渲染」可预览前部排版）");
                     }
 
-                    var parsedItems = new List<MdListItemData>(itemCap);
-                    for (int li = 0; li < itemCap; li++)
+                    var parsedItems = new List<MdListItemData>(rawItems.Count);
+                    for (int li = 0; li < rawItems.Count; li++)
                     {
                         if (li > 0 && !budget.CanAddBlock())
                             break;
                         var entry = rawItems[li];
                         parsedItems.Add(new MdListItemData(
-                            ParseInlinesAst(entry.Body, budget, allowLinks: true),
+                            ParseInlinesAst(entry.Body.ToString(), budget, allowLinks: true),
                             entry.IsTask,
                             entry.TaskDone));
                     }
@@ -678,6 +678,10 @@ namespace LeafTab.Services
             var nodes = new List<MdInlineNode>(4);
             var plainBuffer = new StringBuilder();
             int i = 0;
+            int nextBracketParen = text.IndexOf("](", StringComparison.Ordinal);
+            bool noTripleStar = false, noTripleUnder = false;
+            bool noDoubleStar = false, noDoubleUnder = false;
+            bool noStrike = false, noSingleStar = false, noSingleUnder = false;
 
             bool FlushPlain()
             {
@@ -733,26 +737,28 @@ namespace LeafTab.Services
                     continue;
                 }
 
-                if (allowLinks && ch == '<')
+                if (allowLinks && ch == '<' && TryFindAutoLinkEnd(text, i, out int autoLinkEnd))
                 {
-                    int end = text.IndexOf('>', i + 1);
-                    if (end > i + 1)
+                    string url = text.Substring(i + 1, autoLinkEnd - i - 1);
+                    if (Uri.TryCreate(url, UriKind.Absolute, out Uri? autoUri) &&
+                        (autoUri.Scheme == Uri.UriSchemeHttp || autoUri.Scheme == Uri.UriSchemeHttps))
                     {
-                        string url = text.Substring(i + 1, end - i - 1);
-                        if (url.IndexOfAny(new[] { ' ', '\t', '\r', '\n' }) < 0 &&
-                            Uri.TryCreate(url, UriKind.Absolute, out Uri? autoUri) &&
-                            (autoUri.Scheme == Uri.UriSchemeHttp || autoUri.Scheme == Uri.UriSchemeHttps))
-                        {
-                            if (!FlushPlain() || !budget.TryConsumeInlineNodes(2)) break;
-                            nodes.Add(new MdInlineNode(MdInlineKind.Link, url, url,
-                                new[] { new MdInlineNode(MdInlineKind.Plain, url) }));
-                            i = end + 1;
-                            continue;
-                        }
+                        if (!FlushPlain() || !budget.TryConsumeInlineNodes(2)) break;
+                        nodes.Add(new MdInlineNode(MdInlineKind.Link, url, url,
+                            new[] { new MdInlineNode(MdInlineKind.Plain, url) }));
+                        i = autoLinkEnd + 1;
+                        continue;
                     }
                 }
 
+                if ((ch == '[' || (ch == '!' && i + 1 < text.Length && text[i + 1] == '[')) &&
+                    nextBracketParen >= 0 && nextBracketParen <= i)
+                {
+                    nextBracketParen = text.IndexOf("](", i + 1, StringComparison.Ordinal);
+                }
+
                 if (ch == '!' && i + 1 < text.Length && text[i + 1] == '[' &&
+                    nextBracketParen >= 0 && nextBracketParen - (i + 1) <= MaxBracketLabelLength &&
                     TryParseBracketUrl(text, i + 1, out string altText, out _, out int afterImg))
                 {
                     if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
@@ -763,7 +769,9 @@ namespace LeafTab.Services
                     continue;
                 }
 
-                if (allowLinks && ch == '[' && TryParseBracketUrl(text, i, out string linkLabel, out string linkUrl, out int afterLink))
+                if (allowLinks && ch == '[' &&
+                    nextBracketParen >= 0 && nextBracketParen - i <= MaxBracketLabelLength &&
+                    TryParseBracketUrl(text, i, out string linkLabel, out string linkUrl, out int afterLink))
                 {
                     if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
                         break;
@@ -773,37 +781,56 @@ namespace LeafTab.Services
                     continue;
                 }
 
-                if (text.IndexOf("***", i, StringComparison.Ordinal) == i || text.IndexOf("___", i, StringComparison.Ordinal) == i)
+                bool doubleEmphasis = (ch == '*' || ch == '_') && i + 1 < text.Length && text[i + 1] == ch;
+                if (doubleEmphasis && i + 2 < text.Length && text[i + 2] == ch)
                 {
-                    string marker = text.Substring(i, 3);
-                    int close = text.IndexOf(marker, i + 3, StringComparison.Ordinal);
-                    if (close > i + 3)
+                    bool skipTriple = ch == '*' ? noTripleStar : noTripleUnder;
+                    if (!skipTriple)
                     {
-                        if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
-                            break;
-                        string inner = text.Substring(i + 3, close - (i + 3));
-                        nodes.Add(new MdInlineNode(MdInlineKind.BoldItalic, inner, null, ParseInlinesAst(inner, budget, allowLinks, inlineDepth + 1)));
-                        i = close + 3;
-                        continue;
+                        string marker = ch == '*' ? "***" : "___";
+                        int close = text.IndexOf(marker, i + 3, StringComparison.Ordinal);
+                        if (close > i + 3)
+                        {
+                            if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
+                                break;
+                            string inner = text.Substring(i + 3, close - (i + 3));
+                            nodes.Add(new MdInlineNode(MdInlineKind.BoldItalic, inner, null, ParseInlinesAst(inner, budget, allowLinks, inlineDepth + 1)));
+                            i = close + 3;
+                            continue;
+                        }
+                        if (close < 0)
+                        {
+                            if (ch == '*') noTripleStar = true;
+                            else noTripleUnder = true;
+                        }
                     }
                 }
 
-                if (text.IndexOf("**", i, StringComparison.Ordinal) == i || text.IndexOf("__", i, StringComparison.Ordinal) == i)
+                if (doubleEmphasis)
                 {
-                    string marker = text.Substring(i, 2);
-                    int close = text.IndexOf(marker, i + 2, StringComparison.Ordinal);
-                    if (close > i + 2)
+                    bool skipDouble = ch == '*' ? noDoubleStar : noDoubleUnder;
+                    if (!skipDouble)
                     {
-                        if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
-                            break;
-                        string inner = text.Substring(i + 2, close - (i + 2));
-                        nodes.Add(new MdInlineNode(MdInlineKind.Bold, inner, null, ParseInlinesAst(inner, budget, allowLinks, inlineDepth + 1)));
-                        i = close + 2;
-                        continue;
+                        string marker = ch == '*' ? "**" : "__";
+                        int close = text.IndexOf(marker, i + 2, StringComparison.Ordinal);
+                        if (close > i + 2)
+                        {
+                            if (!FlushPlain() || !budget.TryConsumeInlineNodes(1))
+                                break;
+                            string inner = text.Substring(i + 2, close - (i + 2));
+                            nodes.Add(new MdInlineNode(MdInlineKind.Bold, inner, null, ParseInlinesAst(inner, budget, allowLinks, inlineDepth + 1)));
+                            i = close + 2;
+                            continue;
+                        }
+                        if (close < 0)
+                        {
+                            if (ch == '*') noDoubleStar = true;
+                            else noDoubleUnder = true;
+                        }
                     }
                 }
 
-                if (text.IndexOf("~~", i, StringComparison.Ordinal) == i)
+                if (ch == '~' && i + 1 < text.Length && text[i + 1] == '~' && !noStrike)
                 {
                     int close = text.IndexOf("~~", i + 2, StringComparison.Ordinal);
                     if (close > i + 2)
@@ -815,9 +842,12 @@ namespace LeafTab.Services
                         i = close + 2;
                         continue;
                     }
+                    if (close < 0)
+                        noStrike = true;
                 }
 
-                if (ch == '*' || (ch == '_' && IsFlankingUnderscoreStart(text, i)))
+                if (((ch == '*' && !noSingleStar && i + 1 < text.Length && !char.IsWhiteSpace(text[i + 1])) ||
+                     (ch == '_' && !noSingleUnder && IsFlankingUnderscoreStart(text, i))))
                 {
                     int close = FindClosingEmphasis(text, i + 1, ch);
                     if (close > i + 1)
@@ -828,6 +858,11 @@ namespace LeafTab.Services
                         nodes.Add(new MdInlineNode(MdInlineKind.Italic, inner, null, ParseInlinesAst(inner, budget, allowLinks, inlineDepth + 1)));
                         i = close + 1;
                         continue;
+                    }
+                    if (close < 0)
+                    {
+                        if (ch == '*') noSingleStar = true;
+                        else noSingleUnder = true;
                     }
                 }
 
@@ -1625,6 +1660,35 @@ namespace LeafTab.Services
             return -1;
         }
 
+        private const int MaxAutoLinkLength = 2048;
+        private const int MaxBracketLabelLength = 2048;
+        private const int MaxBracketUrlLength = 2048;
+
+        private static bool TryFindAutoLinkEnd(string text, int openAngleIdx, out int closeAngleIdx)
+        {
+            closeAngleIdx = -1;
+            int start = openAngleIdx + 1;
+            bool isHttp =
+                (start + 7 <= text.Length && string.Compare(text, start, "http://", 0, 7, StringComparison.OrdinalIgnoreCase) == 0) ||
+                (start + 8 <= text.Length && string.Compare(text, start, "https://", 0, 8, StringComparison.OrdinalIgnoreCase) == 0);
+            if (!isHttp)
+                return false;
+
+            int limit = Math.Min(text.Length, start + MaxAutoLinkLength);
+            for (int k = start; k < limit; k++)
+            {
+                char c = text[k];
+                if (c == '>')
+                {
+                    closeAngleIdx = k;
+                    return true;
+                }
+                if (c == '<' || c == ' ' || c == '\t' || c == '\r' || c == '\n')
+                    return false;
+            }
+            return false;
+        }
+
         private static bool TryParseBracketUrl(string text, int openBracketIdx, out string label, out string url, out int afterIndex)
         {
             label = string.Empty;
@@ -1636,9 +1700,10 @@ namespace LeafTab.Services
 
             int closeBracket = -1;
             int depth = 1;
-            for (int j = openBracketIdx + 1; j < text.Length; j++)
+            int labelLimit = Math.Min(text.Length, openBracketIdx + MaxBracketLabelLength);
+            for (int j = openBracketIdx + 1; j < labelLimit; j++)
             {
-                if (text[j] == '\\' && j + 1 < text.Length)
+                if (text[j] == '\\' && j + 1 < labelLimit)
                 {
                     j++;
                     continue;
@@ -1663,11 +1728,12 @@ namespace LeafTab.Services
             int parenDepth = 1;
             char quote = '\0';
             bool angle = false;
+            int destLimit = Math.Min(text.Length, closeBracket + 2 + MaxBracketUrlLength);
             int destinationStart = closeBracket + 2;
-            while (destinationStart < text.Length && char.IsWhiteSpace(text[destinationStart])) destinationStart++;
-            for (int k = closeBracket + 2; k < text.Length; k++)
+            while (destinationStart < destLimit && char.IsWhiteSpace(text[destinationStart])) destinationStart++;
+            for (int k = closeBracket + 2; k < destLimit; k++)
             {
-                if (text[k] == '\\' && k + 1 < text.Length)
+                if (text[k] == '\\' && k + 1 < destLimit)
                 {
                     k++;
                     continue;

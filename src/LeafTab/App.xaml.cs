@@ -18,6 +18,69 @@ using LeafTab.Views;
 
 namespace LeafTab
 {
+    // Accessed only on the UI dispatcher, including the transition to live routing.
+    internal sealed class StartupLaunchQueue
+    {
+        private readonly Queue<LaunchActionRequest> _pending = new Queue<LaunchActionRequest>();
+        private readonly Func<LaunchActionRequest, Task<bool>> _route;
+        private bool _ready;
+
+        internal StartupLaunchQueue(Func<LaunchActionRequest, Task<bool>> route) => _route = route;
+        internal bool HasPending => _pending.Count != 0;
+
+        private async Task RouteSafeAsync(LaunchActionRequest request)
+        {
+            try
+            {
+                await _route(request);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("startup-launch-route-failed", ex);
+            }
+        }
+
+        internal void Accept(LaunchActionRequest request)
+        {
+            if (_ready) _ = RouteSafeAsync(request);
+            else _pending.Enqueue(request);
+        }
+
+        internal async Task CompleteAsync(Func<Task>? finishWindow = null)
+        {
+            try
+            {
+                while (HasPending || finishWindow != null)
+                {
+                    if (HasPending)
+                    {
+                        await RouteSafeAsync(_pending.Dequeue());
+                    }
+                    else
+                    {
+                        var finish = finishWindow!;
+                        finishWindow = null;
+                        try
+                        {
+                            await finish();
+                        }
+                        catch (Exception ex)
+                        {
+                            DiagnosticLog.Write("startup-launch-finish-failed", ex);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                // 即使单次路由或恢复回调异常，也必须解除排队态，避免单实例路由在进程生命周期内永久锁死
+                _ready = true;
+                while (HasPending)
+                    _ = RouteSafeAsync(_pending.Dequeue());
+            }
+        }
+    }
+
     public partial class App : Application
     {
         private static readonly uint s_currentPid = (uint)Process.GetCurrentProcess().Id;
@@ -175,8 +238,7 @@ namespace LeafTab
             }
 
             _isSelfTest = req.IsSelfTest;
-            var earlyBufferedRequests = new List<LaunchActionRequest>();
-            bool initialWindowReady = false;
+            var startupRequests = new StartupLaunchQueue(RouteExternalLaunchRequestAsync);
 
             Action<LaunchActionRequest> routeIncomingRequest = incoming =>
             {
@@ -192,14 +254,7 @@ namespace LeafTab
                     }
 
                     _hasHandledExternalOpen = true;
-                    if (initialWindowReady)
-                    {
-                        _ = RouteExternalLaunchRequestAsync(incoming);
-                    }
-                    else
-                    {
-                        earlyBufferedRequests.Add(incoming);
-                    }
+                    startupRequests.Accept(incoming);
                 }));
             };
 
@@ -256,7 +311,7 @@ namespace LeafTab
                                      AppConfigStore.Current.Settings.RestorePreviousTabs &&
                                      AppConfigStore.Current.Settings.OpenTabs.Count > 0;
             bool deferFallbackTab = !_isSelfTest &&
-                                    (isSilentWarmup || hasRestorableTabs || req.Targets.Count > 0 || req.IsComServerLaunch || earlyBufferedRequests.Count > 0);
+                                    (isSilentWarmup || hasRestorableTabs || req.Targets.Count > 0 || req.IsComServerLaunch || startupRequests.HasPending);
 
             var mainWindow = new MainWindow(
                 skipSessionPersistence: _isSelfTest,
@@ -270,25 +325,10 @@ namespace LeafTab
                 mainWindow.Height = 760;
             }
 
-            if (isSilentWarmup && earlyBufferedRequests.Count == 0)
+            if (isSilentWarmup && !startupRequests.HasPending)
             {
                 new WindowInteropHelper(mainWindow).EnsureHandle();
-                initialWindowReady = true;
-
-                while (earlyBufferedRequests.Count > 0)
-                {
-                    var batch = earlyBufferedRequests.ToArray();
-                    earlyBufferedRequests.Clear();
-                    foreach (LaunchActionRequest buffered in batch)
-                    {
-                        if (buffered.IsQuitProcess)
-                        {
-                            ForceExitAllWindows();
-                            return;
-                        }
-                        await RouteExternalLaunchRequestAsync(buffered);
-                    }
-                }
+                await startupRequests.CompleteAsync();
 
                 // Start the idle exit timer ONLY AFTER draining any requests that arrived during EnsureHandle(),
                 // and ONLY if this COM server remained purely passive with zero visible windows.
@@ -314,34 +354,28 @@ namespace LeafTab
                     }
                 }
 
-                await mainWindow.WaitUntilLoadedAsync();
+                try
+                {
+                    await mainWindow.WaitUntilLoadedAsync();
 
-                if (req.Targets.Count > 0)
-                {
-                    await mainWindow.HandleExternalLaunchRequestAsync(req, isInitialLaunch: true);
-                }
-                while (earlyBufferedRequests.Count > 0)
-                {
-                    var batch = earlyBufferedRequests.ToArray();
-                    earlyBufferedRequests.Clear();
-                    foreach (LaunchActionRequest buffered in batch)
+                    if (req.Targets.Count > 0)
                     {
-                        if (buffered.IsQuitProcess)
-                        {
-                            ForceExitAllWindows();
-                            return;
-                        }
-                        await RouteExternalLaunchRequestAsync(buffered);
+                        await mainWindow.HandleExternalLaunchRequestAsync(req, isInitialLaunch: true);
                     }
                 }
-
-                if (hasRestorableTabs && mainWindow.Tabs.Count == 0 && req.Targets.Count == 0 && earlyBufferedRequests.Count == 0)
+                catch (Exception ex)
                 {
-                    await mainWindow.TryRestoreSavedTabsIfEnabledAsync();
+                    DiagnosticLog.Write("startup-initial-launch-failed", ex);
                 }
 
-                mainWindow.EnsureAtLeastOneTabOpen(markAsAutoFallback: true);
-                initialWindowReady = true;
+                await startupRequests.CompleteAsync(async () =>
+                {
+                    if (hasRestorableTabs && mainWindow.Tabs.Count == 0 && req.Targets.Count == 0)
+                    {
+                        await mainWindow.TryRestoreSavedTabsIfEnabledAsync();
+                    }
+                    mainWindow.EnsureAtLeastOneTabOpen(markAsAutoFallback: true);
+                });
             }
 
             if (req.IsUiPreview)
@@ -598,7 +632,11 @@ namespace LeafTab
             IntPtr targetPidl,
             ClosedTabSnapshot? historySnapshot = null,
             MainWindow? cascadeFrom = null,
-            Point? screenTopLeftDip = null)
+            Point? screenTopLeftDip = null) =>
+            (await OpenTabInIndependentWindowAsync(targetPidl, historySnapshot, cascadeFrom, screenTopLeftDip)).Window;
+
+        internal async Task<(MainWindow Window, ExplorerTabItem Tab)> OpenTabInIndependentWindowAsync(
+            IntPtr targetPidl, ClosedTabSnapshot? historySnapshot, MainWindow? cascadeFrom, Point? screenTopLeftDip)
         {
             IntPtr clonedPidl = targetPidl != IntPtr.Zero
                 ? PidlManager.Clone(targetPidl)
@@ -606,15 +644,22 @@ namespace LeafTab
 
             try
             {
-                MainWindow newWin = await CreateSecondaryWindowCoreAsync(cascadeFrom, screenTopLeftDip);
-                ExplorerTabItem tab = newWin.AddNewTab(clonedPidl, activate: true, animateOpen: false);
-                if (historySnapshot != null)
+                ExplorerTabItem? tab = null;
+                MainWindow newWin = await CreateSecondaryWindowCoreAsync(cascadeFrom, screenTopLeftDip, destination =>
                 {
-                    tab.RestoreHistoryFromSnapshot(historySnapshot);
-                    newWin.RefreshNavigationChromeState();
-                }
+                    // Window.Show performs the first measure with dispatcher processing disabled.
+                    // Build the tab now, but mount its message-pumping Shell control after Loaded.
+                    tab = destination.AddNewTab(clonedPidl, activate: false, animateOpen: false, deferHostMount: true);
+                    if (historySnapshot != null)
+                    {
+                        tab.RestoreHistoryFromSnapshot(historySnapshot);
+                    }
+                });
+                if (newWin.IsClosingOrClosed || !newWin.Tabs.Contains(tab!))
+                    throw new OperationCanceledException("目标标签页已关闭。");
+                newWin.ActivateTab(tab!);
                 newWin.BringWindowToFront();
-                return newWin;
+                return (newWin, tab!);
             }
             finally
             {
@@ -622,7 +667,8 @@ namespace LeafTab
             }
         }
 
-        private async Task<MainWindow> CreateSecondaryWindowCoreAsync(MainWindow? cascadeFrom, Point? screenTopLeftDip)
+        private async Task<MainWindow> CreateSecondaryWindowCoreAsync(MainWindow? cascadeFrom, Point? screenTopLeftDip,
+            Action<MainWindow>? initializeBeforeShow = null)
         {
             var newWin = new MainWindow(skipSessionPersistence: _isSelfTest, deferInitialFallbackTab: true);
 
@@ -650,8 +696,22 @@ namespace LeafTab
                 }
             }
 
-            RegisterWindow(newWin);
-            newWin.Show();
+            try
+            {
+                // A moved tab that cannot be created must not leave a blank window on the desktop.
+                initializeBeforeShow?.Invoke(newWin);
+                RegisterWindow(newWin);
+                newWin.Show();
+            }
+            catch
+            {
+                if (!newWin.IsClosingOrClosed)
+                {
+                    newWin.PrepareForForceExit(skipPerWindowSave: true);
+                    newWin.Close();
+                }
+                throw;
+            }
             await newWin.WaitUntilLoadedAsync();
             return newWin;
         }

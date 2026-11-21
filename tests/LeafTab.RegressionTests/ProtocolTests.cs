@@ -41,7 +41,8 @@ namespace LeafTab.RegressionTests
             Test("Old uninstall preserves another installation's shared configuration", () =>
             {
                 string old = MakeDirectory("old-uninstall"), shared = MakeDirectory("shared-config");
-                File.WriteAllText(Path.Combine(old, "config.json"), "old");
+                File.WriteAllText(Path.Combine(old, ".portable"), "");
+                Check(AppConfigService.Save(ConfigWithBookmark("old"), Path.Combine(old, "config.json")));
                 File.WriteAllText(Path.Combine(shared, "config.json"), "new");
                 LeafTab.Setup.SetupEngine.RemoveKnownUserData(old, shared, false);
                 Check(!File.Exists(Path.Combine(old, "config.json")) && File.ReadAllText(Path.Combine(shared, "config.json")) == "new");

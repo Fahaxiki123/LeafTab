@@ -13,6 +13,7 @@ using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
 using LeafTab.Services;
+using LeafTab.Shared;
 
 namespace LeafTab.Views
 {
@@ -99,17 +100,17 @@ namespace LeafTab.Views
 
         private void PreviewOpenDefaultButton_Click(object sender, RoutedEventArgs e)
         {
-            if (_currentPreviewData == null ||
-                !_currentPreviewData.CanOpenWithDefaultApp ||
-                string.IsNullOrWhiteSpace(_currentPreviewData.FilePath) ||
-                !File.Exists(_currentPreviewData.FilePath))
-            {
-                return;
-            }
+            FilePreviewData? preview = _currentPreviewData;
+            if (_selectedTab == null || preview == null || !preview.CanOpenWithDefaultApp ||
+                string.IsNullOrWhiteSpace(preview.FilePath)) return;
+
+            // A native selection can change between status refreshes.
+            UpdateCommandBarAndStatus(computeBytes: true);
+            if (!ReferenceEquals(preview, _currentPreviewData)) return;
 
             try
             {
-                Process.Start(new ProcessStartInfo(_currentPreviewData.FilePath) { UseShellExecute = true });
+                Process.Start(new ProcessStartInfo(preview.FilePath) { UseShellExecute = true });
             }
             catch (Exception ex)
             {
@@ -168,7 +169,6 @@ namespace LeafTab.Views
             else
             {
                 CancelPendingPreviewLoad();
-                _currentPreviewData = null;
                 _lastPreviewSelectionKey = string.Empty;
                 ClearPreviewBodyContent();
 
@@ -193,16 +193,18 @@ namespace LeafTab.Views
         private void CancelPendingPreviewLoad()
         {
             _previewRequestVersion++;
-            if (_previewLoadCts != null)
+            CancellationTokenSource? active = _previewLoadCts;
+            _previewLoadCts = null;
+            if (active != null)
             {
-                try { _previewLoadCts.Cancel(); } catch { }
-                _previewLoadCts.Dispose();
-                _previewLoadCts = null;
+                // 仅触发取消而不在此提前 Dispose，由 LoadAndRenderSingleItemPreviewAsync 统一负责生命周期释放
+                try { active.Cancel(); } catch { }
             }
         }
 
         private void ClearPreviewBodyContent()
         {
+            _currentPreviewData = null;
             PreviewHeaderIcon.Source = null;
             PreviewHeaderTitle.Text = "预览";
             PreviewHeaderSubtitle.Text = "未选择任何项目";
@@ -263,48 +265,38 @@ namespace LeafTab.Views
             }
 
             if (string.Equals(key, _lastPreviewSelectionKey, StringComparison.Ordinal))
+            {
+                if (sel.SelectedItems <= 0)
+                    PreviewHeaderIcon.Source = _selectedTab?.Icon;
                 return;
+            }
 
             _lastPreviewSelectionKey = key;
             _previewMarkdownUserOverrideRaw = null;
             CancelPendingPreviewLoad();
+            ClearPreviewBodyContent();
 
             if (sel.SelectedItems <= 0)
             {
-                _currentPreviewData = null;
                 PreviewHeaderIcon.Source = _selectedTab?.Icon;
-                PreviewHeaderTitle.Text = "预览";
-                PreviewHeaderSubtitle.Text = "未选择任何项目";
-                PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-                PreviewDocumentViewer.Document = null;
-                PreviewTextBox.Text = string.Empty;
-                PreviewImageControl.Source = null;
-                PreviewEmptyText.Text = "选择一个文件以预览内容";
-                ShowPreviewBodyElement(PreviewEmptyPanel);
                 return;
             }
 
             if (sel.SelectedItems > 1)
             {
-                _currentPreviewData = null;
-                PreviewHeaderIcon.Source = null;
                 PreviewHeaderTitle.Text = $"已选择 {sel.SelectedItems} 个项目";
                 PreviewHeaderSubtitle.Text = sel.HasSizedFileSelection
                     ? $"总大小 {PidlManager.FormatByteSize(sel.SelectedSizeBytes)}"
                     : "多项选择";
-                PreviewRawToggleButton.Visibility = Visibility.Collapsed;
-                PreviewNoticeBanner.Visibility = Visibility.Collapsed;
-                PreviewDocumentViewer.Document = null;
-                PreviewTextBox.Text = string.Empty;
-                PreviewImageControl.Source = null;
                 PreviewEmptyText.Text = sel.HasSizedFileSelection
                     ? $"已选择 {sel.SelectedItems} 个项目（共 {PidlManager.FormatByteSize(sel.SelectedSizeBytes)}）"
                     : $"已选择 {sel.SelectedItems} 个项目";
-                ShowPreviewBodyElement(PreviewEmptyPanel);
                 return;
             }
 
+            PreviewHeaderTitle.Text = single.DisplayName ?? "预览";
+            PreviewHeaderSubtitle.Text = string.Empty;
+            PreviewEmptyText.Text = "正在加载预览…";
             int requestVersion = _previewRequestVersion;
             var cts = new CancellationTokenSource();
             _previewLoadCts = cts;
@@ -313,37 +305,40 @@ namespace LeafTab.Views
                 single.DisplayName,
                 single.IsFolder,
                 requestVersion,
-                cts);
+                cts,
+                token => FilePreviewService.LoadPreviewAsync(
+                    single.FileSystemPath, single.DisplayName, single.IsFolder, cancellationToken: token));
         }
 
-        private async Task LoadAndRenderSingleItemPreviewAsync(
+        internal async Task LoadAndRenderSingleItemPreviewAsync(
             string? filePath,
             string? displayName,
             bool isFolder,
             int requestVersion,
-            CancellationTokenSource cts)
+            CancellationTokenSource selectionCts,
+            Func<CancellationToken, Task<FilePreviewData>> readPreview,
+            int remoteTimeoutMs = RemotePreviewTimeoutMs)
         {
+            CancellationToken selectionToken = selectionCts.Token;
+            CancellationTokenSource? readCts = null;
+            Task<FilePreviewData>? loadTask = null;
             try
             {
-                Task<FilePreviewData> loadTask = FilePreviewService.LoadPreviewAsync(
-                    filePath,
-                    displayName,
-                    isFolder,
-                    typeName: null,
-                    cts.Token);
-
                 FilePreviewData data;
                 if (IsRemoteNetworkPath(filePath))
                 {
+                    readCts = CancellationTokenSource.CreateLinkedTokenSource(selectionToken);
+                    loadTask = readPreview(readCts.Token);
+                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(selectionToken);
                     Task completed = await Task.WhenAny(
                         loadTask,
-                        Task.Delay(RemotePreviewTimeoutMs, cts.Token)).ConfigureAwait(true);
+                        Task.Delay(remoteTimeoutMs, timeoutCts.Token)).ConfigureAwait(true);
+                    timeoutCts.Cancel();
 
                     if (!ReferenceEquals(completed, loadTask))
                     {
-                        if (_isClosingWindow || !_showPreviewPane || requestVersion != _previewRequestVersion || cts.IsCancellationRequested)
-                            return;
-
+                        selectionToken.ThrowIfCancellationRequested();
+                        readCts.Cancel();
                         data = BuildRemotePreviewTimeoutFallback(filePath!, displayName, isFolder);
                     }
                     else
@@ -353,10 +348,10 @@ namespace LeafTab.Views
                 }
                 else
                 {
-                    data = await loadTask.ConfigureAwait(true);
+                    data = await readPreview(selectionToken).ConfigureAwait(true);
                 }
 
-                if (_isClosingWindow || !_showPreviewPane || requestVersion != _previewRequestVersion || cts.IsCancellationRequested)
+                if (_isClosingWindow || !_showPreviewPane || requestVersion != _previewRequestVersion || selectionToken.IsCancellationRequested)
                     return;
 
                 _currentPreviewData = data;
@@ -364,6 +359,39 @@ namespace LeafTab.Views
             }
             catch (OperationCanceledException)
             {
+            }
+            catch (Exception ex)
+            {
+                if (_isClosingWindow || !_showPreviewPane || requestVersion != _previewRequestVersion || selectionToken.IsCancellationRequested) return;
+                DiagnosticLog.Write("preview-load-failed", ex);
+                ClearPreviewBodyContent();
+                PreviewHeaderTitle.Text = displayName ?? "预览";
+                PreviewHeaderSubtitle.Text = string.Empty;
+                PreviewEmptyText.Text = "无法读取此项目的预览。";
+            }
+            finally
+            {
+                if (ReferenceEquals(_previewLoadCts, selectionCts))
+                    _previewLoadCts = null;
+                selectionCts.Dispose();
+
+                if (readCts != null && loadTask != null)
+                {
+                    // A synchronous Shell or file read may outlive the timeout. It still owns its token.
+                    _ = loadTask.ContinueWith(
+                        t =>
+                        {
+                            _ = t.Exception;
+                            readCts.Dispose();
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+                else
+                {
+                    readCts?.Dispose();
+                }
             }
         }
 

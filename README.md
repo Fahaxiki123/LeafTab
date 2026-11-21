@@ -2,15 +2,22 @@
 
 **[获取最新稳定版](https://github.com/Fahaxiki123/LeafTab/releases/latest)** · [全部版本](https://github.com/Fahaxiki123/LeafTab/releases)
 
-截至 **2026-11-18** 已核对发布版本：**v0.6.9 稳定性与交互修复版**（2026-11-17 发布）。
+截至 **2026-11-21** 已核对发布版本：**v0.6.10 搜索、预览、移窗与卸载可靠性修复版**（2026-11-21 发布）。
 
-**[下载 v0.6.9 Windows x64 安装包](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/LeafTab-v0.6.9-Setup-x64.exe)** · [版本说明](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.9) · [SHA-256 校验文件](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/SHA256SUMS.txt) · [同版本源码](https://github.com/Fahaxiki123/LeafTab/tree/v0.6.9)
+**[下载 v0.6.10 Windows x64 安装包](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.10/LeafTab-v0.6.10-Setup-x64.exe)** · [版本说明](https://github.com/Fahaxiki123/LeafTab/releases/tag/v0.6.10) · [SHA-256 校验文件](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.10/SHA256SUMS.txt) · [同版本源码](https://github.com/Fahaxiki123/LeafTab/tree/v0.6.10)
 
 一款面向 **Windows 10 x64（1903~22H2）与 Windows 11 x64** 的轻量级、无广告、零注入多标签资源管理器。
 
-内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 363 KiB）**，基于系统自带运行时，零第三方 DLL 依赖。
+内部直接托管 Windows 官方公开的 `IExplorerBrowser`（`SHELLDLL_DefView`）原生视图控件，外层基于 `.NET Framework 4.8 + WPF` 打造简约高级的 **Apple 风「极简云雾」液态玻璃（Liquid Glass）** 功能区、自适应圆弧连接标签栏（空间不足时可横向滚动并使用标签列表）、极简无框悬浮命令栏、SF Symbols 双色调分层矢量图标体系、可交互面包屑与异步搜索舱。提供轻量级 **图形化一键安装包（约 382.5 KiB）**，基于系统自带运行时，零第三方 DLL 依赖。
 
 ---
+
+## 0.6.10 更新内容
+
+- **搜索与导航并发可靠性**：修复「此电脑」在快速返回索引结果与慢设备枚举并存时漏项并合并延迟到达的设备；补齐受限虚拟目录枚举失败区分、超千项展开、搜索视图超时重连及快速连续搜索取消竞态；「此电脑」排序与范围筛选对齐，且慢速虚拟目录枚举不再阻塞其他标签页的面包屑菜单，后台 STA 线程在工作结束后稳定退出。
+- **实时预览可靠性与性能**：远程/网络文件预览超时后保证渲染明确的中文超时提示并阻止旧回调干扰当前选择；将 Markdown 内联与列表解析收紧为线性复杂度并降低超大文本分配。
+- **跨窗移窗与启动路由**：跨窗移入标签失败回滚时若用户已在目标窗口新建标签，保留新开标签并避免误关窗口，恢复源标签待执行搜索状态，并在移窗后完整继承搜索词、匹配结果与扩容上限；修复窗口在 `Loaded` 前关闭导致挂起以及冷启动/会话恢复期间早期打开请求遗漏。
+- **安装、卸载与配置保护**：卸载与安装清理严格核验 `.portable` 目录、签名可识别的旧配置与超上限第三方 `config.json`，避免误删第三方或用户文件；修复 `--no-register-uninstall` 清理、`启动后自动启动` 与向导关闭阻塞及驱动器根目录路径格式问题。
 
 ## 0.6.9 更新内容
 
@@ -87,9 +94,9 @@
 
 ## 下载与安装
 
-前往 [**最新稳定版下载页**](https://github.com/Fahaxiki123/LeafTab/releases/latest) 获取当前发布。上方 v0.6.9 安装包、校验文件和源码均固定到同一版本；后续升级使用最新稳定版入口，查找旧版使用 [全部版本](https://github.com/Fahaxiki123/LeafTab/releases)。
+前往 [**最新稳定版下载页**](https://github.com/Fahaxiki123/LeafTab/releases/latest) 获取当前发布。上方 v0.6.10 安装包、校验文件和源码均固定到同一版本；后续升级使用最新稳定版入口，查找旧版使用 [全部版本](https://github.com/Fahaxiki123/LeafTab/releases)。
 
-- **已核对的 v0.6.9 图形化安装包**：[LeafTab-v0.6.9-Setup-x64.exe](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.9/LeafTab-v0.6.9-Setup-x64.exe)（约 363 KiB）
+- **已核对的 v0.6.10 图形化安装包**：[LeafTab-v0.6.10-Setup-x64.exe](https://github.com/Fahaxiki123/LeafTab/releases/download/v0.6.10/LeafTab-v0.6.10-Setup-x64.exe)（约 382.5 KiB）
   - 纯用户态免管理员权限安装（默认安装至 `%LOCALAPPDATA%\Programs\LeafTab`），支持自定义安装路径与覆盖升级；
   - 安装向导内可一键勾选**「设为默认资源管理器（接管文件夹与 Win+E）」**、**「添加文件夹右键菜单」**与**「桌面/开始菜单快捷方式」**；
   - 支持在 Windows **「设置 → 应用 → 安装的应用」**中一键干净卸载，卸载时自动恢复系统默认文件夹打开方式，不留任何损坏关联。
@@ -188,7 +195,7 @@ msbuild LeafTab.sln /t:Restore,Build /p:Configuration=Release /p:Platform=x64
 编译产物位于：
 ```text
 src\LeafTab\bin\x64\Release\net48\LeafTab.exe                              # 主程序编译产物（由安装包自动压缩内嵌）
-src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.9-Setup-x64.exe       # 图形化一键安装包（内嵌压缩主程序与卸载向导）
+src\LeafTab.Setup\bin\x64\Release\net48\LeafTab-v0.6.10-Setup-x64.exe      # 图形化一键安装包（内嵌压缩主程序与卸载向导）
 ```
 
 ---

@@ -46,6 +46,7 @@ namespace LeafTab.Views
         private readonly ObservableCollection<BookmarkItemViewModel> _bookmarks;
         private readonly AppConfigStore? _sharedStore;
         private readonly Stack<ClosedTabSnapshot> _closedTabs = new Stack<ClosedTabSnapshot>();
+        private readonly HashSet<ExplorerTabItem> _movingTabs = new HashSet<ExplorerTabItem>();
         private readonly List<string> _recentFolders;
 
         private ExplorerTabItem? _selectedTab;
@@ -1138,7 +1139,7 @@ namespace LeafTab.Views
 
             try
             {
-                ExplorerBrowserHost? adoptedHost = TryConsumePrewarmedHost(effectivePidl);
+                ExplorerBrowserHost? adoptedHost = deferHostMount ? null : TryConsumePrewarmedHost(effectivePidl);
                 var tab = new ExplorerTabItem(effectivePidl, _showPreviewPane, adoptedHost);
                 ExplorerBrowserHost host = tab.BrowserHost;
 
@@ -1442,29 +1443,152 @@ namespace LeafTab.Views
             }
         }
 
-        public async Task<MainWindow?> MoveTabToNewWindowAsync(ExplorerTabItem tab, Point? screenTopLeftDip = null)
+        private enum MovedTabRestoreOutcome
         {
-            if (App.CurrentApp == null || tab == null || !_tabs.Contains(tab) || _tabs.Count <= 1)
+            Ready,
+            UserInteracted,
+            Failed
+        }
+
+        public Task<MainWindow?> MoveTabToNewWindowAsync(ExplorerTabItem tab, Point? screenTopLeftDip = null)
+        {
+            App? app = App.CurrentApp;
+            if (app == null) return Task.FromResult<MainWindow?>(null);
+            return TransferTabAsync(
+                tab,
+                (pidl, snapshot) => app.OpenTabInIndependentWindowAsync(
+                    pidl, snapshot, cascadeFrom: screenTopLeftDip.HasValue ? null : this, screenTopLeftDip: screenTopLeftDip),
+                closeNewWindowOnFailure: true);
+        }
+
+        internal async Task<MainWindow?> TransferTabAsync(
+            ExplorerTabItem tab,
+            Func<IntPtr, ClosedTabSnapshot, Task<(MainWindow Window, ExplorerTabItem Tab)>> openWindow,
+            bool closeNewWindowOnFailure = false)
+        {
+            if (tab == null || !_tabs.Contains(tab) || _tabs.Count <= 1 || !_movingTabs.Add(tab))
                 return null;
 
-            ClosedTabSnapshot snapshot = tab.CreateClosedSnapshot();
-            IntPtr clonedPidl = tab.CurrentPidl != IntPtr.Zero
-                ? PidlManager.Clone(tab.CurrentPidl)
-                : PidlManager.CreateThisPcPidl();
+            string sourceQuery = tab.SearchQuery;
+            int sourceSearchVersion = tab.BrowserHost.SearchRequestVersion;
+            bool deferredSearch = _searchDebounceTimer.IsEnabled && ReferenceEquals(_pendingSearchTab, tab);
+            if (deferredSearch)
+            {
+                _searchDebounceTimer.Stop();
+                _pendingSearchTab = null;
+            }
+
+            IntPtr clonedPidl = IntPtr.Zero;
+            bool sourceConsumed = false;
+            bool sourceQueryChanged = false;
+            void OnSourcePropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+            {
+                if (e.PropertyName == nameof(ExplorerTabItem.SearchQuery)) sourceQueryChanged = true;
+            }
+            tab.PropertyChanged += OnSourcePropertyChanged;
+            bool SourceStillMatches() =>
+                !sourceQueryChanged && !_isClosingWindow && _tabs.Contains(tab) &&
+                tab.BrowserHost.SearchRequestVersion == sourceSearchVersion &&
+                PidlManager.AreEqual(tab.CurrentPidl, clonedPidl) &&
+                !tab.BrowserHost.HasRequestedDifferentFolder(clonedPidl);
 
             try
             {
-                DetachAndDisposeTabFromCurrentWindow(tab);
-                return await App.CurrentApp.OpenNewIndependentWindowAsync(
-                    clonedPidl,
-                    historySnapshot: snapshot,
-                    cascadeFrom: screenTopLeftDip.HasValue ? null : this,
-                    screenTopLeftDip: screenTopLeftDip);
+                clonedPidl = tab.CurrentPidl != IntPtr.Zero ? PidlManager.Clone(tab.CurrentPidl) : PidlManager.CreateThisPcPidl();
+                int maxResults = tab.BrowserHost.IsShowingSearchResults
+                    ? tab.BrowserHost.CurrentSearchMaxResults : ExplorerBrowserHost.DefaultMaxSearchResults;
+                var (destination, moved) = await openWindow(clonedPidl, tab.CreateClosedSnapshot());
+                MovedTabRestoreOutcome outcome = await destination.RestoreMovedTabViewCoreAsync(moved, clonedPidl, sourceQuery, maxResults);
+                if (outcome == MovedTabRestoreOutcome.Failed)
+                {
+                    if (closeNewWindowOnFailure && !ReferenceEquals(destination, this) &&
+                        !destination.IsClosingOrClosed && destination.Tabs.Contains(moved))
+                    {
+                        if (destination.Tabs.Count == 1)
+                        {
+                            destination.PrepareForForceExit(skipPerWindowSave: true);
+                            destination.Close();
+                        }
+                        else destination.DetachAndDisposeTabFromCurrentWindow(moved);
+                    }
+                    if (!_isClosingWindow) SetTransientStatus("目标视图未就绪，已保留原标签页。");
+                    return null;
+                }
+
+                if (SourceStillMatches())
+                {
+                    if (_tabs.Count == 1) Close();
+                    else DetachAndDisposeTabFromCurrentWindow(tab);
+                    sourceConsumed = true;
+                }
+                return destination;
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("move-tab-failed", ex);
+                SetTransientStatus("移动标签页失败，已保留原标签页。");
+                return null;
             }
             finally
             {
+                tab.PropertyChanged -= OnSourcePropertyChanged;
+                bool resume = deferredSearch && !sourceConsumed && SourceStillMatches();
                 PidlManager.Free(ref clonedPidl);
+                _movingTabs.Remove(tab);
+                if (resume && _pendingSearchTab == null)
+                {
+                    _pendingSearchTab = tab;
+                    _searchDebounceTimer.Start();
+                }
+                else if (resume && !ReferenceEquals(_pendingSearchTab, tab))
+                {
+                    // Another tab now owns the window's timer. Run the suspended request independently.
+                    _ = RunDebouncedSearchAsync(tab);
+                }
             }
+        }
+
+        internal async Task<bool> RestoreMovedTabViewAsync(ExplorerTabItem tab, IntPtr folder, string query, int maxResults) =>
+            await RestoreMovedTabViewCoreAsync(tab, folder, query, maxResults) != MovedTabRestoreOutcome.Failed;
+
+        private async Task<MovedTabRestoreOutcome> RestoreMovedTabViewCoreAsync(ExplorerTabItem tab, IntPtr folder, string query, int maxResults)
+        {
+            var host = tab.BrowserHost;
+            int searchVersion = host.SearchRequestVersion;
+            bool editedQuery = !string.IsNullOrEmpty(tab.SearchQuery);
+            void OnSearchTextChanged(object sender, TextChangedEventArgs e)
+            {
+                if (!_suppressSearchTextChanged && ReferenceEquals(tab, _selectedTab)) editedQuery = true;
+            }
+            MovedTabRestoreOutcome CheckOutcome(bool completed)
+            {
+                if (_isClosingWindow || !_tabs.Contains(tab)) return MovedTabRestoreOutcome.Failed;
+                if (editedQuery || host.SearchRequestVersion != searchVersion || host.HasRequestedDifferentFolder(folder))
+                    return MovedTabRestoreOutcome.UserInteracted;
+                return completed ? MovedTabRestoreOutcome.Ready : MovedTabRestoreOutcome.Failed;
+            }
+
+            SearchTextBox.TextChanged += OnSearchTextChanged;
+            try
+            {
+                bool navigated = await host.WaitForFolderNavigationAsync(folder);
+                // NavigationCompleted updates the tab and search box in a posted dispatcher callback.
+                await Dispatcher.Yield(DispatcherPriority.Background);
+                var outcome = CheckOutcome(navigated && host.IsFolderNavigationComplete(folder));
+                string normalizedQuery = (query ?? string.Empty).Trim();
+                if (outcome != MovedTabRestoreOutcome.Ready || normalizedQuery.Length == 0) return outcome;
+
+                tab.SearchQuery = normalizedQuery;
+                if (ReferenceEquals(tab, _selectedTab)) SetSearchBoxTextSilently(normalizedQuery);
+                bool completed = await host.StartSearchForMoveAsync(normalizedQuery, folder, tab.FileSystemPath, maxResults);
+                return CheckOutcome(completed);
+            }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("move-tab-restore-failed", ex);
+                return CheckOutcome(false);
+            }
+            finally { SearchTextBox.TextChanged -= OnSearchTextChanged; }
         }
 
         private void CloseTabsToRight(ExplorerTabItem pivotTab)
@@ -2788,7 +2912,7 @@ namespace LeafTab.Views
             };
             menu.Items.Add(miOpenDiagLogs);
 
-            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.9";
+            string appVer = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.6.10";
             var miAboutVer = new MenuItem
             {
                 Header = $"版本 LeafTab v{appVer} (x64)",
@@ -3240,7 +3364,6 @@ namespace LeafTab.Views
             ClearDragHoverState();
 
             CancelPendingPreviewLoad();
-            _currentPreviewData = null;
             _lastPreviewSelectionKey = string.Empty;
             ClearPreviewBodyContent();
 
@@ -3275,12 +3398,12 @@ namespace LeafTab.Views
             }
 
             _isClosingWindow = true;
+            _loadedTcs.TrySetResult(false);
             _statusRefreshTimer.Stop();
             _searchDebounceTimer.Stop();
             ClearDragHoverState();
 
             CancelPendingPreviewLoad();
-            _currentPreviewData = null;
             ClearPreviewBodyContent();
 
             _addressParseCts?.Cancel();

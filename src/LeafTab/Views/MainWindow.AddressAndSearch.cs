@@ -9,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Threading;
 using LeafTab.Controls;
 using LeafTab.Interop;
 using LeafTab.Models;
@@ -223,7 +224,7 @@ namespace LeafTab.Views
 
         private void BreadcrumbSegment_Click(object sender, RoutedEventArgs e)
         {
-            if (sender is Button btn && btn.Tag is BreadcrumbNode node && _selectedTab != null)
+            if (sender is FrameworkElement element && element.Tag is BreadcrumbNode node && _selectedTab != null)
             {
                 IntPtr pidl = PidlManager.FromBytes(node.PidlBytes);
                 if (pidl != IntPtr.Zero)
@@ -264,62 +265,208 @@ namespace LeafTab.Views
             }
         }
 
-        private void BreadcrumbChevron_Click(object sender, RoutedEventArgs e)
+        private async void BreadcrumbChevron_Click(object sender, RoutedEventArgs e)
         {
             if (sender is not Button btn || btn.Tag is not BreadcrumbNode node || _selectedTab == null)
                 return;
 
-            IntPtr parentPidl = PidlManager.FromBytes(node.PidlBytes);
-            if (parentPidl == IntPtr.Zero)
-                return;
-
-            List<BreadcrumbNode> children;
-            try
-            {
-                children = PidlManager.EnumerateChildFolders(parentPidl, maxCount: 80);
-            }
-            finally
-            {
-                PidlManager.Free(ref parentPidl);
-            }
-
+            e.Handled = true;
             var menu = CreateLiquidGlassContextMenu(btn);
-            if (children.Count == 0)
+            var lifetime = new CancellationTokenSource();
+            CancellationToken token = lifetime.Token;
+            int closed = 0;
+            int activeOps = 1; // 追踪目录枚举与各页图标异步任务，避免门关闭后提前释放 CTS
+
+            void ReleaseOp()
             {
-                menu.Items.Add(new MenuItem { Header = "（无子文件夹）", IsEnabled = false });
-            }
-            else
-            {
-                foreach (BreadcrumbNode child in children)
+                if (Interlocked.Decrement(ref activeOps) == 0 && Volatile.Read(ref closed) != 0)
                 {
-                    var mi = new MenuItem
-                    {
-                        Header = child.Title.Replace("_", "__"),
-                        Tag = child,
-                        Icon = CreateMenuIcon(child.Icon)
-                    };
-                    mi.Click += (_, _) =>
-                    {
-                        IntPtr target = PidlManager.FromBytes(child.PidlBytes);
-                        if (target != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                _selectedTab?.BrowserHost.NavigateToPidl(target);
-                                _selectedTab?.BrowserHost.FocusNativeView();
-                            }
-                            finally
-                            {
-                                PidlManager.Free(ref target);
-                            }
-                        }
-                    };
-                    menu.Items.Add(mi);
+                    try { lifetime.Dispose(); } catch { }
                 }
             }
 
+            void CloseWhenDetached(object s, RoutedEventArgs args) => menu.IsOpen = false;
+            void CleanupOnClose()
+            {
+                if (Interlocked.Exchange(ref closed, 1) != 0)
+                    return;
+
+                btn.Unloaded -= CloseWhenDetached;
+                try { lifetime.Cancel(); } catch { }
+                if (Volatile.Read(ref activeOps) == 0)
+                {
+                    try { lifetime.Dispose(); } catch { }
+                }
+            }
+
+            btn.Unloaded += CloseWhenDetached;
+            menu.Closed += (_, _) => CleanupOnClose();
+            menu.Items.Add(new MenuItem { Header = "正在读取子文件夹…", IsEnabled = false });
             menu.IsOpen = true;
-            e.Handled = true;
+            if (!menu.IsOpen)
+            {
+                CleanupOnClose();
+                ReleaseOp();
+                return;
+            }
+
+            try
+            {
+                BreadcrumbChildrenResult result = await PidlManager.GetChildFoldersResultAsync(node.PidlBytes, token);
+                if (token.IsCancellationRequested)
+                    return;
+
+                ShowBreadcrumbFolderPagesCore(
+                    menu,
+                    result.Children,
+                    token,
+                    result.IsTruncated,
+                    onIconWorkStart: () => Interlocked.Increment(ref activeOps),
+                    onIconWorkEnd: ReleaseOp);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                DiagnosticLog.Write("breadcrumb-enumeration-failed", ex);
+                if (token.IsCancellationRequested) return;
+                menu.Items.Clear();
+                menu.Items.Add(new MenuItem { Header = "无法读取子文件夹", IsEnabled = false });
+                ResetContextMenuScrollToTop(menu);
+            }
+            finally
+            {
+                ReleaseOp();
+            }
+        }
+
+        private void ShowBreadcrumbFolderPages(ContextMenu menu, List<BreadcrumbNode> children, CancellationToken token) =>
+            ShowBreadcrumbFolderPagesCore(menu, children, token, isTruncated: false, onIconWorkStart: null, onIconWorkEnd: null);
+
+        private void ShowBreadcrumbFolderPagesCore(
+            ContextMenu menu,
+            List<BreadcrumbNode> children,
+            CancellationToken token,
+            bool isTruncated,
+            Action? onIconWorkStart,
+            Action? onIconWorkEnd)
+        {
+            const int pageSize = 80;
+            CancellationTokenSource? loadingIcons = null;
+            async void ShowPage(int start)
+            {
+                if (token.IsCancellationRequested)
+                    return;
+
+                try { loadingIcons?.Cancel(); } catch { }
+                menu.Items.Clear();
+                if (children.Count == 0)
+                {
+                    menu.Items.Add(new MenuItem { Header = "（无子文件夹）", IsEnabled = false });
+                    ResetContextMenuScrollToTop(menu);
+                    return;
+                }
+
+                void AddPageButton(string title, int offset)
+                {
+                    var button = new MenuItem { Header = title, StaysOpenOnClick = true };
+                    button.Click += (_, _) => ShowPage(offset);
+                    menu.Items.Add(button);
+                }
+
+                if (start > 0) AddPageButton("上一页", Math.Max(0, start - pageSize));
+                var page = children.GetRange(start, Math.Min(pageSize, children.Count - start));
+                var items = new List<MenuItem>(page.Count);
+                foreach (BreadcrumbNode child in page)
+                {
+                    var item = new MenuItem
+                    {
+                        Header = child.Title.Replace("_", "__"),
+                        Tag = child
+                    };
+                    item.Click += BreadcrumbSegment_Click;
+                    menu.Items.Add(item);
+                    items.Add(item);
+                }
+                if (start + page.Count < children.Count)
+                {
+                    AddPageButton("下一页", start + page.Count);
+                }
+                else if (isTruncated)
+                {
+                    menu.Items.Add(new MenuItem
+                    {
+                        Header = $"已达安全上限，仅显示前 {children.Count} 个子文件夹",
+                        IsEnabled = false
+                    });
+                }
+
+                ResetContextMenuScrollToTop(menu);
+
+                onIconWorkStart?.Invoke();
+                CancellationTokenSource? request = null;
+                try
+                {
+                    try
+                    {
+                        request = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return;
+                    }
+
+                    loadingIcons = request;
+                    var icons = await PidlManager.GetChildFolderIconsAsync(page, request.Token);
+                    if (request.IsCancellationRequested || token.IsCancellationRequested)
+                        return;
+                    for (int i = 0; i < items.Count; i++)
+                        items[i].Icon = CreateMenuIcon(icons[i]);
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { DiagnosticLog.Write("breadcrumb-icons-failed", ex); }
+                finally
+                {
+                    if (request != null)
+                    {
+                        if (ReferenceEquals(loadingIcons, request))
+                            loadingIcons = null;
+                        try { request.Dispose(); } catch { }
+                    }
+                    onIconWorkEnd?.Invoke();
+                }
+            }
+            ShowPage(0);
+        }
+
+        private static void ResetContextMenuScrollToTop(ContextMenu menu)
+        {
+            ScrollViewer? sv = FindVisualDescendant<ScrollViewer>(menu);
+            if (sv != null)
+            {
+                sv.ScrollToTop();
+            }
+            else
+            {
+                _ = menu.Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+                {
+                    FindVisualDescendant<ScrollViewer>(menu)?.ScrollToTop();
+                }));
+            }
+        }
+
+        private static T? FindVisualDescendant<T>(DependencyObject root) where T : DependencyObject
+        {
+            int count = VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(root, i);
+                if (child is T match)
+                    return match;
+                T? nested = FindVisualDescendant<T>(child);
+                if (nested != null)
+                    return nested;
+            }
+            return null;
         }
 
         private void AddressBoxBorder_MouseEnter(object sender, MouseEventArgs e) => UpdateBookmarkStarOpacity(animate: true);
@@ -779,10 +926,14 @@ namespace LeafTab.Views
             ExplorerTabItem? target = _pendingSearchTab;
             _pendingSearchTab = null;
 
-            if (target != null && _tabs.Contains(target))
-            {
-                await ExecuteSearchOnTabAsync(target, target.SearchQuery);
-            }
+            if (target != null) await RunDebouncedSearchAsync(target);
+        }
+
+        private async Task RunDebouncedSearchAsync(ExplorerTabItem target)
+        {
+            try { await ExecuteSearchOnTabAsync(target, target.SearchQuery); }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { DiagnosticLog.Write("search-ui-failed", ex); }
         }
 
         private void CancelSearchForNavigation(ExplorerTabItem tab)
@@ -811,7 +962,12 @@ namespace LeafTab.Views
                 _searchDebounceTimer.Stop();
                 _pendingSearchTab = null;
                 e.Handled = true;
-                await ExecuteSearchOnSelectedTabAsync();
+                try
+                {
+                    await ExecuteSearchOnSelectedTabAsync();
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { DiagnosticLog.Write("search-ui-failed", ex); }
             }
         }
 
@@ -824,7 +980,12 @@ namespace LeafTab.Views
                 FocusSearchBox();
                 return;
             }
-            await ExecuteSearchOnSelectedTabAsync();
+            try
+            {
+                await ExecuteSearchOnSelectedTabAsync();
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { DiagnosticLog.Write("search-ui-failed", ex); }
         }
 
         private void ClearSearchButton_Click(object sender, RoutedEventArgs e)
@@ -878,8 +1039,13 @@ namespace LeafTab.Views
 
         private async void SearchLoadMoreButton_Click(object sender, RoutedEventArgs e)
         {
-            await LoadMoreSearchResultsInSelectedTabAsync();
-            _selectedTab?.BrowserHost.FocusNativeView();
+            try
+            {
+                await LoadMoreSearchResultsInSelectedTabAsync();
+                _selectedTab?.BrowserHost.FocusNativeView();
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { DiagnosticLog.Write("search-ui-failed", ex); }
         }
 
         internal async Task<int> LoadMoreSearchResultsInSelectedTabAsync()

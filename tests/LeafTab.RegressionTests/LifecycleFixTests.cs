@@ -18,6 +18,7 @@ namespace LeafTab.RegressionTests
     {
         private static void RunLifecycleFixTests()
         {
+            RunStartupAndTabMoveTests();
             Test("Unavailable instance mutex never claims primary ownership", () =>
             {
                 using var service = new SingleInstanceService("denied-" + Guid.NewGuid().ToString("N"));

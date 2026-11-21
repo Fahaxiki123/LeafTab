@@ -1,3 +1,14 @@
+# LeafTab 0.6.10 发布验收（2026-11-21）
+
+- 正式版本主程序、安装器、清单、诊断标题与版本号兜底统一为 `0.6.10`。项目外隔离 `Release | x64` 构建 `0` 警告、`0` 错误。
+- 6 套安全离线/离屏回归套件合计 `192` passed / `0` failed：常规回归 `148/148`、`--external-selection-native` `6/6`、`--search-navigation-native` `12/12`、`--search-history-native` `15/15`、`--window-search-native` `5/5`、`--focus-navigation-native` `6/6`。
+- 构建产物及校验值：
+  - `LeafTab-v0.6.10-Setup-x64.exe`：`391,680` 字节（`382.5 KiB`），SHA-256 `a612f8e5bc3111c94495bae272df2d37a92e09192afc93791a0ef3273e66fe0b`
+  - 内嵌主程序 `LeafTab.exe`：`634,880` 字节（`620.0 KiB`，GZip 压缩后 `277,598` 字节），SHA-256 `45f34b42b92c8e349866738c1de87f9e0d1bdd0d70aadfad7861ddc34bdbafe5`
+- 范围边界：当前构建与验证环境为提权会话，未运行 `--shell-selection-native` 与交互式前台焦点套件；本轮未在 Windows 10 或多屏混合 DPI 环境下做实机复测，安装包未签名。
+
+---
+
 # LeafTab 0.6.9 发布验收（2026-11-17）
 
 - 正式版本主程序、安装器、界面及清单版本统一为 0.6.9。项目外 Release/x64 构建 0 警告、0 错误，115 项常规、46 项原生回归全部通过，内置自检 RESULT: PASS；功能代码此前的 7 项真实键盘输入验收通过。

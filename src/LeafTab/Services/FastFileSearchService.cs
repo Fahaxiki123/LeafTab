@@ -49,19 +49,22 @@ namespace LeafTab.Services
         public bool IsTruncated { get; }
         public long ElapsedMs { get; }
         public string? NoticeMessage { get; }
+        public bool QuerySupported { get; }
 
         public SearchExecutionReport(
             SearchBackendKind backend,
             int matchedCount,
             bool isTruncated,
             long elapsedMs,
-            string? noticeMessage = null)
+            string? noticeMessage = null,
+            bool querySupported = true)
         {
             Backend = backend;
             MatchedCount = matchedCount;
             IsTruncated = isTruncated;
             ElapsedMs = elapsedMs;
             NoticeMessage = noticeMessage;
+            QuerySupported = querySupported;
         }
     }
 
@@ -216,7 +219,8 @@ namespace LeafTab.Services
                     0,
                     false,
                     sw.ElapsedMilliseconds,
-                    parsedQuery.UnsupportedSyntaxNotice);
+                    parsedQuery.UnsupportedSyntaxNotice,
+                    querySupported: false);
             }
 
             // Tier 2a: Short-TTL RAM snapshot cache for instant consecutive keystrokes
@@ -736,7 +740,6 @@ namespace LeafTab.Services
             bool stopRequested = false;
 
             var batchLock = new object();
-            var dispatchLock = new object();
             var pendingBatch = new List<SearchResultEntry>(FirstBatchSize);
             int totalMatched = 0;
             bool isTruncated = false;
@@ -751,22 +754,13 @@ namespace LeafTab.Services
             var allCapturedChunks = collectCache ? new ConcurrentBag<List<SearchResultEntry>>() : null;
             var trackedCacheDirs = collectCache ? new ConcurrentQueue<TrackedDirectoryStamp>() : null;
 
-            string? singlePrefix = singleCacheRoot != null ? EnsureTrailingBackslash(singleCacheRoot) : null;
-            int singlePrefixLen = singlePrefix?.Length ?? 0;
-
-            if (singleCacheRoot != null)
-            {
-                primaryQueue.Enqueue(singleCacheRoot);
-            }
-            else
-            {
-                EnqueueInitialMultiDrivePriorityDirs(primaryQueue, roots, includeHidden, priorityDirectories);
-                foreach (string r in roots)
-                {
-                    string cleanRoot = EnsureTrailingBackslash(r);
-                    primaryQueue.Enqueue(cleanRoot);
-                }
-            }
+            string[] rootPrefixes = singleCacheRoot != null
+                ? new[] { EnsureTrailingBackslash(singleCacheRoot) }
+                : Array.ConvertAll(roots, EnsureTrailingBackslash);
+            if (singleCacheRoot == null)
+                EnqueueInitialMultiDrivePriorityDirs(primaryQueue, rootPrefixes, includeHidden, priorityDirectories);
+            foreach (string root in rootPrefixes)
+                primaryQueue.Enqueue(root);
 
             // Dedup visited directories when prioritizing user folders + drive roots
             var visitedDirs = singleCacheRoot == null
@@ -787,16 +781,90 @@ namespace LeafTab.Services
                 }
             }
 
+            if (cancellationToken.IsCancellationRequested)
+                return new SearchExecutionReport(SearchBackendKind.NativeFastScan, 0, false, sw.ElapsedMilliseconds);
+
             using CancellationTokenRegistration reg = cancellationToken.Register(SignalStop);
+
+            var readyBatches = new Queue<(SearchResultEntry[] Items, int Index)>();
+            bool isDelivering = false;
+
+            void DrainReadyBatches()
+            {
+                while (true)
+                {
+                    SearchResultEntry[] items;
+                    int currentBatchIndex;
+                    lock (batchLock)
+                    {
+                        if (readyBatches.Count == 0 || cancellationToken.IsCancellationRequested)
+                        {
+                            readyBatches.Clear();
+                            isDelivering = false;
+                            return;
+                        }
+
+                        (items, currentBatchIndex) = readyBatches.Dequeue();
+                    }
+
+                    try
+                    {
+                        onBatch(items, currentBatchIndex);
+                    }
+                    catch
+                    {
+                        lock (batchLock)
+                        {
+                            readyBatches.Clear();
+                            isDelivering = false;
+                        }
+                        throw;
+                    }
+                }
+            }
+
+            // 仅在 batchLock 内切分并按序入队批次，释放锁后再串行交付给 onBatch，
+            // 避免慢回调（如 Shell PIDL 构造与 UI 投递）阻塞其余工作线程并行扫描目录。
+            Action<SearchResultEntry> addMatch = entry =>
+            {
+                bool shouldDrain = false;
+                lock (batchLock)
+                {
+                    if (Volatile.Read(ref stopRequested) || cancellationToken.IsCancellationRequested)
+                        return;
+                    if (totalMatched >= maxResults)
+                    {
+                        // 已观察到超出上限的额外匹配；精确命中 maxResults 时仍可正常结束并生成完整缓存快照
+                        isTruncated = true;
+                        SignalStop();
+                        return;
+                    }
+
+                    pendingBatch.Add(entry);
+                    totalMatched++;
+                    if (pendingBatch.Count >= nextBatchTarget || totalMatched == maxResults)
+                    {
+                        readyBatches.Enqueue((pendingBatch.ToArray(), batchIndex++));
+                        pendingBatch.Clear();
+                        nextBatchTarget = SubsequentBatchSize;
+                        if (!isDelivering)
+                        {
+                            isDelivering = true;
+                            shouldDrain = true;
+                        }
+                    }
+                }
+
+                if (shouldDrain)
+                    DrainReadyBatches();
+            };
 
             for (int w = 0; w < workerCount; w++)
             {
                 workers[w] = Task.Run(() =>
                 {
-                    var localMatches = new List<SearchResultEntry>(16);
                     var localPrimarySubdirs = new List<string>(16);
                     var localDeferredSubdirs = new List<string>(8);
-                    var localBatchesToSend = new List<(SearchResultEntry[] Items, int Index)>(4);
                     List<SearchResultEntry>? localCacheChunk = collectCache ? new List<SearchResultEntry>(256) : null;
 
                     while (!Volatile.Read(ref stopRequested) && !cancellationToken.IsCancellationRequested)
@@ -845,7 +913,6 @@ namespace LeafTab.Services
                         if (currentDir == null)
                             break;
 
-                        localMatches.Clear();
                         localPrimarySubdirs.Clear();
                         localDeferredSubdirs.Clear();
 
@@ -869,13 +936,13 @@ namespace LeafTab.Services
 
                             EnumerateDirectoryNative(
                                 currentDir,
-                                singlePrefixLen,
+                                rootPrefixes,
                                 includeHidden,
                                 parsedQuery,
                                 collectCache && Volatile.Read(ref cacheAbandoned) == 0,
                                 maxTrackedDirs,
                                 trackedCacheDirs,
-                                localMatches,
+                                addMatch,
                                 localPrimarySubdirs,
                                 localDeferredSubdirs,
                                 localCacheChunk,
@@ -898,55 +965,6 @@ namespace LeafTab.Services
                                 Monitor.PulseAll(queueLock);
                             }
                         }
-
-                        if (localMatches.Count > 0 && !cancellationToken.IsCancellationRequested)
-                        {
-                            localBatchesToSend.Clear();
-
-                            lock (batchLock)
-                            {
-                                for (int i = 0; i < localMatches.Count; i++)
-                                {
-                                    if (totalMatched >= maxResults)
-                                    {
-                                        isTruncated = true;
-                                        SignalStop();
-                                        break;
-                                    }
-
-                                    pendingBatch.Add(localMatches[i]);
-                                    totalMatched++;
-
-                                    if (pendingBatch.Count >= nextBatchTarget)
-                                    {
-                                        localBatchesToSend.Add((pendingBatch.ToArray(), batchIndex++));
-                                        pendingBatch.Clear();
-                                        nextBatchTarget = SubsequentBatchSize;
-                                    }
-                                }
-
-                                if (totalMatched >= maxResults && pendingBatch.Count > 0)
-                                {
-                                    localBatchesToSend.Add((pendingBatch.ToArray(), batchIndex++));
-                                    pendingBatch.Clear();
-                                    nextBatchTarget = SubsequentBatchSize;
-                                }
-                            }
-
-                            if (localBatchesToSend.Count > 0 && !cancellationToken.IsCancellationRequested)
-                            {
-                                lock (dispatchLock)
-                                {
-                                    for (int b = 0; b < localBatchesToSend.Count; b++)
-                                    {
-                                        if (cancellationToken.IsCancellationRequested)
-                                            break;
-                                        (SearchResultEntry[] items, int idx) = localBatchesToSend[b];
-                                        onBatch(items, idx);
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     if (localCacheChunk != null && localCacheChunk.Count > 0 && Volatile.Read(ref cacheAbandoned) == 0)
@@ -958,26 +976,22 @@ namespace LeafTab.Services
 
             Task.WaitAll(workers);
 
-            SearchResultEntry[]? tailBatch = null;
-            int tailIndex = -1;
+            bool drainRemaining = false;
             lock (batchLock)
             {
                 if (pendingBatch.Count > 0 && !cancellationToken.IsCancellationRequested)
                 {
-                    tailBatch = pendingBatch.ToArray();
+                    readyBatches.Enqueue((pendingBatch.ToArray(), batchIndex++));
                     pendingBatch.Clear();
-                    tailIndex = batchIndex++;
                 }
-            }
-
-            if (tailBatch != null && !cancellationToken.IsCancellationRequested)
-            {
-                lock (dispatchLock)
+                if (!isDelivering && readyBatches.Count > 0 && !cancellationToken.IsCancellationRequested)
                 {
-                    if (!cancellationToken.IsCancellationRequested)
-                        onBatch(tailBatch, tailIndex);
+                    isDelivering = true;
+                    drainRemaining = true;
                 }
             }
+            if (drainRemaining)
+                DrainReadyBatches();
 
             if (collectCache &&
                 singleCacheRoot != null &&
@@ -1042,13 +1056,13 @@ namespace LeafTab.Services
 
         private static void EnumerateDirectoryNative(
             string currentDir,
-            int singlePrefixLen,
+            string[] rootPrefixes,
             bool includeHidden,
             ParsedSearchQuery parsedQuery,
             bool captureForCache,
             int maxTrackedDirs,
             ConcurrentQueue<TrackedDirectoryStamp>? trackedCacheDirs,
-            List<SearchResultEntry> localMatches,
+            Action<SearchResultEntry> addMatch,
             List<string> localPrimarySubdirs,
             List<string> localDeferredSubdirs,
             List<SearchResultEntry>? localCacheChunk,
@@ -1059,6 +1073,17 @@ namespace LeafTab.Services
             CancellationToken cancellationToken)
         {
             string dirWithSlash = EnsureTrailingBackslash(currentDir);
+            // Priority folders in a This PC scan use the same drive-relative paths
+            // as folders reached by descending from that drive.
+            int relativeStart = 0;
+            foreach (string root in rootPrefixes)
+            {
+                if (dirWithSlash.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                {
+                    relativeStart = root.Length;
+                    break;
+                }
+            }
             string searchPattern = ToWin32FindPattern(dirWithSlash);
             bool isDriveRoot = dirWithSlash.Length <= 3;
 
@@ -1112,9 +1137,7 @@ namespace LeafTab.Services
                         continue;
                     }
 
-                    string relTarget = (singlePrefixLen > 0 && fullPath.Length > singlePrefixLen)
-                        ? fullPath.Substring(singlePrefixLen)
-                        : name;
+                    string relTarget = relativeStart == dirWithSlash.Length ? name : fullPath.Substring(relativeStart);
 
                     ulong fileSize = ((ulong)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                     var entry = new SearchResultEntry(fullPath, attrs, fileSize, fd.ftLastWriteTime);
@@ -1133,7 +1156,7 @@ namespace LeafTab.Services
 
                     if ((includeHidden || !isHidden) && parsedQuery.MatchesEntry(name, relTarget, in entry))
                     {
-                        localMatches.Add(entry);
+                        addMatch(entry);
                     }
 
                     bool isSubDir = isDir && (attrs & NativeMethods.FILE_ATTRIBUTE_REPARSE_POINT) == 0;

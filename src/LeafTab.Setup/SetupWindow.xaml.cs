@@ -1,6 +1,8 @@
 using System;
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Interop;
@@ -10,13 +12,18 @@ namespace LeafTab.Setup
 {
     public partial class SetupWindow : Window
     {
+        internal delegate Task<(bool Ok, string Message, string InstalledExePath)> InstallAction(
+            SetupOptions options, Action<int, string> progress);
+
         private readonly SetupOptions _options;
+        private readonly InstallAction _install;
         private bool _isBusy;
         private bool _isCompleted;
 
-        internal SetupWindow(SetupOptions options)
+        internal SetupWindow(SetupOptions options, InstallAction? install = null)
         {
             _options = options;
+            _install = install ?? SetupEngine.ExecuteInstallAsync;
             InitializeComponent();
 
             SourceInitialized += OnWindowSourceInitialized;
@@ -114,6 +121,7 @@ namespace LeafTab.Setup
             }
 
             _isBusy = true;
+            InstallErrorText.Visibility = Visibility.Collapsed;
             CancelButton.IsEnabled = false;
             TopCloseButton.IsEnabled = false;
             PrimaryActionButton.IsEnabled = false;
@@ -122,86 +130,107 @@ namespace LeafTab.Setup
             UninstallConfigPanel.Visibility = Visibility.Collapsed;
             ProgressCardPanel.Visibility = Visibility.Visible;
 
-            if (_options.IsUninstall)
+            try
             {
-                _options.RemoveUserDataOnUninstall = RemoveUserDataCheckBox.IsChecked == true;
-                StatusDetailText.Text = "正在安全还原注册表关联并释放文件…";
-
-                var res = await SetupEngine.ExecuteUninstallAsync(_options, (pct, msg) =>
+                if (_options.IsUninstall)
                 {
-                    Dispatcher.Invoke(() =>
+                    _options.RemoveUserDataOnUninstall = RemoveUserDataCheckBox.IsChecked == true;
+                    StatusDetailText.Text = "正在安全还原注册表关联并释放文件…";
+
+                    var res = await SetupEngine.ExecuteUninstallAsync(_options, (pct, msg) =>
                     {
-                        SetupProgressBar.Value = pct;
-                        StatusStepText.Text = msg;
+                        Dispatcher.Invoke(() =>
+                        {
+                            SetupProgressBar.Value = pct;
+                            StatusStepText.Text = msg;
+                        });
                     });
-                });
 
-                _isBusy = false;
-                TopCloseButton.IsEnabled = true;
-                PrimaryActionButton.IsEnabled = true;
-
-                if (res.Ok)
-                {
-                    _isCompleted = true;
-                    StatusDetailText.Text = "感谢使用 LeafTab（一叶），点击「完成」关闭向导。";
-                    CancelButton.Visibility = Visibility.Collapsed;
-                    PrimaryActionButton.Background = new SolidColorBrush(Color.FromRgb(22, 163, 74));
-                    PrimaryActionButton.Content = "完成";
-                    Closed += (_, _) => SetupEngine.ScheduleSelfDeleteIfRunningAsUninstaller(_options.InstallDir);
-                }
-                else
-                {
-                    StatusStepText.Text = "卸载遇到问题";
-                    StatusDetailText.Text = res.Message;
-                    CancelButton.IsEnabled = true;
-                    PrimaryActionButton.Content = "重试";
-                }
-            }
-            else
-            {
-                _options.InstallDir = (InstallPathTextBox.Text ?? string.Empty).Trim();
-                _options.SetDefaultExplorer = SetDefaultCheckBox.IsChecked == true;
-                _options.AddContextMenu = ContextMenuCheckBox.IsChecked == true;
-                _options.CreateShortcuts = ShortcutsCheckBox.IsChecked == true;
-                _options.LaunchAfterInstall = LaunchNowCheckBox.IsChecked == true;
-
-                var res = await SetupEngine.ExecuteInstallAsync(_options, (pct, msg) =>
-                {
-                    Dispatcher.Invoke(() =>
+                    if (res.Ok)
                     {
-                        SetupProgressBar.Value = pct;
-                        StatusStepText.Text = msg;
-                    });
-                });
-
-                _isBusy = false;
-                TopCloseButton.IsEnabled = true;
-                PrimaryActionButton.IsEnabled = true;
-
-                if (res.Ok)
-                {
-                    _isCompleted = true;
-                    StatusDetailText.Text = "已安装至：" + res.InstalledExePath;
-                    CancelButton.Visibility = Visibility.Collapsed;
-                    PrimaryActionButton.Background = new SolidColorBrush(Color.FromRgb(22, 163, 74));
-                    PrimaryActionButton.Content = "完成";
-
-                    if (_options.LaunchAfterInstall)
+                        _isCompleted = true;
+                        StatusDetailText.Text = "感谢使用 LeafTab（一叶），点击「完成」关闭向导。";
+                        CancelButton.Visibility = Visibility.Collapsed;
+                        PrimaryActionButton.Background = new SolidColorBrush(Color.FromRgb(22, 163, 74));
+                        PrimaryActionButton.Content = "完成";
+                        Closed += (_, _) => SetupEngine.ScheduleSelfDeleteIfRunningAsUninstaller(_options.InstallDir);
+                    }
+                    else
                     {
-                        // Close wizard automatically shortly after launching LeafTab so it doesn't sit behind
-                        Close();
+                        StatusStepText.Text = "卸载遇到问题";
+                        StatusDetailText.Text = res.Message;
+                        PrimaryActionButton.Content = "重试";
                     }
                 }
                 else
                 {
-                    StatusStepText.Text = "安装失败";
-                    StatusDetailText.Text = res.Message;
-                    InstallConfigPanel.Visibility = Visibility.Visible;
-                    ProgressCardPanel.Visibility = Visibility.Collapsed;
-                    CancelButton.IsEnabled = true;
-                    PrimaryActionButton.Content = "重试安装";
+                    _options.InstallDir = (InstallPathTextBox.Text ?? string.Empty).Trim();
+                    _options.SetDefaultExplorer = SetDefaultCheckBox.IsChecked == true;
+                    _options.AddContextMenu = ContextMenuCheckBox.IsChecked == true;
+                    _options.CreateShortcuts = ShortcutsCheckBox.IsChecked == true;
+                    _options.LaunchAfterInstall = LaunchNowCheckBox.IsChecked == true;
+
+                    var res = await _install(_options, (pct, msg) =>
+                    {
+                        Dispatcher.Invoke(() =>
+                        {
+                            SetupProgressBar.Value = pct;
+                            StatusStepText.Text = msg;
+                        });
+                    });
+
+                    if (res.Ok)
+                    {
+                        _isCompleted = true;
+                        StatusDetailText.Text = "已安装至：" + res.InstalledExePath;
+                        CancelButton.Visibility = Visibility.Collapsed;
+                        PrimaryActionButton.Background = new SolidColorBrush(Color.FromRgb(22, 163, 74));
+                        PrimaryActionButton.Content = "完成";
+                    }
+                    else
+                    {
+                        ShowInstallFailure(res.Message);
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                if (_options.IsUninstall)
+                {
+                    StatusStepText.Text = "卸载遇到问题";
+                    StatusDetailText.Text = ex.Message;
+                    PrimaryActionButton.Content = "重试";
+                }
+                else
+                {
+                    ShowInstallFailure(ex.Message);
+                }
+            }
+            finally
+            {
+                _isBusy = false;
+                TopCloseButton.IsEnabled = true;
+                PrimaryActionButton.IsEnabled = true;
+                if (!_isCompleted)
+                    CancelButton.IsEnabled = true;
+            }
+            if (_isCompleted && !_options.IsUninstall && _options.LaunchAfterInstall)
+                Close();
+        }
+
+        private void ShowInstallFailure(string message)
+        {
+            InstallErrorText.Text = "安装失败：" + message;
+            InstallErrorText.Visibility = Visibility.Visible;
+            InstallConfigPanel.Visibility = Visibility.Visible;
+            ProgressCardPanel.Visibility = Visibility.Collapsed;
+            PrimaryActionButton.Content = "重试安装";
+        }
+
+        protected override void OnClosing(CancelEventArgs e)
+        {
+            base.OnClosing(e);
+            if (_isBusy) e.Cancel = true;
         }
 
         private void CancelOrClose_Click(object sender, RoutedEventArgs e)
